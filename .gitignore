@@ -1,0 +1,19 @@
+# Python Bytecode
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Checkpoints and logs
+work_dirs/
+*.pth
+*.pt
+*.log
+
+# Environment
+.venv/
+env/
+.idea/
+.vscode/
+
+Visdrone/
+work_dirs/

@@ -1,0 +1,72 @@
+# Configuration for Image Classification Example
+
+work_dir: "./work_dirs/toy_classification"
+device: "cpu"  # supports 'cuda', 'cpu', 'mps'
+seed: 42
+
+custom_imports:
+  - "examples.image_classification.model"
+  - "examples.image_classification.dataset"
+
+# 1. Model Configuration
+model:
+  type: "SimpleConvNet"
+  in_channels: 3
+  num_classes: 5
+  hidden_dim: 16
+
+# 2. Dataset Configuration
+data:
+  train:
+    dataset:
+      type: "SyntheticImageDataset"
+      num_samples: 120
+      img_size: [32, 32]
+      num_classes: 5
+      pipeline:
+        - type: "Normalize"
+          mean: [0.5, 0.5, 0.5]
+          std: [0.5, 0.5, 0.5]
+    batch_size: 16
+    shuffle: true
+    num_workers: 0
+    drop_last: true
+
+  val:
+    dataset:
+      type: "SyntheticImageDataset"
+      num_samples: 40
+      img_size: [32, 32]
+      num_classes: 5
+      pipeline:
+        - type: "Normalize"
+          mean: [0.5, 0.5, 0.5]
+          std: [0.5, 0.5, 0.5]
+    batch_size: 16
+    shuffle: false
+    num_workers: 0
+
+# 3. Optimizer Configuration
+optimizer:
+  type: "AdamW"
+  lr: 0.001
+  weight_decay: 0.01
+
+# 4. LR Scheduler Configuration
+lr_scheduler:
+  type: "CosineAnnealingLR"
+  T_max: 5
+  eta_min: 0.00001
+
+# 5. Metrics Configuration
+metrics:
+  acc:
+    type: "Accuracy"
+    topk: [1]
+
+# 6. Training Engine Configuration
+train_cfg:
+  max_epochs: 3
+  val_interval: 1
+  grad_clip: 1.0
+  use_amp: false
