@@ -209,20 +209,21 @@ class ClassSpecificDetHead(nn.Module):
             nn.Sigmoid()  # Giữ box luôn trong khoảng [0, 1]
         )
 
-    def forward(self, feat_map: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        # feat_map: [B, C, dim, H, W]
-        B, C, dim, H, W = feat_map.shape
-
-        # Gộp chiều C và dim lại thành: [B, C * dim, H, W]
-        feat_grouped = feat_map.view(B, C * dim, H, W)
-
-        # Chạy song song 10 heads cho 10 class cùng lúc:
-        cls_logits = self.cls_head(feat_grouped)    # [B, C, H, W]
-        pred_boxes = self.box_head(feat_grouped)    # [B, C * 4, H, W]
-
-        # Reshape pred_boxes về [B, C, 4, H, W]
-        pred_boxes = pred_boxes.view(B, C, 4, H, W)
-
+    def forward(self, class_feat: torch.Tensor, pure_feat: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Args:
+            class_feat: [B, C, dim, H, W] (feat_map tương tác với slots)
+            pure_feat:  [B, dim, H, W]    (feat_map gốc từ FPN upsample)
+        Returns:
+            cls_logits: [B, C, H, W]
+            pred_boxes: [B, 4, H, W]
+        """
+        B, C, dim, H, W = class_feat.shape
+        # 1. Dự đoán Class từ class_feat
+        feat_grouped = class_feat.view(B, C * dim, H, W)
+        cls_logits = self.cls_head(feat_grouped) # [B, C, H, W]
+        # 2. Dự đoán Box từ pure_feat gốc
+        pred_boxes = self.box_head(pure_feat)    # [B, 4, H, W]
         return cls_logits, pred_boxes
 
 class SlotCrossAttention(nn.Module):
@@ -426,8 +427,8 @@ class VisDroneDetector(BaseModel):
         B,D,H,W = c12.shape
         feat_map= self.up_sample(c1, c3, c5, c12) # [B, dim, H, W]
 
-        feat_map = self.cross_attn(slots, feat_map)  # [B, C, dim, H, W]
-        return slots, feat_map, attn
+        cls_feat_map = self.cross_attn(slots, feat_map)  # [B, C, dim, H, W]
+        return slots, cls_feat_map, feat_map, attn
 
     def _compute_losses(self, cls_logits, pred_boxes, targets, device):
         """Hàm dùng chung tính Loss từ cls_logits và pred_boxes."""
@@ -548,9 +549,10 @@ class VisDroneDetector(BaseModel):
         return results
 
     def forward_train(self, inputs: torch.Tensor, targets=None, **kwargs):
-        slots, feat_map, attn = self.extract_features(inputs)
-        cls_logits, pred_boxes = self.head(feat_map)
+        slots, cls_feat_map, feat_map, attn = self.extract_features(inputs)
+        cls_logits, pred_boxes = self.head(cls_feat_map, feat_map)
         return self._compute_losses(cls_logits, pred_boxes, targets, device=inputs.device)
+    
     def predict(self, inputs: torch.Tensor, conf_threshold=0.25, nms_threshold=0.5, **kwargs):
         slots, feat_map, attn = self.extract_features(inputs)
         cls_logits, pred_boxes = self.head(feat_map)
