@@ -1,0 +1,84 @@
+# Configuration for VisDrone Object Detection
+
+work_dir: "./work_dirs/visdrone_detection"
+device: "cuda"  
+seed: 42
+tqdm: true
+accumulate: 2
+
+custom_imports:
+  - "Visdrone.model"
+  - "Visdrone.dataset"
+  - "Visdrone.metrics"
+
+# 1. Model Configuration: Modular VisDrone Detector with FPN
+model:
+  type: "VisDroneDetector"
+  num_classes: 10
+  dim: 16
+  total_head: 4
+  images_size: 640
+  num_ref: 16
+# 2. Dataset Configuration
+data:
+  train:
+    dataset:
+      type: "CustomLMDBDataset"
+      data_root: "D:/apps/Datasets/VisDrone/VisDrone_data.lmdb"
+      split: "train"
+      split_ratio: 0.8
+      seed: 42
+      pipeline:
+        - type: "Resize"
+          size: [640, 640]
+        - type: "ToTensor"
+    batch_size: 8
+    shuffle: true
+    num_workers: 2
+
+  val:
+    dataset:
+      type: "CustomLMDBDataset"
+      data_root: "D:/apps/Datasets/VisDrone/VisDrone_data.lmdb"
+      split: "val"
+      split_ratio: 0.8
+      seed: 42
+      pipeline:
+        - type: "Resize"
+          size: [640, 640]
+        - type: "ToTensor"
+    batch_size: 8
+    shuffle: false
+    num_workers: 0
+
+# 3. Optimizer Configuration
+optimizer:
+  type: "AdamW"
+  lr: 0.0005
+  weight_decay: 0.0001
+
+# 4. LR Scheduler Configuration
+lr_scheduler:
+  type: "CosineAnnealingLR"
+  T_max: 5
+  eta_min: 0.00001
+
+metrics:
+  mAP:
+    type: "VisDroneMAP"
+    num_classes: 10
+    box_format: "cxcywh"
+hooks:
+  - type: "ExcelTracker"
+    filename: "training_metrics.xlsx"       # File sẽ được lưu trong thư mục work_dir
+    track_gradients: true                   # Bật tracking gradient chi tiết
+    grad_interval: 1                        # Chu kỳ lấy mẫu gradient (mỗi 1 batch)
+    submodules: null
+
+# 5. Training Engine Configuration
+train_cfg:
+  max_epochs: 100
+  val_interval: 1
+  log_interval: 500
+  grad_clip: 1.0
+  use_amp: false
