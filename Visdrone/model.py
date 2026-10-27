@@ -225,6 +225,62 @@ class ClassSpecificDetHead(nn.Module):
 
         return cls_logits, pred_boxes
 
+class SlotCrossAttention(nn.Module):
+    """
+    Module Cross-Attention:
+    Slots (Query) quét qua Feature Map (Key, Value) để trích xuất đặc trưng chuyên biệt cho từng class.
+    """
+    def __init__(self, dim: int, num_heads: int = 4):
+        super().__init__()
+        self.dim = dim
+        self.num_heads = num_heads
+        self.head_dim = dim // num_heads
+        self.scale = self.head_dim ** -0.5
+        # Chiếu Q từ Slots
+        self.q_proj = nn.Linear(dim, dim, bias=False)
+        # Chiếu K, V từ Feature Map (dùng Conv 1x1 siêu nhanh)
+        self.k_proj = nn.Conv2d(dim, dim, kernel_size=1, bias=False)
+        self.v_proj = nn.Conv2d(dim, dim, kernel_size=1, bias=False)
+        # Output projection & Normalization
+        self.out_proj = nn.Conv2d(dim, dim, kernel_size=1)
+        self.norm_feat = nn.BatchNorm2d(dim)
+        self.norm_slot = nn.LayerNorm(dim)
+    def forward(self, slots: torch.Tensor, feat_map: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            slots: [B, C, dim] (C = num_classes)
+            feat_map: [B, dim, H, W] (từ up_sample FPN, ví dụ 160x160)
+        Returns:
+            class_feat_map: [B, C, dim, H, W] (Mỗi class có 1 heatmap đặc trưng tương tác sâu)
+        """
+        B, C, D = slots.shape
+        _, _, H, W = feat_map.shape
+        N = H * W
+        # 1. Chuẩn bị Query từ Slots: [B, C, H_heads, D_head]
+        q = self.norm_slot(slots)
+        q = self.q_proj(q).view(B, C, self.num_heads, self.head_dim)
+        # 2. Chuẩn bị Key và Value từ Feat Map: [B, N, H_heads, D_head]
+        k = self.k_proj(feat_map).flatten(2).transpose(1, 2).view(B, N, self.num_heads, self.head_dim)
+        v = self.v_proj(feat_map).flatten(2).transpose(1, 2).view(B, N, self.num_heads, self.head_dim)
+        # 3. Tính Attention Map giữa từng Class và từng vị trí pixel:
+        # q: [B, C, heads, d]
+        # k: [B, N, heads, d]
+        # -> attn: [B, C, heads, N]
+        attn_scores = torch.einsum('bchd, bnhd -> bchn', q, k) * self.scale
+        attn_weights = F.softmax(attn_scores, dim=-1) # Softmax trên toàn bộ N pixels
+        # 4. Tạo đặc trưng điều biến không gian (Spatial Modulation Map):
+        # Nhân attn với Value để tạo trọng số tương tác:
+        # attn: [B, C, heads, N] x v: [B, N, heads, d] -> [B, C, heads, d]
+        slot_context = torch.einsum('bchn, bnhd -> bchd', attn_weights, v)
+        slot_context = slot_context.reshape(B, C, D) # [B, C, dim]
+        # 5. Phối hợp đặc trưng (Modulation):
+        # Thay vì chỉ cộng broadcast đơn thuần, ta kết hợp cả cộng và nhân tương quan (Gate Modulation):
+        slot_context = slot_context.unsqueeze(-1).unsqueeze(-1) # [B, C, dim, 1, 1]
+        feat_expanded = feat_map.unsqueeze(1)                   # [B, 1, dim, H, W]
+        # Class Feature Map: vừa giữ đặc trưng không gian nét, vừa được lọc theo đặc trưng của class!
+        out = feat_expanded * torch.sigmoid(slot_context) + slot_context # [B, C, dim, H, W]
+        return out
+
 @MODELS.register_module()
 class VisDroneDetector(BaseModel):
     """Detector for COCO dataset predicting bounding boxes, class labels, and objectness."""
@@ -282,6 +338,8 @@ class VisDroneDetector(BaseModel):
         self.head = ClassSpecificDetHead(
             dim= dim
         )
+
+        self.cross_attn = SlotCrossAttention(dim=dim, num_heads=total_head)
 
     def initalize_slots(self, batch_size=1, device=None):
         # Handle the case where device is passed as the first positional argument
@@ -370,7 +428,7 @@ class VisDroneDetector(BaseModel):
 
         up_slots= slots.unsqueeze(-1).unsqueeze(-1) # [B, C, dim, 1, 1]
         feat_map= feat_map.unsqueeze(1) # [B, 1, dim, H, W]
-        feat_map= feat_map + up_slots # [B, C, dim, H, W]
+        feat_map = self.cross_attn(up_slots, feat_map)  # [B, C, dim, H, W]
         return slots, feat_map, attn
 
     def _compute_losses(self, cls_logits, pred_boxes, targets, device):
