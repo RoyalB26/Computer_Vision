@@ -1,0 +1,185 @@
+================================================================================
+ MODEL ARCHITECTURE REPORT: YOLOV1 (DARKNET-24 + FULLY CONNECTED HEAD)
+================================================================================
+Model Class          : YOLOv1Model
+Total Parameters     : 283,761,914 (283.76 M)
+Trainable Parameters : 283,761,914 (283.76 M)
+Frozen Parameters    : 0 (0.00 M)
+Estimated Model Size : 1082.47 MB
+Standard Input Size  : [1, 3, 448, 448]
+--------------------------------------------------------------------------------
+
+[1. TOP-LEVEL SUBMODULES BREAKDOWN]
+Submodule Name                 Type                                Parameters
+--------------------------------------------------------------------------------
+layer_00                       Conv                                     9,536
+layer_01                       MaxPool2d                                    0
+layer_02                       Conv                                   110,976
+layer_03                       MaxPool2d                                    0
+layer_04                       Conv                                    24,832
+layer_05                       Conv                                   295,424
+layer_06                       Conv                                    66,048
+layer_07                       Conv                                 1,180,672
+layer_08                       MaxPool2d                                    0
+layer_09                       Conv                                   131,584
+layer_10                       Conv                                 1,180,672
+layer_11                       Conv                                   131,584
+layer_12                       Conv                                 1,180,672
+layer_13                       Conv                                   131,584
+layer_14                       Conv                                 1,180,672
+layer_15                       Conv                                   131,584
+layer_16                       Conv                                 1,180,672
+layer_17                       Conv                                   263,168
+layer_18                       Conv                                 4,720,640
+layer_19                       MaxPool2d                                    0
+layer_20                       Conv                                   525,312
+layer_21                       Conv                                 4,720,640
+layer_22                       Conv                                   525,312
+layer_23                       Conv                                 4,720,640
+layer_24                       Conv                                 9,439,232
+layer_25                       Conv                                 9,439,232
+layer_26                       Conv                                 9,439,232
+layer_27                       Conv                                 9,439,232
+layer_28                       Flatten                                      0
+layer_29                       Linear                             205,524,992
+layer_30                       LeakyReLU                                    0
+layer_31                       Dropout                                      0
+layer_32                       Linear                              18,067,770
+--------------------------------------------------------------------------------
+
+[2. DETAILED PYTORCH MODULE STRUCTURE]
+--------------------------------------------------------------------------------
+YOLOv1Model(
+  (model): Sequential(
+    (0): Conv(
+      (conv): Conv2d(3, 64, kernel_size=(7, 7), stride=(2, 2), padding=(3, 3), bias=False)
+      (bn): BatchNorm2d(64, eps=1e-05, momentum=0.1, affine=True, bias=True, track_running_stats=True)
+      (act): SiLU()
+    )
+    (1): MaxPool2d(kernel_size=2, stride=2, padding=0, dilation=1, ceil_mode=False)
+    (2): Conv(
+      (conv): Conv2d(64, 192, kernel_size=(3, 3), stride=(1, 1), padding=(1, 1), bias=False)
+      (bn): BatchNorm2d(192, eps=1e-05, momentum=0.1, affine=True, bias=True, track_running_stats=True)
+      (act): SiLU()
+    )
+    (3): MaxPool2d(kernel_size=2, stride=2, padding=0, dilation=1, ceil_mode=False)
+    (4): Conv(
+      (conv): Conv2d(192, 128, kernel_size=(1, 1), stride=(1, 1), bias=False)
+      (bn): BatchNorm2d(128, eps=1e-05, momentum=0.1, affine=True, bias=True, track_running_stats=True)
+      (act): SiLU()
+    )
+    (5): Conv(
+      (conv): Conv2d(128, 256, kernel_size=(3, 3), stride=(1, 1), padding=(1, 1), bias=False)
+      (bn): BatchNorm2d(256, eps=1e-05, momentum=0.1, affine=True, bias=True, track_running_stats=True)
+      (act): SiLU()
+    )
+    (6): Conv(
+      (conv): Conv2d(256, 256, kernel_size=(1, 1), stride=(1, 1), bias=False)
+      (bn): BatchNorm2d(256, eps=1e-05, momentum=0.1, affine=True, bias=True, track_running_stats=True)
+      (act): SiLU()
+    )
+    (7): Conv(
+      (conv): Conv2d(256, 512, kernel_size=(3, 3), stride=(1, 1), padding=(1, 1), bias=False)
+      (bn): BatchNorm2d(512, eps=1e-05, momentum=0.1, affine=True, bias=True, track_running_stats=True)
+      (act): SiLU()
+    )
+    (8): MaxPool2d(kernel_size=2, stride=2, padding=0, dilation=1, ceil_mode=False)
+    (9): Conv(
+      (conv): Conv2d(512, 256, kernel_size=(1, 1), stride=(1, 1), bias=False)
+      (bn): BatchNorm2d(256, eps=1e-05, momentum=0.1, affine=True, bias=True, track_running_stats=True)
+      (act): SiLU()
+    )
+    (10): Conv(
+      (conv): Conv2d(256, 512, kernel_size=(3, 3), stride=(1, 1), padding=(1, 1), bias=False)
+      (bn): BatchNorm2d(512, eps=1e-05, momentum=0.1, affine=True, bias=True, track_running_stats=True)
+      (act): SiLU()
+    )
+    (11): Conv(
+      (conv): Conv2d(512, 256, kernel_size=(1, 1), stride=(1, 1), bias=False)
+      (bn): BatchNorm2d(256, eps=1e-05, momentum=0.1, affine=True, bias=True, track_running_stats=True)
+      (act): SiLU()
+    )
+    (12): Conv(
+      (conv): Conv2d(256, 512, kernel_size=(3, 3), stride=(1, 1), padding=(1, 1), bias=False)
+      (bn): BatchNorm2d(512, eps=1e-05, momentum=0.1, affine=True, bias=True, track_running_stats=True)
+      (act): SiLU()
+    )
+    (13): Conv(
+      (conv): Conv2d(512, 256, kernel_size=(1, 1), stride=(1, 1), bias=False)
+      (bn): BatchNorm2d(256, eps=1e-05, momentum=0.1, affine=True, bias=True, track_running_stats=True)
+      (act): SiLU()
+    )
+    (14): Conv(
+      (conv): Conv2d(256, 512, kernel_size=(3, 3), stride=(1, 1), padding=(1, 1), bias=False)
+      (bn): BatchNorm2d(512, eps=1e-05, momentum=0.1, affine=True, bias=True, track_running_stats=True)
+      (act): SiLU()
+    )
+    (15): Conv(
+      (conv): Conv2d(512, 256, kernel_size=(1, 1), stride=(1, 1), bias=False)
+      (bn): BatchNorm2d(256, eps=1e-05, momentum=0.1, affine=True, bias=True, track_running_stats=True)
+      (act): SiLU()
+    )
+    (16): Conv(
+      (conv): Conv2d(256, 512, kernel_size=(3, 3), stride=(1, 1), padding=(1, 1), bias=False)
+      (bn): BatchNorm2d(512, eps=1e-05, momentum=0.1, affine=True, bias=True, track_running_stats=True)
+      (act): SiLU()
+    )
+    (17): Conv(
+      (conv): Conv2d(512, 512, kernel_size=(1, 1), stride=(1, 1), bias=False)
+      (bn): BatchNorm2d(512, eps=1e-05, momentum=0.1, affine=True, bias=True, track_running_stats=True)
+      (act): SiLU()
+    )
+    (18): Conv(
+      (conv): Conv2d(512, 1024, kernel_size=(3, 3), stride=(1, 1), padding=(1, 1), bias=False)
+      (bn): BatchNorm2d(1024, eps=1e-05, momentum=0.1, affine=True, bias=True, track_running_stats=True)
+      (act): SiLU()
+    )
+    (19): MaxPool2d(kernel_size=2, stride=2, padding=0, dilation=1, ceil_mode=False)
+    (20): Conv(
+      (conv): Conv2d(1024, 512, kernel_size=(1, 1), stride=(1, 1), bias=False)
+      (bn): BatchNorm2d(512, eps=1e-05, momentum=0.1, affine=True, bias=True, track_running_stats=True)
+      (act): SiLU()
+    )
+    (21): Conv(
+      (conv): Conv2d(512, 1024, kernel_size=(3, 3), stride=(1, 1), padding=(1, 1), bias=False)
+      (bn): BatchNorm2d(1024, eps=1e-05, momentum=0.1, affine=True, bias=True, track_running_stats=True)
+      (act): SiLU()
+    )
+    (22): Conv(
+      (conv): Conv2d(1024, 512, kernel_size=(1, 1), stride=(1, 1), bias=False)
+      (bn): BatchNorm2d(512, eps=1e-05, momentum=0.1, affine=True, bias=True, track_running_stats=True)
+      (act): SiLU()
+    )
+    (23): Conv(
+      (conv): Conv2d(512, 1024, kernel_size=(3, 3), stride=(1, 1), padding=(1, 1), bias=False)
+      (bn): BatchNorm2d(1024, eps=1e-05, momentum=0.1, affine=True, bias=True, track_running_stats=True)
+      (act): SiLU()
+    )
+    (24): Conv(
+      (conv): Conv2d(1024, 1024, kernel_size=(3, 3), stride=(1, 1), padding=(1, 1), bias=False)
+      (bn): BatchNorm2d(1024, eps=1e-05, momentum=0.1, affine=True, bias=True, track_running_stats=True)
+      (act): SiLU()
+    )
+    (25): Conv(
+      (conv): Conv2d(1024, 1024, kernel_size=(3, 3), stride=(2, 2), padding=(1, 1), bias=False)
+      (bn): BatchNorm2d(1024, eps=1e-05, momentum=0.1, affine=True, bias=True, track_running_stats=True)
+      (act): SiLU()
+    )
+    (26): Conv(
+      (conv): Conv2d(1024, 1024, kernel_size=(3, 3), stride=(1, 1), padding=(1, 1), bias=False)
+      (bn): BatchNorm2d(1024, eps=1e-05, momentum=0.1, affine=True, bias=True, track_running_stats=True)
+      (act): SiLU()
+    )
+    (27): Conv(
+      (conv): Conv2d(1024, 1024, kernel_size=(3, 3), stride=(1, 1), padding=(1, 1), bias=False)
+      (bn): BatchNorm2d(1024, eps=1e-05, momentum=0.1, affine=True, bias=True, track_running_stats=True)
+      (act): SiLU()
+    )
+    (28): Flatten(start_dim=1, end_dim=-1)
+    (29): Linear(in_features=50176, out_features=4096, bias=True)
+    (30): LeakyReLU(negative_slope=0.1, inplace=True)
+    (31): Dropout(p=0.5, inplace=False)
+    (32): Linear(in_features=4096, out_features=4410, bias=True)
+  )
+)
+================================================================================

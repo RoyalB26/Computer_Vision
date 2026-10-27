@@ -6,6 +6,7 @@ from .logger_hook import LoggerHook
 from .lr_scheduler_hook import LrSchedulerHook
 from .tensorboard_hook import TensorboardHook
 from .wandb_hook import WandbHook
+from ...utils.tracker import ExcelTracker, ExcelTrackerHook
 
 __all__ = [
     "BaseHook",
@@ -15,4 +16,6 @@ __all__ = [
     "EarlyStoppingHook",
     "TensorboardHook",
     "WandbHook",
+    "ExcelTracker",
+    "ExcelTrackerHook",
 ]

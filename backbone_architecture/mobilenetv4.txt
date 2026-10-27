@@ -1,0 +1,501 @@
+================================================================================
+ MODEL ARCHITECTURE REPORT: MOBILENETV4_CONV_SMALL
+================================================================================
+Model Class          : MobileNetV3
+Total Parameters     : 3,774,024 (3.77 M)
+Trainable Parameters : 3,774,024 (3.77 M)
+Frozen Parameters    : 0 (0.00 M)
+Estimated Model Size : 14.40 MB
+Standard Input Size  : [1, 3, 224, 224]
+--------------------------------------------------------------------------------
+
+[1. TOP-LEVEL SUBMODULES BREAKDOWN]
+Submodule Name                 Type                                Parameters
+--------------------------------------------------------------------------------
+conv_stem                      Conv2d                                     864
+bn1                            BatchNormAct2d                              64
+blocks                         Sequential                           1,260,736
+global_pool                    SelectAdaptivePool2d                         0
+conv_head                      Conv2d                               1,228,800
+norm_head                      BatchNormAct2d                           2,560
+act2                           Identity                                     0
+flatten                        Flatten                                      0
+classifier                     Linear                               1,281,000
+--------------------------------------------------------------------------------
+
+[2. DETAILED PYTORCH MODULE STRUCTURE]
+--------------------------------------------------------------------------------
+MobileNetV3(
+  (conv_stem): Conv2d(3, 32, kernel_size=(3, 3), stride=(2, 2), padding=(1, 1), bias=False)
+  (bn1): BatchNormAct2d(
+    32, eps=1e-05, momentum=0.1, affine=True, bias=True, track_running_stats=True
+    (drop): Identity()
+    (act): ReLU(inplace=True)
+  )
+  (blocks): Sequential(
+    (0): Sequential(
+      (0): ConvBnAct(
+        (conv): Conv2d(32, 32, kernel_size=(3, 3), stride=(2, 2), padding=(1, 1), bias=False)
+        (bn1): BatchNormAct2d(
+          32, eps=1e-05, momentum=0.1, affine=True, bias=True, track_running_stats=True
+          (drop): Identity()
+          (act): ReLU(inplace=True)
+        )
+        (aa): Identity()
+        (drop_path): Identity()
+      )
+      (1): ConvBnAct(
+        (conv): Conv2d(32, 32, kernel_size=(1, 1), stride=(1, 1), bias=False)
+        (bn1): BatchNormAct2d(
+          32, eps=1e-05, momentum=0.1, affine=True, bias=True, track_running_stats=True
+          (drop): Identity()
+          (act): ReLU(inplace=True)
+        )
+        (aa): Identity()
+        (drop_path): Identity()
+      )
+    )
+    (1): Sequential(
+      (0): ConvBnAct(
+        (conv): Conv2d(32, 96, kernel_size=(3, 3), stride=(2, 2), padding=(1, 1), bias=False)
+        (bn1): BatchNormAct2d(
+          96, eps=1e-05, momentum=0.1, affine=True, bias=True, track_running_stats=True
+          (drop): Identity()
+          (act): ReLU(inplace=True)
+        )
+        (aa): Identity()
+        (drop_path): Identity()
+      )
+      (1): ConvBnAct(
+        (conv): Conv2d(96, 64, kernel_size=(1, 1), stride=(1, 1), bias=False)
+        (bn1): BatchNormAct2d(
+          64, eps=1e-05, momentum=0.1, affine=True, bias=True, track_running_stats=True
+          (drop): Identity()
+          (act): ReLU(inplace=True)
+        )
+        (aa): Identity()
+        (drop_path): Identity()
+      )
+    )
+    (2): Sequential(
+      (0): UniversalInvertedResidual(
+        (dw_start): ConvNormAct(
+          (conv): Conv2d(64, 64, kernel_size=(5, 5), stride=(1, 1), padding=(2, 2), groups=64, bias=False)
+          (bn): BatchNormAct2d(
+            64, eps=1e-05, momentum=0.1, affine=True, bias=True, track_running_stats=True
+            (drop): Identity()
+            (act): Identity()
+          )
+        )
+        (pw_exp): ConvNormAct(
+          (conv): Conv2d(64, 192, kernel_size=(1, 1), stride=(1, 1), bias=False)
+          (bn): BatchNormAct2d(
+            192, eps=1e-05, momentum=0.1, affine=True, bias=True, track_running_stats=True
+            (drop): Identity()
+            (act): ReLU(inplace=True)
+          )
+        )
+        (dw_mid): ConvNormAct(
+          (conv): Conv2d(192, 192, kernel_size=(5, 5), stride=(2, 2), padding=(2, 2), groups=192, bias=False)
+          (bn): BatchNormAct2d(
+            192, eps=1e-05, momentum=0.1, affine=True, bias=True, track_running_stats=True
+            (drop): Identity()
+            (act): ReLU(inplace=True)
+          )
+        )
+        (se): Identity()
+        (pw_proj): ConvNormAct(
+          (conv): Conv2d(192, 96, kernel_size=(1, 1), stride=(1, 1), bias=False)
+          (bn): BatchNormAct2d(
+            96, eps=1e-05, momentum=0.1, affine=True, bias=True, track_running_stats=True
+            (drop): Identity()
+            (act): Identity()
+          )
+        )
+        (dw_end): Identity()
+        (layer_scale): Identity()
+        (drop_path): Identity()
+      )
+      (1): UniversalInvertedResidual(
+        (dw_start): Identity()
+        (pw_exp): ConvNormAct(
+          (conv): Conv2d(96, 192, kernel_size=(1, 1), stride=(1, 1), bias=False)
+          (bn): BatchNormAct2d(
+            192, eps=1e-05, momentum=0.1, affine=True, bias=True, track_running_stats=True
+            (drop): Identity()
+            (act): ReLU(inplace=True)
+          )
+        )
+        (dw_mid): ConvNormAct(
+          (conv): Conv2d(192, 192, kernel_size=(3, 3), stride=(1, 1), padding=(1, 1), groups=192, bias=False)
+          (bn): BatchNormAct2d(
+            192, eps=1e-05, momentum=0.1, affine=True, bias=True, track_running_stats=True
+            (drop): Identity()
+            (act): ReLU(inplace=True)
+          )
+        )
+        (se): Identity()
+        (pw_proj): ConvNormAct(
+          (conv): Conv2d(192, 96, kernel_size=(1, 1), stride=(1, 1), bias=False)
+          (bn): BatchNormAct2d(
+            96, eps=1e-05, momentum=0.1, affine=True, bias=True, track_running_stats=True
+            (drop): Identity()
+            (act): Identity()
+          )
+        )
+        (dw_end): Identity()
+        (layer_scale): Identity()
+        (drop_path): Identity()
+      )
+      (2): UniversalInvertedResidual(
+        (dw_start): Identity()
+        (pw_exp): ConvNormAct(
+          (conv): Conv2d(96, 192, kernel_size=(1, 1), stride=(1, 1), bias=False)
+          (bn): BatchNormAct2d(
+            192, eps=1e-05, momentum=0.1, affine=True, bias=True, track_running_stats=True
+            (drop): Identity()
+            (act): ReLU(inplace=True)
+          )
+        )
+        (dw_mid): ConvNormAct(
+          (conv): Conv2d(192, 192, kernel_size=(3, 3), stride=(1, 1), padding=(1, 1), groups=192, bias=False)
+          (bn): BatchNormAct2d(
+            192, eps=1e-05, momentum=0.1, affine=True, bias=True, track_running_stats=True
+            (drop): Identity()
+            (act): ReLU(inplace=True)
+          )
+        )
+        (se): Identity()
+        (pw_proj): ConvNormAct(
+          (conv): Conv2d(192, 96, kernel_size=(1, 1), stride=(1, 1), bias=False)
+          (bn): BatchNormAct2d(
+            96, eps=1e-05, momentum=0.1, affine=True, bias=True, track_running_stats=True
+            (drop): Identity()
+            (act): Identity()
+          )
+        )
+        (dw_end): Identity()
+        (layer_scale): Identity()
+        (drop_path): Identity()
+      )
+      (3): UniversalInvertedResidual(
+        (dw_start): Identity()
+        (pw_exp): ConvNormAct(
+          (conv): Conv2d(96, 192, kernel_size=(1, 1), stride=(1, 1), bias=False)
+          (bn): BatchNormAct2d(
+            192, eps=1e-05, momentum=0.1, affine=True, bias=True, track_running_stats=True
+            (drop): Identity()
+            (act): ReLU(inplace=True)
+          )
+        )
+        (dw_mid): ConvNormAct(
+          (conv): Conv2d(192, 192, kernel_size=(3, 3), stride=(1, 1), padding=(1, 1), groups=192, bias=False)
+          (bn): BatchNormAct2d(
+            192, eps=1e-05, momentum=0.1, affine=True, bias=True, track_running_stats=True
+            (drop): Identity()
+            (act): ReLU(inplace=True)
+          )
+        )
+        (se): Identity()
+        (pw_proj): ConvNormAct(
+          (conv): Conv2d(192, 96, kernel_size=(1, 1), stride=(1, 1), bias=False)
+          (bn): BatchNormAct2d(
+            96, eps=1e-05, momentum=0.1, affine=True, bias=True, track_running_stats=True
+            (drop): Identity()
+            (act): Identity()
+          )
+        )
+        (dw_end): Identity()
+        (layer_scale): Identity()
+        (drop_path): Identity()
+      )
+      (4): UniversalInvertedResidual(
+        (dw_start): Identity()
+        (pw_exp): ConvNormAct(
+          (conv): Conv2d(96, 192, kernel_size=(1, 1), stride=(1, 1), bias=False)
+          (bn): BatchNormAct2d(
+            192, eps=1e-05, momentum=0.1, affine=True, bias=True, track_running_stats=True
+            (drop): Identity()
+            (act): ReLU(inplace=True)
+          )
+        )
+        (dw_mid): ConvNormAct(
+          (conv): Conv2d(192, 192, kernel_size=(3, 3), stride=(1, 1), padding=(1, 1), groups=192, bias=False)
+          (bn): BatchNormAct2d(
+            192, eps=1e-05, momentum=0.1, affine=True, bias=True, track_running_stats=True
+            (drop): Identity()
+            (act): ReLU(inplace=True)
+          )
+        )
+        (se): Identity()
+        (pw_proj): ConvNormAct(
+          (conv): Conv2d(192, 96, kernel_size=(1, 1), stride=(1, 1), bias=False)
+          (bn): BatchNormAct2d(
+            96, eps=1e-05, momentum=0.1, affine=True, bias=True, track_running_stats=True
+            (drop): Identity()
+            (act): Identity()
+          )
+        )
+        (dw_end): Identity()
+        (layer_scale): Identity()
+        (drop_path): Identity()
+      )
+      (5): UniversalInvertedResidual(
+        (dw_start): ConvNormAct(
+          (conv): Conv2d(96, 96, kernel_size=(3, 3), stride=(1, 1), padding=(1, 1), groups=96, bias=False)
+          (bn): BatchNormAct2d(
+            96, eps=1e-05, momentum=0.1, affine=True, bias=True, track_running_stats=True
+            (drop): Identity()
+            (act): Identity()
+          )
+        )
+        (pw_exp): ConvNormAct(
+          (conv): Conv2d(96, 384, kernel_size=(1, 1), stride=(1, 1), bias=False)
+          (bn): BatchNormAct2d(
+            384, eps=1e-05, momentum=0.1, affine=True, bias=True, track_running_stats=True
+            (drop): Identity()
+            (act): ReLU(inplace=True)
+          )
+        )
+        (dw_mid): Identity()
+        (se): Identity()
+        (pw_proj): ConvNormAct(
+          (conv): Conv2d(384, 96, kernel_size=(1, 1), stride=(1, 1), bias=False)
+          (bn): BatchNormAct2d(
+            96, eps=1e-05, momentum=0.1, affine=True, bias=True, track_running_stats=True
+            (drop): Identity()
+            (act): Identity()
+          )
+        )
+        (dw_end): Identity()
+        (layer_scale): Identity()
+        (drop_path): Identity()
+      )
+    )
+    (3): Sequential(
+      (0): UniversalInvertedResidual(
+        (dw_start): ConvNormAct(
+          (conv): Conv2d(96, 96, kernel_size=(3, 3), stride=(1, 1), padding=(1, 1), groups=96, bias=False)
+          (bn): BatchNormAct2d(
+            96, eps=1e-05, momentum=0.1, affine=True, bias=True, track_running_stats=True
+            (drop): Identity()
+            (act): Identity()
+          )
+        )
+        (pw_exp): ConvNormAct(
+          (conv): Conv2d(96, 576, kernel_size=(1, 1), stride=(1, 1), bias=False)
+          (bn): BatchNormAct2d(
+            576, eps=1e-05, momentum=0.1, affine=True, bias=True, track_running_stats=True
+            (drop): Identity()
+            (act): ReLU(inplace=True)
+          )
+        )
+        (dw_mid): ConvNormAct(
+          (conv): Conv2d(576, 576, kernel_size=(3, 3), stride=(2, 2), padding=(1, 1), groups=576, bias=False)
+          (bn): BatchNormAct2d(
+            576, eps=1e-05, momentum=0.1, affine=True, bias=True, track_running_stats=True
+            (drop): Identity()
+            (act): ReLU(inplace=True)
+          )
+        )
+        (se): Identity()
+        (pw_proj): ConvNormAct(
+          (conv): Conv2d(576, 128, kernel_size=(1, 1), stride=(1, 1), bias=False)
+          (bn): BatchNormAct2d(
+            128, eps=1e-05, momentum=0.1, affine=True, bias=True, track_running_stats=True
+            (drop): Identity()
+            (act): Identity()
+          )
+        )
+        (dw_end): Identity()
+        (layer_scale): Identity()
+        (drop_path): Identity()
+      )
+      (1): UniversalInvertedResidual(
+        (dw_start): ConvNormAct(
+          (conv): Conv2d(128, 128, kernel_size=(5, 5), stride=(1, 1), padding=(2, 2), groups=128, bias=False)
+          (bn): BatchNormAct2d(
+            128, eps=1e-05, momentum=0.1, affine=True, bias=True, track_running_stats=True
+            (drop): Identity()
+            (act): Identity()
+          )
+        )
+        (pw_exp): ConvNormAct(
+          (conv): Conv2d(128, 512, kernel_size=(1, 1), stride=(1, 1), bias=False)
+          (bn): BatchNormAct2d(
+            512, eps=1e-05, momentum=0.1, affine=True, bias=True, track_running_stats=True
+            (drop): Identity()
+            (act): ReLU(inplace=True)
+          )
+        )
+        (dw_mid): ConvNormAct(
+          (conv): Conv2d(512, 512, kernel_size=(5, 5), stride=(1, 1), padding=(2, 2), groups=512, bias=False)
+          (bn): BatchNormAct2d(
+            512, eps=1e-05, momentum=0.1, affine=True, bias=True, track_running_stats=True
+            (drop): Identity()
+            (act): ReLU(inplace=True)
+          )
+        )
+        (se): Identity()
+        (pw_proj): ConvNormAct(
+          (conv): Conv2d(512, 128, kernel_size=(1, 1), stride=(1, 1), bias=False)
+          (bn): BatchNormAct2d(
+            128, eps=1e-05, momentum=0.1, affine=True, bias=True, track_running_stats=True
+            (drop): Identity()
+            (act): Identity()
+          )
+        )
+        (dw_end): Identity()
+        (layer_scale): Identity()
+        (drop_path): Identity()
+      )
+      (2): UniversalInvertedResidual(
+        (dw_start): Identity()
+        (pw_exp): ConvNormAct(
+          (conv): Conv2d(128, 512, kernel_size=(1, 1), stride=(1, 1), bias=False)
+          (bn): BatchNormAct2d(
+            512, eps=1e-05, momentum=0.1, affine=True, bias=True, track_running_stats=True
+            (drop): Identity()
+            (act): ReLU(inplace=True)
+          )
+        )
+        (dw_mid): ConvNormAct(
+          (conv): Conv2d(512, 512, kernel_size=(5, 5), stride=(1, 1), padding=(2, 2), groups=512, bias=False)
+          (bn): BatchNormAct2d(
+            512, eps=1e-05, momentum=0.1, affine=True, bias=True, track_running_stats=True
+            (drop): Identity()
+            (act): ReLU(inplace=True)
+          )
+        )
+        (se): Identity()
+        (pw_proj): ConvNormAct(
+          (conv): Conv2d(512, 128, kernel_size=(1, 1), stride=(1, 1), bias=False)
+          (bn): BatchNormAct2d(
+            128, eps=1e-05, momentum=0.1, affine=True, bias=True, track_running_stats=True
+            (drop): Identity()
+            (act): Identity()
+          )
+        )
+        (dw_end): Identity()
+        (layer_scale): Identity()
+        (drop_path): Identity()
+      )
+      (3): UniversalInvertedResidual(
+        (dw_start): Identity()
+        (pw_exp): ConvNormAct(
+          (conv): Conv2d(128, 384, kernel_size=(1, 1), stride=(1, 1), bias=False)
+          (bn): BatchNormAct2d(
+            384, eps=1e-05, momentum=0.1, affine=True, bias=True, track_running_stats=True
+            (drop): Identity()
+            (act): ReLU(inplace=True)
+          )
+        )
+        (dw_mid): ConvNormAct(
+          (conv): Conv2d(384, 384, kernel_size=(5, 5), stride=(1, 1), padding=(2, 2), groups=384, bias=False)
+          (bn): BatchNormAct2d(
+            384, eps=1e-05, momentum=0.1, affine=True, bias=True, track_running_stats=True
+            (drop): Identity()
+            (act): ReLU(inplace=True)
+          )
+        )
+        (se): Identity()
+        (pw_proj): ConvNormAct(
+          (conv): Conv2d(384, 128, kernel_size=(1, 1), stride=(1, 1), bias=False)
+          (bn): BatchNormAct2d(
+            128, eps=1e-05, momentum=0.1, affine=True, bias=True, track_running_stats=True
+            (drop): Identity()
+            (act): Identity()
+          )
+        )
+        (dw_end): Identity()
+        (layer_scale): Identity()
+        (drop_path): Identity()
+      )
+      (4): UniversalInvertedResidual(
+        (dw_start): Identity()
+        (pw_exp): ConvNormAct(
+          (conv): Conv2d(128, 512, kernel_size=(1, 1), stride=(1, 1), bias=False)
+          (bn): BatchNormAct2d(
+            512, eps=1e-05, momentum=0.1, affine=True, bias=True, track_running_stats=True
+            (drop): Identity()
+            (act): ReLU(inplace=True)
+          )
+        )
+        (dw_mid): ConvNormAct(
+          (conv): Conv2d(512, 512, kernel_size=(3, 3), stride=(1, 1), padding=(1, 1), groups=512, bias=False)
+          (bn): BatchNormAct2d(
+            512, eps=1e-05, momentum=0.1, affine=True, bias=True, track_running_stats=True
+            (drop): Identity()
+            (act): ReLU(inplace=True)
+          )
+        )
+        (se): Identity()
+        (pw_proj): ConvNormAct(
+          (conv): Conv2d(512, 128, kernel_size=(1, 1), stride=(1, 1), bias=False)
+          (bn): BatchNormAct2d(
+            128, eps=1e-05, momentum=0.1, affine=True, bias=True, track_running_stats=True
+            (drop): Identity()
+            (act): Identity()
+          )
+        )
+        (dw_end): Identity()
+        (layer_scale): Identity()
+        (drop_path): Identity()
+      )
+      (5): UniversalInvertedResidual(
+        (dw_start): Identity()
+        (pw_exp): ConvNormAct(
+          (conv): Conv2d(128, 512, kernel_size=(1, 1), stride=(1, 1), bias=False)
+          (bn): BatchNormAct2d(
+            512, eps=1e-05, momentum=0.1, affine=True, bias=True, track_running_stats=True
+            (drop): Identity()
+            (act): ReLU(inplace=True)
+          )
+        )
+        (dw_mid): ConvNormAct(
+          (conv): Conv2d(512, 512, kernel_size=(3, 3), stride=(1, 1), padding=(1, 1), groups=512, bias=False)
+          (bn): BatchNormAct2d(
+            512, eps=1e-05, momentum=0.1, affine=True, bias=True, track_running_stats=True
+            (drop): Identity()
+            (act): ReLU(inplace=True)
+          )
+        )
+        (se): Identity()
+        (pw_proj): ConvNormAct(
+          (conv): Conv2d(512, 128, kernel_size=(1, 1), stride=(1, 1), bias=False)
+          (bn): BatchNormAct2d(
+            128, eps=1e-05, momentum=0.1, affine=True, bias=True, track_running_stats=True
+            (drop): Identity()
+            (act): Identity()
+          )
+        )
+        (dw_end): Identity()
+        (layer_scale): Identity()
+        (drop_path): Identity()
+      )
+    )
+    (4): Sequential(
+      (0): ConvBnAct(
+        (conv): Conv2d(128, 960, kernel_size=(1, 1), stride=(1, 1), bias=False)
+        (bn1): BatchNormAct2d(
+          960, eps=1e-05, momentum=0.1, affine=True, bias=True, track_running_stats=True
+          (drop): Identity()
+          (act): ReLU(inplace=True)
+        )
+        (aa): Identity()
+        (drop_path): Identity()
+      )
+    )
+  )
+  (global_pool): SelectAdaptivePool2d(pool_type=avg, flatten=Identity())
+  (conv_head): Conv2d(960, 1280, kernel_size=(1, 1), stride=(1, 1), bias=False)
+  (norm_head): BatchNormAct2d(
+    1280, eps=1e-05, momentum=0.1, affine=True, bias=True, track_running_stats=True
+    (drop): Identity()
+    (act): ReLU(inplace=True)
+  )
+  (act2): Identity()
+  (flatten): Flatten(start_dim=1, end_dim=-1)
+  (classifier): Linear(in_features=1280, out_features=1000, bias=True)
+)
+================================================================================

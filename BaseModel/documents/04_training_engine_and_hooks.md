@@ -79,6 +79,34 @@ Hooks cho phép gắn các chức năng phụ trợ vào các điểm kích ho�
 | `EarlyStoppingHook` | Tự động ngắt huấn luyện khi validation metric không tăng sau $N$ epoch. | `monitor: 'val_loss'`, `patience: 10`, `mode: 'min'` |
 | `TensorboardHook` | Ghi log biểu đồ loss, lr, metrics ra thư mục TensorBoard (`tf_logs`). | `log_dir: Optional[str]` |
 | `WandbHook` | Theo dõi thí nghiệm trực tuyến và đồng bộ metrics lên Weights & Biases. | `project: 'BaseModel_CV'`, `name: 'run1'` |
+| `ExcelTracker` | Lưu trữ toàn bộ chỉ số loss, lr và chuẩn gradient chi tiết ra file Excel (`.xlsx`) đa sheet sau mỗi epoch, không in ra terminal. | `filename: 'training_metrics.xlsx'`, `track_gradients: true`, `grad_interval: 1` |
+
+---
+
+### 3.2. Tracking số liệu tự động ra file Excel (`ExcelTracker`)
+Module [`ExcelTracker`](file:///d:/Study/Projects/Computer_Vision/BaseModel/utils/tracker.py) chuyên trách lưu trữ số liệu huấn luyện vào file `.xlsx` mà không in ra console, gồm 2 sheet mặc định:
+- **`Epoch_Overview`**: `Epoch`, `Train_Loss`, `Val_Loss`, `Lr`, thời gian chạy `Time_Seconds`, cùng các loss và metrics phụ.
+- **`Gradients_Detail`**: `Epoch`, `Total_Grad_Norm`, cùng gradient norm của từng module con (`grad_norm_backbone`, `grad_norm_neck`, `grad_norm_head`,...).
+- **Custom Sheets / Custom Metrics**: Cho phép đăng ký thêm chỉ số hoặc tạo sheet đo đạc riêng.
+
+Khai báo trong file `config.yaml`:
+```yaml
+hooks:
+  - type: "ExcelTracker"
+    filename: "training_metrics.xlsx"
+    track_gradients: true
+    grad_interval: 1
+```
+
+Hoặc sử dụng bằng code Python:
+```python
+from BaseModel.utils import ExcelTracker
+
+tracker = ExcelTracker("training_metrics.xlsx")
+# Tự đăng ký thêm chỉ số custom
+tracker.register_metric("Epoch_Overview", "GPU_Mem_MB", lambda trainer: 1024.0)
+trainer.register_hook(tracker)
+```
 
 ---
 

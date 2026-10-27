@@ -3,9 +3,9 @@ import os
 import sys
 
 # Add project root to sys.path
-project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
-if project_root not in sys.path:
-    sys.path.insert(0, project_root)
+root_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+if root_dir not in sys.path:
+    sys.path.insert(0, root_dir)
 
 # Import custom task modules to register them into DATASETS & MODELS
 import examples.image_classification.dataset

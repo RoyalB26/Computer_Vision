@@ -107,6 +107,19 @@ def main():
             collate_fn=data_cfg.val.get("collate_fn", None),
         )
 
+    # Thống kê số lượng dữ liệu
+    num_train_data = len(train_loader.dataset) if hasattr(train_loader, "dataset") else len(train_loader)
+    num_val_data = len(val_loader.dataset) if (val_loader and hasattr(val_loader, "dataset")) else (len(val_loader) if val_loader else 0)
+
+    logger.info("=" * 60)
+    logger.info("DATASET STATISTICS:")
+    logger.info(f"Num Train Data       : {num_train_data:,} samples ({len(train_loader)} batches)")
+    if val_loader:
+        logger.info(f"Num Val Data         : {num_val_data:,} samples ({len(val_loader)} batches)")
+    else:
+        logger.info("Num Val Data         : 0 samples (No validation set configured)")
+    logger.info("=" * 60)
+
     # 7. Build Optimizer
     logger.info("Building optimizer...")
     optimizer = build_from_cfg(cfg.optimizer, OPTIMIZERS, default_args={"params": model.parameters()})

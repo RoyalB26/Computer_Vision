@@ -166,7 +166,12 @@ class BaseTrainer:
     def train(self) -> None:
         """The Master Template Method orchestrating the full training process."""
         if self.logger:
-            self.logger.info(f"Starting training on device: {self.device} | Total Epochs: {self.max_epochs}")
+            num_train = len(self.train_loader.dataset) if hasattr(self.train_loader, "dataset") else len(self.train_loader)
+            num_val = len(self.val_loader.dataset) if (self.val_loader and hasattr(self.val_loader, "dataset")) else (len(self.val_loader) if self.val_loader else 0)
+            self.logger.info(
+                f"Starting training on device: {self.device} | Total Epochs: {self.max_epochs} | "
+                f"Num Train Data: {num_train:,} | Num Val Data: {num_val:,}"
+            )
 
         self.call_hook("before_train")
 
@@ -410,8 +415,11 @@ class BaseTrainer:
             else:
                 preds = self.model(inputs)
                 outputs = {"preds": preds}
-                if self.loss_fn is not None and targets is not None:
-                    outputs["loss"] = self.loss_fn(preds, targets)
+
+            # If model didn't calculate loss internally, compute it via trainer.loss_fn
+            if "loss" not in outputs and self.loss_fn is not None and targets is not None:
+                preds_for_loss = outputs.get("preds", outputs)
+                outputs["loss"] = self.loss_fn(preds_for_loss, targets)
 
             # Update metrics
             preds = outputs.get("preds", outputs.get("pred", None))

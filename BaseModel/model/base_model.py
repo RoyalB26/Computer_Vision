@@ -62,8 +62,12 @@ class BaseModel(nn.Module, ABC):
             # If model defines loss_fn or can compute loss during validation
             try:
                 train_out = self.forward_train(inputs, targets, **kwargs)
-                if "loss" in train_out:
-                    output["loss"] = train_out["loss"]
+                if isinstance(train_out, dict):
+                    for k, v in train_out.items():
+                        if "loss" in k.lower():
+                            output[k] = v
+                elif isinstance(train_out, torch.Tensor):
+                    output["loss"] = train_out
             except Exception:
                 pass
 

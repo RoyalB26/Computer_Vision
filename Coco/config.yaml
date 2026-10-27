@@ -1,0 +1,81 @@
+# Configuration for COCO Multi-label Classification
+
+work_dir: "./work_dirs/coco_classification"
+device: "cuda"  
+seed: 42
+
+custom_imports:
+  - "Coco.model"
+  - "Coco.dataset"
+
+# 1. Model Configuration: Multi-label ConvNet
+model:
+  type: "ConvNet"
+  in_channels: 3
+  num_classes: 80
+  hidden_dim: 80
+
+# 2. Dataset Configuration
+data:
+  train:
+    dataset:
+      type: "COCOLMDBDataset"
+      data_root: "D:/apps/Datasets/COCO/COCO_data.lmdb"
+      split: "train"
+      split_ratio: 0.8
+      num_classes: 80
+      seed: 42
+      pipeline:
+        - type: "Resize"
+          size: [224, 224]
+        - type: "ToTensor"
+    batch_size: 32
+    shuffle: true
+    num_workers: 0
+    collate_fn:
+      type: "PadCollate"
+      pad_value: 0.0
+      size_divisor: 32
+  val:
+    dataset:
+      type: "COCOLMDBDataset"
+      data_root: "D:/apps/Datasets/COCO/COCO_data.lmdb"
+      split: "val"
+      split_ratio: 0.8
+      num_classes: 80
+      seed: 42
+      pipeline:
+        - type: "Resize"
+          size: [224, 224]
+        - type: "ToTensor"
+    batch_size: 32
+    shuffle: false
+    num_workers: 0
+    collate_fn:
+      type: "PadCollate"
+      pad_value: 0.0
+      size_divisor: 32
+
+# 3. Optimizer Configuration
+optimizer:
+  type: "AdamW"
+  lr: 0.0005
+  weight_decay: 0.0001
+
+# 4. LR Scheduler Configuration
+
+
+# 5. Training Engine Configuration
+train_cfg:
+  max_epochs: 100
+  val_interval: 10
+  log_interval: 500
+  grad_clip: 1.0
+  use_amp: false
+
+hooks:
+  - type: "ExcelTracker"
+    filename: "training_metrics.xlsx"       # File sẽ được lưu trong thư mục work_dir
+    track_gradients: true                   # Bật tracking gradient chi tiết
+    grad_interval: 1                        # Chu kỳ lấy mẫu gradient (mỗi 1 batch)
+    submodules: null

@@ -80,6 +80,8 @@ class ConvModule(nn.Module):
             self.act = nn.SiLU(inplace=True)
         elif act_cfg == "gelu":
             self.act = nn.GELU()
+        elif act_cfg == "Hardswish":
+            self.act = nn.Hardswish()
         else:
             self.act = nn.Identity()
 
@@ -282,7 +284,7 @@ class AnchorFreeDetHead(nn.Module):
         self.cls_out = nn.Conv2d(in_channels, num_classes, kernel_size=1)
 
         self.box_conv = ConvModule(in_channels, in_channels, kernel_size=3)
-        self.box_out = nn.Sequential(nn.Conv2d(in_channels, 4, kernel_size=1), nn.Sigmoid())
+        self.box_out = nn.Conv2d(in_channels, 4, kernel_size=1)
 
         self.obj_conv = ConvModule(in_channels, in_channels, kernel_size=3)
         self.obj_out = nn.Conv2d(in_channels, 1, kernel_size=1)

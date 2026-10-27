@@ -1,0 +1,77 @@
+# Configuration for Image Classification Example
+
+work_dir: "./work_dirs/detection"
+device: "cuda"  # supports 'cuda', 'cpu', 'mps'
+seed: 42
+
+custom_imports:
+  - "toy_detection.model"
+  - "toy_detection.dataset"
+  - "toy_detection.transform"
+
+# 1. Model Configuration
+model:
+  type: "SimpleConvNet"
+  in_channels: 3
+  num_classes: 5
+  hidden_dim: 15
+
+# 2. Dataset Configuration
+data:
+  train:
+    dataset:
+      type: "Dataset"
+      split: "train"
+      ratio: 0.8
+      img_size: [16, 16]
+      num_classes: 5
+      pipeline:
+        - type: "LocalToTensor"
+    batch_size: 16
+    shuffle: true
+    num_workers: 0
+    drop_last: true
+
+  val:
+    dataset:
+      type: "Dataset"
+      split: "val"
+      ratio: 0.8
+      img_size: [16, 16]
+      num_classes: 5
+      pipeline:
+        - type: "LocalToTensor"
+    batch_size: 16
+    shuffle: false
+    num_workers: 0
+
+# 3. Optimizer Configuration
+optimizer:
+  type: "AdamW"
+  lr: 0.001
+  weight_decay: 0.01
+
+
+# 5. Metrics Configuration
+metrics:
+  acc:
+    type: "Accuracy"
+    topk: [1]
+
+loss:
+  type: "CrossEntropyLoss"
+
+# 6. Training Engine Configuration
+train_cfg:
+  max_epochs: 100
+  val_interval: 20
+  log_interval: 1000
+  grad_clip: 1.0
+  use_amp: false
+
+hooks:
+  - type: "ExcelTracker"
+    filename: "training_metrics_3layer.xlsx"       # File sẽ được lưu trong thư mục work_dir
+    track_gradients: true                   # Bật tracking gradient chi tiết
+    grad_interval: 1                        # Chu kỳ lấy mẫu gradient (mỗi 1 batch)
+    submodules: null

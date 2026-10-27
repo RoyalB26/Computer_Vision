@@ -229,4 +229,8 @@ hooks:
     monitor: "val_loss"
     patience: 10                # Dừng train nếu sau 10 epoch loss không giảm
     mode: "min"
+  - type: "ExcelTracker"
+    filename: "training_metrics.xlsx"
+    track_gradients: true
+    grad_interval: 1
 ```
