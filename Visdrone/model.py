@@ -426,9 +426,7 @@ class VisDroneDetector(BaseModel):
         B,D,H,W = c12.shape
         feat_map= self.up_sample(c1, c3, c5, c12) # [B, dim, H, W]
 
-        up_slots= slots.unsqueeze(-1).unsqueeze(-1) # [B, C, dim, 1, 1]
-        feat_map= feat_map.unsqueeze(1) # [B, 1, dim, H, W]
-        feat_map = self.cross_attn(up_slots, feat_map)  # [B, C, dim, H, W]
+        feat_map = self.cross_attn(slots, feat_map)  # [B, C, dim, H, W]
         return slots, feat_map, attn
 
     def _compute_losses(self, cls_logits, pred_boxes, targets, device):
