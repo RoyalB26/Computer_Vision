@@ -262,9 +262,9 @@ class StandardDetHead(nn.Module):
             nn.Sigmoid()  # Dự đoán [cx, cy, w, h] chuẩn hóa [0, 1]
         )
 
-    def forward(self, feat_map: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        cls_logits = self.cls_head(feat_map)  # [B, num_classes, H, W]
-        pred_boxes = self.box_head(feat_map)  # [B, 4, H, W]
+    def forward(self, cls_feat_map, box_feat_map: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        cls_logits = self.cls_head(cls_feat_map)  # [B, num_classes, H, W]
+        pred_boxes = self.box_head(box_feat_map)  # [B, 4, H, W]
         return cls_logits, pred_boxes
 
 
@@ -324,6 +324,32 @@ class VisDroneDetectorNoSlot(BaseModel):
 
         return slots
 
+    def slot_orthogonality_loss(self, slots, eps=1e-8):
+        """
+        slots: [B, num_slots, dim]
+        Loss ép cosine similarity giữa các cặp slot khác nhau về 0.
+        """
+        B, K, D = slots.shape
+        
+        # 1. Chuẩn hóa L2 dọc theo chiều feature để tích vô hướng thành Cosine Similarity
+        slots_norm = F.normalize(slots, p=2, dim=-1, eps=eps)  # [B, K, D]
+        
+        # 2. Tính ma trận Cosine Similarity giữa mọi cặp slot qua BMM
+        # [B, K, D] x [B, D, K] -> [B, K, K]
+        cos_sim = torch.bmm(slots_norm, slots_norm.transpose(1, 2))
+        
+        # 3. Tạo ma trận đơn vị I để loại bỏ đường chéo chính (tự so với chính nó luôn = 1)
+        eye = torch.eye(K, device=slots.device).unsqueeze(0)  # [1, K, K]
+        
+        # 4. Trừ I để chỉ giữ lại độ tương đồng ngoài đường chéo: (S_norm * S_norm^T - I)
+        off_diagonal = cos_sim - eye
+        
+        # 5. Phạt bình phương các giá trị ngoài đường chéo
+        # Số lượng cặp ngoài đường chéo là K * (K - 1)
+        loss = (off_diagonal ** 2).sum(dim=(-2, -1)) / (K * (K - 1))
+        
+        return loss.mean()
+
     def extract_features(self, x: torch.Tensor) -> torch.Tensor:
         """Trích xuất đặc trưng qua Backbone và FPN, không dùng slot attention."""
         B,_,_,_= x.shape
@@ -332,9 +358,9 @@ class VisDroneDetectorNoSlot(BaseModel):
         # c12 có 576 kênh, đưa trực tiếp vào up_sample
         box_feat_map = self.up_sample_box(c1, c3, c5, c12)  # [B, dim, 160, 160]
         cls_feat_map = self.up_sample_cls(slots, c1, c3, c5, c12)  # [B, dim, 160, 160]
-        return cls_feat_map, box_feat_map
+        return slots, cls_feat_map, box_feat_map
 
-    def _compute_losses(self, cls_logits, pred_boxes, targets, device):
+    def _compute_losses(self, cls_logits, pred_boxes, slots, targets, device):
         """Tính toán Classification Loss và Bounding Box Loss."""
         batch_size, num_classes, grid_h, grid_w = cls_logits.shape
         total_cls_loss = torch.tensor(0.0, device=device)
@@ -372,23 +398,25 @@ class VisDroneDetectorNoSlot(BaseModel):
                     p_box = img_box[:, grid_y, grid_x].permute(1, 0)
                     box_loss = F.smooth_l1_loss(p_box, gt_boxes, reduction='sum')
                     total_box_loss += box_loss
-
+            img_cls_clamped = torch.clamp(img_cls, min=-15.0, max=15.0)
             cls_loss = F.binary_cross_entropy_with_logits(
-                img_cls, cls_target, 
-                pos_weight=torch.tensor([10.0], device=device),
+                img_cls_clamped, cls_target, 
+                pos_weight=torch.tensor([10.0], device=device, dtype=img_cls.dtype),
                 reduction='sum'
             )
             total_cls_loss += cls_loss
 
         norm_pixels = max(batch_size * num_classes * grid_h * grid_w, 1)
         total_cls_loss = total_cls_loss / norm_pixels
-        total_box_loss = (total_box_loss / num_pos_total) if num_pos_total > 0 else (total_box_loss * 0.0)
-        total_loss = 2.0 * total_cls_loss + 1.0 * total_box_loss
-
+        total_box_loss = (total_box_loss / max(num_pos_total, 1)) if num_pos_total > 0 else (total_box_loss * 0.0)
+        ortho_loss= self.slot_orthogonality_loss(slots)
+        total_loss = 2.0 * total_cls_loss + 1.0 * total_box_loss + ortho_loss
+        
         return {
             "loss": total_loss,
             "loss_cls": total_cls_loss,
             "loss_box": total_box_loss,
+            "ortho_loss": ortho_loss,
         }
 
     def _post_process(self, cls_logits, pred_boxes, conf_threshold=0.10, nms_threshold=0.5, max_det=100):
@@ -452,14 +480,14 @@ class VisDroneDetectorNoSlot(BaseModel):
         return results
 
     def forward_train(self, inputs: torch.Tensor, targets=None, **kwargs):
-        feat_map = self.extract_features(inputs)
-        cls_logits, pred_boxes = self.head(feat_map)
+        slots, cls_feat_map, box_feat_map= self.extract_features(inputs)
+        cls_logits, pred_boxes = self.head(cls_feat_map ,box_feat_map)
         return self._compute_losses(cls_logits, pred_boxes, targets, device=inputs.device)
 
     def predict(self, inputs: torch.Tensor, conf_threshold=0.001, nms_threshold=0.5, **kwargs):
-        feat_map = self.extract_features(inputs)
-        cls_logits, pred_boxes = self.head(feat_map)
-        return self._post_process(cls_logits, pred_boxes, conf_threshold=conf_threshold, nms_threshold=nms_threshold)
+        slots, cls_feat_map, box_feat_map= self.extract_features(inputs)
+        cls_logits, pred_boxes = self.head(cls_feat_map ,box_feat_map)
+        return self._post_process(cls_logits, pred_boxes, slots, conf_threshold=conf_threshold, nms_threshold=nms_threshold)
 
     def forward_val(
         self,
@@ -471,12 +499,12 @@ class VisDroneDetectorNoSlot(BaseModel):
         **kwargs,
     ) -> Dict[str, Any]:
         """Validation forward pass: Chỉ chạy mạng 1 LẦN duy nhất."""
-        feat_map = self.extract_features(inputs)
-        cls_logits, pred_boxes = self.head(feat_map)
+        slots, cls_feat_map, box_feat_map= self.extract_features(inputs)
+        cls_logits, pred_boxes = self.head(cls_feat_map ,box_feat_map)
 
         output = {}
         if targets is not None:
-            loss_dict = self._compute_losses(cls_logits, pred_boxes, targets, device=inputs.device)
+            loss_dict = self._compute_losses(cls_logits, pred_boxes, slots, targets, device=inputs.device)
             output.update(loss_dict)
 
         preds = self._post_process(

@@ -14,7 +14,7 @@ custom_imports:
 model:
   type: "VisDroneDetectorNoSlot"
   num_classes: 10
-  dim: 72
+  dim: 64
   images_size: 640
 
 # 2. Dataset Configuration

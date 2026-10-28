@@ -208,16 +208,22 @@ class VisDroneDetectorNoSlot(BaseModel):
                     box_loss = F.smooth_l1_loss(p_box, gt_boxes, reduction='sum')
                     total_box_loss += box_loss
 
+            # Clamp logits để đảm bảo ổn định số học trong AMP FP16
+            img_cls_clamped = torch.clamp(img_cls, min=-15.0, max=15.0)
             cls_loss = F.binary_cross_entropy_with_logits(
-                img_cls, cls_target, 
-                pos_weight=torch.tensor([10.0], device=device),
+                img_cls_clamped, cls_target, 
+                pos_weight=torch.tensor([10.0], device=device, dtype=img_cls.dtype),
                 reduction='sum'
             )
             total_cls_loss += cls_loss
 
         norm_pixels = max(batch_size * num_classes * grid_h * grid_w, 1)
         total_cls_loss = total_cls_loss / norm_pixels
-        total_box_loss = (total_box_loss / num_pos_total) if num_pos_total > 0 else (total_box_loss * 0.0)
+        total_box_loss = (total_box_loss / max(num_pos_total, 1)) if num_pos_total > 0 else (total_box_loss * 0.0)
+        
+        # Phòng ngừa triệt để NaN / Inf
+        total_cls_loss = torch.nan_to_num(total_cls_loss, nan=0.0, posinf=1.0, neginf=0.0)
+        total_box_loss = torch.nan_to_num(total_box_loss, nan=0.0, posinf=1.0, neginf=0.0)
         total_loss = 2.0 * total_cls_loss + 1.0 * total_box_loss
 
         return {

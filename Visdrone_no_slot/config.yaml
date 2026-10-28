@@ -79,5 +79,5 @@ train_cfg:
   max_epochs: 100
   val_interval: 5
   log_interval: 200
-  grad_clip: 1.0
+  grad_clip: 0.5
   use_amp: true
