@@ -3,6 +3,7 @@ Kiến trúc tiêu chuẩn (Standard FPN + Anchor-Free Head):
   Backbone (MobileNetV3) -> FPN (UpSample + DownSample) -> Anchor-free Head
 """
 from typing import Any, Dict, List, Optional, Tuple
+import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -268,6 +269,12 @@ class StandardDetHead(nn.Module):
 
         self.obj_conv = ConvModule(dim, dim, kernel_size=3)
         self.obj_out = nn.Conv2d(dim, 1, kernel_size=1)
+
+        # Khởi tạo prior probability = 0.01 cho focal loss (chuẩn RetinaNet / FCOS)
+        prior_prob = 0.01
+        bias_value = -math.log((1.0 - prior_prob) / prior_prob)
+        nn.init.constant_(self.cls_head[-1].bias, bias_value)
+        nn.init.constant_(self.obj_out.bias, bias_value)
 
     def forward(self, feat_map: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         cls_logits = self.cls_head(feat_map)  # [B, num_classes, H, W]
@@ -546,13 +553,12 @@ class VisDroneDetectorNoSlot(BaseModel):
             )
             total_obj_loss += obj_loss
 
-        norm_cls_pixels = max(batch_size * num_classes * grid_h * grid_w, 1)
-        norm_obj_pixels = max(batch_size * grid_h * grid_w, 1)
-        total_cls_loss = total_cls_loss / norm_cls_pixels
-        total_obj_loss = total_obj_loss / norm_obj_pixels
-        total_box_loss = (total_box_loss / max(num_pos_total, 1)) if num_pos_total > 0 else (total_box_loss * 0.0)
+        norm_pos = max(num_pos_total, 1)
+        total_cls_loss = total_cls_loss / norm_pos
+        total_obj_loss = total_obj_loss / norm_pos
+        total_box_loss = (total_box_loss / norm_pos) if num_pos_total > 0 else (total_box_loss * 0.0)
         ortho_loss = self.slot_orthogonality_loss(slots)
-        total_loss = 2.0 * total_cls_loss + 1.0 * total_box_loss + 1.0 * total_obj_loss + ortho_loss
+        total_loss = 1.0 * total_cls_loss + 1.0 * total_box_loss + 1.0 * total_obj_loss + ortho_loss
 
         return {
             "loss": total_loss,
@@ -571,7 +577,7 @@ class VisDroneDetectorNoSlot(BaseModel):
         nms_threshold: float = 0.5,
         max_det: int = 100,
     ) -> List[Dict[str, torch.Tensor]]:
-        """Decode box và chạy CIoU NMS tối ưu tốc độ."""
+        """Decode box và chạy DIoU NMS tối ưu tốc độ."""
         batch_size, num_classes, grid_h, grid_w = cls_logits.shape
         cls_scores = cls_logits.sigmoid()
         obj_scores = obj_logits.sigmoid()  # [B, 1, H, W]
@@ -599,8 +605,9 @@ class VisDroneDetectorNoSlot(BaseModel):
                 b_scores = torch.cat(b_scores_list, dim=0)
                 b_labels = torch.cat(b_labels_list, dim=0)
 
-                if len(b_scores) > 400:
-                    topk_idx = torch.topk(b_scores, 400).indices
+                # Chọn top 1000 candidate boxes có score cao nhất trước khi chạy NMS
+                if len(b_scores) > 1000:
+                    topk_idx = torch.topk(b_scores, 1000).indices
                     b_boxes = b_boxes[topk_idx]
                     b_scores = b_scores[topk_idx]
                     b_labels = b_labels[topk_idx]

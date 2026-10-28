@@ -72,7 +72,21 @@ hooks:
     filename: "training_metrics.xlsx"
     track_gradients: true
     grad_interval: 1
-    submodules: null
+    submodules:       
+      # --- Các khối cấp 1 ---
+      - "backbone"
+      - "downsample"
+      - "up_sample_cls"
+      - "head"
+      # --- Chi tiết các nhánh trong Head ---
+      - "head.cls_head"     # Nhánh phân loại
+      - "head.box_head"     # Nhánh dự đoán bbox (offset + size)
+      - "head.obj_conv"     # Nhánh đặc trưng objectness
+      - "head.obj_out"      # Lớp output objectness
+      # --- Chi tiết các tầng Cross-Attention ---
+      - "up_sample_cls.attn1"      # Cross-Attention tầng 40x40
+      - "up_sample_cls.attn2"      # Cross-Attention tầng 80x80
+      - "up_sample_cls.attn_last"   # Cross-Attention tầng 160x160
 
 # 5. Training Engine Configuration
 train_cfg:
