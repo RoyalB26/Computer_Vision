@@ -226,8 +226,6 @@ class VisDroneMAP(BaseMetric):
 
             # Sắp xếp theo confidence giảm dần
             detections.sort(key=lambda x: x[1], reverse=True)
-            # Chỉ lấy tối đa 1000 detections có score cao nhất cho mỗi class để tăng tốc độ tính mAP
-            detections = detections[:1000]
 
             # Tính AP cho từng ngưỡng IoU
             for th in all_eval_thresholds:
@@ -256,7 +254,7 @@ class VisDroneMAP(BaseMetric):
         map_per_thresh: Dict[float, float] = {}
         for th in all_eval_thresholds:
             aps = ap_table[th]
-            map_per_thresh[th] = (float(np.mean(aps)) * 100.0) if len(aps) > 0 else 0.0
+            map_per_thresh[th] = (float(np.mean(aps))) if len(aps) > 0 else 0.0
 
         map_50 = map_per_thresh.get(0.50, 0.0)
         map_75 = map_per_thresh.get(0.75, 0.0)
