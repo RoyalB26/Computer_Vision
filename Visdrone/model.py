@@ -237,7 +237,7 @@ class ClassSpecificDetHead(nn.Module):
             )  # Mỗi class ra đúng 1 heatmap độc lập
         )
 
-        # 2. Box Head (Dùng chung hoặc riêng tùy chọn, ở đây làm riêng luôn theo class)
+        # 2. Box Head: Dự đoán offset [dx, dy, w, h] cho từng ô lưới (trong khoảng [0, 1])
         self.box_head = nn.Sequential(
             nn.Conv2d(
                 num_classes * dim, num_classes * dim, 
@@ -249,8 +249,13 @@ class ClassSpecificDetHead(nn.Module):
                 num_classes * dim, num_classes * 4, 
                 kernel_size=1, groups=num_classes
             ),
-            nn.Sigmoid()  # Giữ box luôn trong khoảng [0, 1]
+            nn.Sigmoid()  # dx, dy là offset trong ô [0, 1], w, h chuẩn hóa [0, 1]
         )
+
+        # Khởi tạo bias cho cls_head theo chuẩn Focal Loss (prior_prob = 0.01)
+        prior_prob = 0.01
+        bias_value = -math.log((1.0 - prior_prob) / prior_prob)
+        nn.init.constant_(self.cls_head[-1].bias, bias_value)
 
     def forward(self, feat_map: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         # feat_map: [B, C, dim, H, W]
@@ -260,13 +265,13 @@ class ClassSpecificDetHead(nn.Module):
         feat_grouped = feat_map.view(B, C * dim, H, W)
 
         # Chạy song song 10 heads cho 10 class cùng lúc:
-        cls_logits = self.cls_head(feat_grouped)    # [B, C, H, W]
-        pred_boxes = self.box_head(feat_grouped)    # [B, C * 4, H, W]
+        cls_logits = self.cls_head(feat_grouped)      # [B, C, H, W]
+        pred_offsets = self.box_head(feat_grouped)    # [B, C * 4, H, W]
 
-        # Reshape pred_boxes về [B, C, 4, H, W]
-        pred_boxes = pred_boxes.view(B, C, 4, H, W)
+        # Reshape pred_offsets về [B, C, 4, H, W]
+        pred_offsets = pred_offsets.view(B, C, 4, H, W)
 
-        return cls_logits, pred_boxes
+        return cls_logits, pred_offsets
 
 class SlotCrossAttention(nn.Module):
     """
@@ -473,9 +478,50 @@ class VisDroneDetector(BaseModel):
         slots, feat_map, attn_weights = self.cross_attn(slots, feat_map)  # [B, C, dim, H, W]
         return slots, feat_map, attn_weights, pure_map
 
-    def _compute_losses(self, cls_logits, pred_boxes, targets, device):
-        """Hàm dùng chung tính Loss từ cls_logits và pred_boxes."""
+    def _decode_boxes(self, pred_offsets: torch.Tensor) -> torch.Tensor:
+        """Decode offset dự đoán [dx, dy, w, h] tại mỗi ô lưới thành tọa độ box chuẩn hóa [cx, cy, w, h]."""
+        device = pred_offsets.device
+        dtype = pred_offsets.dtype
+        if pred_offsets.dim() == 5:
+            B, C, _, H, W = pred_offsets.shape
+            grid_y, grid_x = torch.meshgrid(
+                torch.arange(H, device=device, dtype=dtype),
+                torch.arange(W, device=device, dtype=dtype),
+                indexing="ij",
+            )
+            cx = (grid_x.view(1, 1, H, W) + pred_offsets[:, :, 0]) / W
+            cy = (grid_y.view(1, 1, H, W) + pred_offsets[:, :, 1]) / H
+            w = pred_offsets[:, :, 2]
+            h = pred_offsets[:, :, 3]
+            return torch.stack([cx, cy, w, h], dim=2)
+        else:
+            B, _, H, W = pred_offsets.shape
+            grid_y, grid_x = torch.meshgrid(
+                torch.arange(H, device=device, dtype=dtype),
+                torch.arange(W, device=device, dtype=dtype),
+                indexing="ij",
+            )
+            cx = (grid_x.view(1, H, W) + pred_offsets[:, 0]) / W
+            cy = (grid_y.view(1, H, W) + pred_offsets[:, 1]) / H
+            w = pred_offsets[:, 2]
+            h = pred_offsets[:, 3]
+            return torch.stack([cx, cy, w, h], dim=1)
+
+    @staticmethod
+    def _cxcywh_to_xyxy(boxes: torch.Tensor) -> torch.Tensor:
+        """Chuyển đổi boxes từ [cx, cy, w, h] sang [x1, y1, x2, y2]."""
+        cx, cy, w, h = boxes[:, 0], boxes[:, 1], boxes[:, 2], boxes[:, 3]
+        x1 = cx - w / 2.0
+        y1 = cy - h / 2.0
+        x2 = cx + w / 2.0
+        y2 = cy + h / 2.0
+        return torch.stack([x1, y1, x2, y2], dim=-1)
+
+    def _compute_losses(self, cls_logits, pred_offsets, targets, device):
+        """Hàm dùng chung tính Focal Loss (cls) và DIoU Loss (box từ offset)."""
         batch_size, num_classes, grid_h, grid_w = cls_logits.shape
+        pred_boxes = self._decode_boxes(pred_offsets)
+
         total_cls_loss = torch.tensor(0.0, device=device)
         total_box_loss = torch.tensor(0.0, device=device)
         num_pos_total = 0
@@ -512,19 +558,27 @@ class VisDroneDetector(BaseModel):
                         p_box = img_box[valid_labels, :, grid_y, grid_x]
                     else:
                         p_box = img_box[:, grid_y, grid_x].permute(1, 0)
-                    box_loss = F.smooth_l1_loss(p_box, gt_boxes, reduction='sum')
+
+                    p_xyxy = self._cxcywh_to_xyxy(p_box)
+                    gt_xyxy = self._cxcywh_to_xyxy(gt_boxes)
+                    box_loss = torchvision.ops.distance_box_iou_loss(
+                        p_xyxy, gt_xyxy, reduction="sum"
+                    )
                     total_box_loss += box_loss
 
-            cls_loss = F.binary_cross_entropy_with_logits(
-                img_cls, cls_target, 
-                pos_weight=torch.tensor([10.0], device=device),
-                reduction='sum'
+            cls_loss = torchvision.ops.sigmoid_focal_loss(
+                img_cls,
+                cls_target,
+                alpha=0.25,
+                gamma=2.0,
+                reduction="sum",
             )
             total_cls_loss += cls_loss
 
-        norm_pixels = max(batch_size * num_classes * grid_h * grid_w, 1)
-        total_cls_loss = total_cls_loss / norm_pixels
-        total_box_loss = (total_box_loss / num_pos_total) if num_pos_total > 0 else (total_box_loss * 0.0)
+        # Chuẩn hóa theo tổng số mẫu dương (num_pos_total), không chia cho toàn bộ số pixel (B * C * H * W)
+        norm_pos = max(num_pos_total, 1)
+        total_cls_loss = total_cls_loss / norm_pos
+        total_box_loss = (total_box_loss / norm_pos) if num_pos_total > 0 else (total_box_loss * 0.0)
         total_loss = 2.0 * total_cls_loss + 1.0 * total_box_loss
 
         return {
@@ -533,10 +587,11 @@ class VisDroneDetector(BaseModel):
             "loss_box": total_box_loss,
         }
 
-    def _post_process(self, cls_logits, pred_boxes, conf_threshold=0.10, nms_threshold=0.5, max_det=100):
-        """Decode box và chạy NMS tối ưu tốc độ."""
+    def _post_process(self, cls_logits, pred_offsets, conf_threshold=0.10, nms_threshold=0.5, max_det=100):
+        """Decode offset thành box và chạy NMS tối ưu tốc độ."""
         batch_size, num_classes, grid_h, grid_w = cls_logits.shape
         cls_scores = cls_logits.sigmoid()
+        pred_boxes = self._decode_boxes(pred_offsets)
         results = []
         for b in range(batch_size):
             b_boxes_list, b_scores_list, b_labels_list = [], [], []
@@ -565,15 +620,7 @@ class VisDroneDetector(BaseModel):
                     b_scores = b_scores[topk_idx]
                     b_labels = b_labels[topk_idx]
                 if nms_threshold is not None and len(b_boxes) > 0:
-                    xyxy = torch.stack(
-                        [
-                            b_boxes[:, 0] - b_boxes[:, 2] / 2,
-                            b_boxes[:, 1] - b_boxes[:, 3] / 2,
-                            b_boxes[:, 0] + b_boxes[:, 2] / 2,
-                            b_boxes[:, 1] + b_boxes[:, 3] / 2,
-                        ],
-                        dim=1,
-                    )
+                    xyxy = self._cxcywh_to_xyxy(b_boxes)
                     keep = torchvision.ops.batched_nms(xyxy, b_scores, b_labels, nms_threshold)
                     keep = keep[:max_det]
                     b_boxes = b_boxes[keep]
@@ -594,14 +641,14 @@ class VisDroneDetector(BaseModel):
     def forward_train(self, inputs: torch.Tensor, targets=None, **kwargs):
         slots, feat_map, attn, pure_map = self.extract_features(inputs)
         feat_map = self.deformable(slots, pure_map, feat_map, attn)
-        cls_logits, pred_boxes = self.head(feat_map)
-        return self._compute_losses(cls_logits, pred_boxes, targets, device=inputs.device)
+        cls_logits, pred_offsets = self.head(feat_map)
+        return self._compute_losses(cls_logits, pred_offsets, targets, device=inputs.device)
     
     def predict(self, inputs: torch.Tensor, conf_threshold=0.001, nms_threshold=0.5, **kwargs):
         slots, feat_map, attn, pure_map = self.extract_features(inputs)
         feat_map = self.deformable(slots, pure_map, feat_map, attn)
-        cls_logits, pred_boxes = self.head(feat_map)
-        return self._post_process(cls_logits, pred_boxes, conf_threshold=conf_threshold, nms_threshold=nms_threshold)
+        cls_logits, pred_offsets = self.head(feat_map)
+        return self._post_process(cls_logits, pred_offsets, conf_threshold=conf_threshold, nms_threshold=nms_threshold)
 
     def forward_val(
         self,
@@ -616,17 +663,17 @@ class VisDroneDetector(BaseModel):
         # 1. Chạy mạng 1 lần duy nhất
         slots, feat_map, attn, pure_map = self.extract_features(inputs)
         feat_map = self.deformable(slots, pure_map, feat_map, attn)
-        cls_logits, pred_boxes = self.head(feat_map)
+        cls_logits, pred_offsets = self.head(feat_map)
         # 2. Tính val loss nếu có targets
         output = {}
         if targets is not None:
             # Gọi trực tiếp hàm tính loss bằng chính logits vừa tính ra
             # (Đảm bảo không phải chạy lại extract_features)
-            loss_dict = self._compute_losses(cls_logits, pred_boxes, targets, device=inputs.device)
+            loss_dict = self._compute_losses(cls_logits, pred_offsets, targets, device=inputs.device)
             output.update(loss_dict)
         # 3. Decode predictions phục vụ tính mAP
         preds = self._post_process(
-            cls_logits, pred_boxes,
+            cls_logits, pred_offsets,
             conf_threshold=conf_threshold,
             nms_threshold=nms_threshold,
             max_det=max_det,

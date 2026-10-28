@@ -238,7 +238,7 @@ class VisDroneMAP(BaseMetric):
                 )
                 ap_table[th].append(ap)
                 if th == 0.50:
-                    per_class_ap50[c] = round(ap * 100.0, 2)
+                    per_class_ap50[c] = round(ap , 2)
 
         # In bảng thống kê chi tiết khả năng nhận diện từng class ra terminal
         print("\n" + "=" * 62)
