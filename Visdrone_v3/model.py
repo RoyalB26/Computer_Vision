@@ -13,6 +13,9 @@ from BaseModel.core import MODELS
 from BaseModel.model import BaseModel
 from torchvision.models import MobileNet_V3_Small_Weights, mobilenet_v3_small
 from torchvision.models.feature_extraction import create_feature_extractor
+from BaseModel.model.layers_module import (
+    ConvModule,
+)
 
 
 class BackBone(nn.Module):
@@ -262,12 +265,71 @@ class StandardDetHead(nn.Module):
             nn.Sigmoid()  # Dự đoán [cx, cy, w, h] chuẩn hóa [0, 1]
         )
 
-    def forward(self, cls_feat_map, box_feat_map: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        self.obj_conv = ConvModule(dim, dim, kernel_size=3)
+        self.obj_out = nn.Conv2d(dim, 1, kernel_size=1)
+
+    def forward(self, cls_feat_map, box_feat_map: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         cls_logits = self.cls_head(cls_feat_map)  # [B, num_classes, H, W]
         pred_boxes = self.box_head(box_feat_map)  # [B, 4, H, W]
-        return cls_logits, pred_boxes
+        obj_logits = self.obj_out(self.obj_conv(cls_feat_map))
+        return cls_logits, pred_boxes, obj_logits
 
 
+
+
+def ciou_nms(boxes: torch.Tensor, scores: torch.Tensor, iou_threshold: float) -> torch.Tensor:
+    """Non-Maximum Suppression using Complete IoU (CIoU).
+    Args:
+        boxes: Tensor shape (N, 4) in (x1, y1, x2, y2) format.
+        scores: Tensor shape (N,) confidence scores.
+        iou_threshold: Threshold for CIoU suppression.
+    Returns:
+        Tensor of indices to keep.
+    """
+    if boxes.numel() == 0:
+        return torch.empty((0,), dtype=torch.long, device=boxes.device)
+    order = scores.argsort(descending=True)
+    keep = []
+    while order.numel() > 0:
+        i = order[0].item()
+        keep.append(i)
+        if order.numel() == 1:
+            break
+        cur_box = boxes[i : i + 1]
+        rem_boxes = boxes[order[1:]]
+        ciou = torchvision.ops.complete_box_iou(cur_box, rem_boxes).squeeze(0)
+        mask = ciou < iou_threshold
+        order = order[1:][mask]
+    return torch.tensor(keep, dtype=torch.long, device=boxes.device)
+
+
+def batched_ciou_nms(
+    boxes: torch.Tensor,
+    scores: torch.Tensor,
+    idxs: torch.Tensor,
+    iou_threshold: float,
+) -> torch.Tensor:
+    """Per-category Batched NMS using Complete IoU (CIoU)."""
+    if boxes.numel() == 0:
+        return torch.empty((0,), dtype=torch.long, device=boxes.device)
+
+    unique_idxs = torch.unique(idxs)
+    keep_list = []
+    for cls_id in unique_idxs:
+        cls_mask = idxs == cls_id
+        cls_indices = torch.where(cls_mask)[0]
+        cls_boxes = boxes[cls_indices]
+        cls_scores = scores[cls_indices]
+
+        cls_keep = ciou_nms(cls_boxes, cls_scores, iou_threshold)
+        keep_list.append(cls_indices[cls_keep])
+
+    if len(keep_list) == 0:
+        return torch.empty((0,), dtype=torch.long, device=boxes.device)
+
+    keep = torch.cat(keep_list, dim=0)
+    keep = keep[scores[keep].argsort(descending=True)]
+    return keep
 
 
 @MODELS.register_module()
@@ -360,22 +422,38 @@ class VisDroneDetectorNoSlot(BaseModel):
         cls_feat_map = self.up_sample_cls(slots, c1, c3, c5, c12)  # [B, dim, 160, 160]
         return slots, cls_feat_map, box_feat_map
 
-    def _compute_losses(self, cls_logits, pred_boxes, slots, targets, device):
-        """Tính toán Classification Loss và Bounding Box Loss."""
+    def _compute_losses(
+        self,
+        cls_logits: torch.Tensor,
+        pred_boxes: torch.Tensor,
+        obj_logits: torch.Tensor,
+        slots: torch.Tensor,
+        targets: Optional[List[Dict[str, torch.Tensor]]] = None,
+        device: Optional[torch.device] = None,
+    ) -> Dict[str, torch.Tensor]:
+        """Tính toán Classification Loss, Bounding Box CIoU Loss, Objectness Loss và Slot Orthogonality Loss."""
+        if device is None:
+            device = cls_logits.device
+
         batch_size, num_classes, grid_h, grid_w = cls_logits.shape
         total_cls_loss = torch.tensor(0.0, device=device)
         total_box_loss = torch.tensor(0.0, device=device)
+        total_obj_loss = torch.tensor(0.0, device=device)
         num_pos_total = 0
 
         for b in range(batch_size):
-            img_cls = cls_logits[b]  # [num_classes, H, W]
-            img_box = pred_boxes[b]  # [4, H, W]
+            img_cls = cls_logits[b]        # [num_classes, H, W]
+            img_box = pred_boxes[b]        # [4, H, W]
+            img_obj = obj_logits[b, 0]     # [H, W]
+
             target_dict = targets[b] if targets is not None and b < len(targets) else None
             gt_boxes = target_dict.get("boxes", torch.empty((0, 4), device=device)) if target_dict else torch.empty((0, 4), device=device)
             gt_labels = target_dict.get("labels", torch.empty((0,), device=device, dtype=torch.long)) if target_dict else torch.empty((0,), device=device, dtype=torch.long)
             num_gt = len(gt_boxes)
 
             cls_target = torch.zeros((num_classes, grid_h, grid_w), device=device)
+            obj_target = torch.zeros((grid_h, grid_w), device=device)
+
             if num_gt > 0:
                 gt_boxes = gt_boxes.to(device)
                 gt_labels = gt_labels.to(device)
@@ -395,40 +473,89 @@ class VisDroneDetectorNoSlot(BaseModel):
                 num_pos_total += num_pos
                 if num_pos > 0:
                     cls_target[valid_labels, grid_y, grid_x] = 1.0
-                    p_box = img_box[:, grid_y, grid_x].permute(1, 0)
-                    box_loss = F.smooth_l1_loss(p_box, gt_boxes, reduction='sum')
+                    obj_target[grid_y, grid_x] = 1.0
+
+                    p_box = img_box[:, grid_y, grid_x].permute(1, 0)  # [num_pos, 4] dạng [cx, cy, w, h]
+
+                    # Chuyển [cx, cy, w, h] sang [x1, y1, x2, y2] cho CIoU Loss
+                    p_x1 = (p_box[:, 0] - p_box[:, 2] / 2).clamp(min=0.0)
+                    p_y1 = (p_box[:, 1] - p_box[:, 3] / 2).clamp(min=0.0)
+                    p_x2 = (p_box[:, 0] + p_box[:, 2] / 2).clamp(max=1.0)
+                    p_y2 = (p_box[:, 1] + p_box[:, 3] / 2).clamp(max=1.0)
+                    p_box_xyxy = torch.stack(
+                        [p_x1, p_y1, torch.maximum(p_x1 + 1e-4, p_x2), torch.maximum(p_y1 + 1e-4, p_y2)],
+                        dim=1,
+                    )
+
+                    gt_x1 = (gt_boxes[:, 0] - gt_boxes[:, 2] / 2).clamp(min=0.0)
+                    gt_y1 = (gt_boxes[:, 1] - gt_boxes[:, 3] / 2).clamp(min=0.0)
+                    gt_x2 = (gt_boxes[:, 0] + gt_boxes[:, 2] / 2).clamp(max=1.0)
+                    gt_y2 = (gt_boxes[:, 1] + gt_boxes[:, 3] / 2).clamp(max=1.0)
+                    gt_boxes_xyxy = torch.stack(
+                        [gt_x1, gt_y1, torch.maximum(gt_x1 + 1e-4, gt_x2), torch.maximum(gt_y1 + 1e-4, gt_y2)],
+                        dim=1,
+                    )
+
+                    box_loss = torchvision.ops.complete_box_iou_loss(p_box_xyxy, gt_boxes_xyxy, reduction='sum')
                     total_box_loss += box_loss
+
             img_cls_clamped = torch.clamp(img_cls, min=-15.0, max=15.0)
-            cls_loss = F.binary_cross_entropy_with_logits(
-                img_cls_clamped, cls_target, 
-                pos_weight=torch.tensor([10.0], device=device, dtype=img_cls.dtype),
-                reduction='sum'
+            cls_loss = torchvision.ops.sigmoid_focal_loss(
+                img_cls_clamped,
+                cls_target,
+                alpha=0.25,
+                gamma=2.0,
+                reduction='sum',
             )
             total_cls_loss += cls_loss
 
-        norm_pixels = max(batch_size * num_classes * grid_h * grid_w, 1)
-        total_cls_loss = total_cls_loss / norm_pixels
+            img_obj_clamped = torch.clamp(img_obj, min=-15.0, max=15.0)
+            obj_loss = torchvision.ops.sigmoid_focal_loss(
+                img_obj_clamped,
+                obj_target,
+                alpha=0.25,
+                gamma=2.0,
+                reduction='sum',
+            )
+            total_obj_loss += obj_loss
+
+        norm_cls_pixels = max(batch_size * num_classes * grid_h * grid_w, 1)
+        norm_obj_pixels = max(batch_size * grid_h * grid_w, 1)
+        total_cls_loss = total_cls_loss / norm_cls_pixels
+        total_obj_loss = total_obj_loss / norm_obj_pixels
         total_box_loss = (total_box_loss / max(num_pos_total, 1)) if num_pos_total > 0 else (total_box_loss * 0.0)
-        ortho_loss= self.slot_orthogonality_loss(slots)
-        total_loss = 2.0 * total_cls_loss + 1.0 * total_box_loss + ortho_loss
-        
+        ortho_loss = self.slot_orthogonality_loss(slots)
+        total_loss = 2.0 * total_cls_loss + 1.0 * total_box_loss + 1.0 * total_obj_loss + ortho_loss
+
         return {
             "loss": total_loss,
             "loss_cls": total_cls_loss,
             "loss_box": total_box_loss,
+            "loss_obj": total_obj_loss,
             "ortho_loss": ortho_loss,
         }
 
-    def _post_process(self, cls_logits, pred_boxes, conf_threshold=0.10, nms_threshold=0.5, max_det=100):
-        """Decode box và chạy NMS tối ưu tốc độ."""
+    def _post_process(
+        self,
+        cls_logits: torch.Tensor,
+        pred_boxes: torch.Tensor,
+        obj_logits: torch.Tensor,
+        conf_threshold: float = 0.10,
+        nms_threshold: float = 0.5,
+        max_det: int = 100,
+    ) -> List[Dict[str, torch.Tensor]]:
+        """Decode box và chạy CIoU NMS tối ưu tốc độ."""
         batch_size, num_classes, grid_h, grid_w = cls_logits.shape
         cls_scores = cls_logits.sigmoid()
+        obj_scores = obj_logits.sigmoid()  # [B, 1, H, W]
         results = []
 
         for b in range(batch_size):
             b_boxes_list, b_scores_list, b_labels_list = [], [], []
+            b_scores_map = cls_scores[b] * obj_scores[b, 0:1]  # [num_classes, H, W]
+
             for c in range(num_classes):
-                c_score = cls_scores[b, c]
+                c_score = b_scores_map[c]
                 mask = c_score >= conf_threshold
                 if not mask.any():
                     continue
@@ -452,16 +579,20 @@ class VisDroneDetectorNoSlot(BaseModel):
                     b_labels = b_labels[topk_idx]
 
                 if nms_threshold is not None and len(b_boxes) > 0:
+                    x1 = (b_boxes[:, 0] - b_boxes[:, 2] / 2).clamp(min=0.0)
+                    y1 = (b_boxes[:, 1] - b_boxes[:, 3] / 2).clamp(min=0.0)
+                    x2 = (b_boxes[:, 0] + b_boxes[:, 2] / 2).clamp(max=1.0)
+                    y2 = (b_boxes[:, 1] + b_boxes[:, 3] / 2).clamp(max=1.0)
                     xyxy = torch.stack(
                         [
-                            b_boxes[:, 0] - b_boxes[:, 2] / 2,
-                            b_boxes[:, 1] - b_boxes[:, 3] / 2,
-                            b_boxes[:, 0] + b_boxes[:, 2] / 2,
-                            b_boxes[:, 1] + b_boxes[:, 3] / 2,
+                            x1,
+                            y1,
+                            torch.maximum(x1 + 1e-4, x2),
+                            torch.maximum(y1 + 1e-4, y2),
                         ],
                         dim=1,
                     )
-                    keep = torchvision.ops.batched_nms(xyxy, b_scores, b_labels, nms_threshold)
+                    keep = batched_ciou_nms(xyxy, b_scores, b_labels, nms_threshold)
                     keep = keep[:max_det]
                     b_boxes = b_boxes[keep]
                     b_scores = b_scores[keep]
@@ -480,14 +611,14 @@ class VisDroneDetectorNoSlot(BaseModel):
         return results
 
     def forward_train(self, inputs: torch.Tensor, targets=None, **kwargs):
-        slots, cls_feat_map, box_feat_map= self.extract_features(inputs)
-        cls_logits, pred_boxes = self.head(cls_feat_map ,box_feat_map)
-        return self._compute_losses(cls_logits, pred_boxes, targets, device=inputs.device)
+        slots, cls_feat_map, box_feat_map = self.extract_features(inputs)
+        cls_logits, pred_boxes, obj_logits = self.head(cls_feat_map, box_feat_map)
+        return self._compute_losses(cls_logits, pred_boxes, obj_logits, slots, targets, device=inputs.device)
 
     def predict(self, inputs: torch.Tensor, conf_threshold=0.001, nms_threshold=0.5, **kwargs):
-        slots, cls_feat_map, box_feat_map= self.extract_features(inputs)
-        cls_logits, pred_boxes = self.head(cls_feat_map ,box_feat_map)
-        return self._post_process(cls_logits, pred_boxes, slots, conf_threshold=conf_threshold, nms_threshold=nms_threshold)
+        slots, cls_feat_map, box_feat_map = self.extract_features(inputs)
+        cls_logits, pred_boxes, obj_logits = self.head(cls_feat_map, box_feat_map)
+        return self._post_process(cls_logits, pred_boxes, obj_logits, conf_threshold=conf_threshold, nms_threshold=nms_threshold)
 
     def forward_val(
         self,
@@ -499,16 +630,16 @@ class VisDroneDetectorNoSlot(BaseModel):
         **kwargs,
     ) -> Dict[str, Any]:
         """Validation forward pass: Chỉ chạy mạng 1 LẦN duy nhất."""
-        slots, cls_feat_map, box_feat_map= self.extract_features(inputs)
-        cls_logits, pred_boxes = self.head(cls_feat_map ,box_feat_map)
+        slots, cls_feat_map, box_feat_map = self.extract_features(inputs)
+        cls_logits, pred_boxes, obj_logits = self.head(cls_feat_map, box_feat_map)
 
         output = {}
         if targets is not None:
-            loss_dict = self._compute_losses(cls_logits, pred_boxes, slots, targets, device=inputs.device)
+            loss_dict = self._compute_losses(cls_logits, pred_boxes, obj_logits, slots, targets, device=inputs.device)
             output.update(loss_dict)
 
         preds = self._post_process(
-            cls_logits, pred_boxes,
+            cls_logits, pred_boxes, obj_logits,
             conf_threshold=conf_threshold,
             nms_threshold=nms_threshold,
             max_det=max_det,
