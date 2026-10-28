@@ -208,6 +208,8 @@ class VisDroneMAP(BaseMetric):
 
             # Sắp xếp theo confidence giảm dần
             detections.sort(key=lambda x: x[1], reverse=True)
+            # Chỉ lấy tối đa 1000 detections có score cao nhất cho mỗi class để tăng tốc độ tính mAP
+            detections = detections[:1000]
 
             # Tính AP cho từng ngưỡng IoU
             for th in all_eval_thresholds:
