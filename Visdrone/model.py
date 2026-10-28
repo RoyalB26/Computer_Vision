@@ -284,7 +284,6 @@ class SlotCrossAttention(nn.Module):
         # Chiếu K, V từ Feature Map (dùng Conv 1x1 siêu nhanh)
         self.k_proj = nn.Conv2d(dim, dim, kernel_size=1, bias=False)
         self.v_proj = nn.Conv2d(dim, dim, kernel_size=1, bias=False)
-        self.conv = nn.Conv2d(self.num_heads, 1, 1, 1, 0)
         # Output projection & Normalization
         self.out_proj = nn.Conv2d(dim, dim, kernel_size=1)
         self.norm_feat = nn.BatchNorm2d(dim)
@@ -319,15 +318,13 @@ class SlotCrossAttention(nn.Module):
         slot_context = torch.einsum('bchn, bnhd -> bchd', attn_weights, v)
         slot_context = slot_context.reshape(B, C, D) # [B, C, dim]
         slots= slot_context
-        attn = attn_weights.permute(0, 2, 1, 3)
-        attn = self.conv(attn).squeeze(1) # [B, num_classes, N]
         # 5. Phối hợp đặc trưng (Modulation):
         # Thay vì chỉ cộng broadcast đơn thuần, ta kết hợp cả cộng và nhân tương quan (Gate Modulation):
         slot_context = slot_context.unsqueeze(-1).unsqueeze(-1) # [B, C, dim, 1, 1]
         feat_expanded = feat_map.unsqueeze(1)                   # [B, 1, dim, H, W]
         # Class Feature Map: vừa giữ đặc trưng không gian nét, vừa được lọc theo đặc trưng của class!
         out = feat_expanded * torch.sigmoid(slot_context) + slot_context # [B, C, dim, H, W]
-        return slots, out, attn
+        return slots, out, attn_weights.mean(dim= -2)
 
 @MODELS.register_module()
 class VisDroneDetector(BaseModel):
@@ -473,7 +470,7 @@ class VisDroneDetector(BaseModel):
         B,D,H,W = c12.shape
         feat_map= self.up_sample(c1, c3, c5, c12) # [B, dim, H, W]
 
-        _, feat_map, attn_weights = self.cross_attn(slots, feat_map)  # [B, C, dim, H, W]
+        slots, feat_map, attn_weights = self.cross_attn(slots, feat_map)  # [B, C, dim, H, W]
         return slots, feat_map, attn_weights, pure_map
 
     def _compute_losses(self, cls_logits, pred_boxes, targets, device):
