@@ -651,7 +651,7 @@ class VisDroneDetectorNoSlot(BaseModel):
         self,
         inputs: torch.Tensor,
         targets: Optional[List[Dict[str, torch.Tensor]]] = None,
-        conf_threshold: float = 0.001,
+        conf_threshold: float = 0.25,
         nms_threshold: float = 0.5,
         max_det: int = 100,
         **kwargs,
