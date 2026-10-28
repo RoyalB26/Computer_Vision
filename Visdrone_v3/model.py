@@ -257,12 +257,13 @@ class StandardDetHead(nn.Module):
         )
 
         # Nhánh Bounding Box: [B, dim, H, W] -> [B, 4, H, W]
+        # Kênh 0, 1: offset tâm (dx, dy) cục bộ quanh cell
+        # Kênh 2, 3: kích thước (w, h)
         self.box_head = nn.Sequential(
             nn.Conv2d(dim, dim, kernel_size=3, padding=1, bias=False),
             nn.BatchNorm2d(dim),
             nn.ReLU(inplace=True),
             nn.Conv2d(dim, 4, kernel_size=1),
-            nn.Sigmoid()  # Dự đoán [cx, cy, w, h] chuẩn hóa [0, 1]
         )
 
         self.obj_conv = ConvModule(dim, dim, kernel_size=3)
@@ -270,8 +271,29 @@ class StandardDetHead(nn.Module):
 
     def forward(self, cls_feat_map, box_feat_map: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         cls_logits = self.cls_head(cls_feat_map)  # [B, num_classes, H, W]
-        pred_boxes = self.box_head(box_feat_map)  # [B, 4, H, W]
+        raw_box = self.box_head(box_feat_map)     # [B, 4, H, W]
         obj_logits = self.obj_out(self.obj_conv(cls_feat_map))
+
+        # Decode tọa độ theo offset lân cận cell (-1, 1)
+        B, _, H, W = raw_box.shape
+        grid_y, grid_x = torch.meshgrid(
+            torch.arange(H, device=raw_box.device, dtype=raw_box.dtype),
+            torch.arange(W, device=raw_box.device, dtype=raw_box.dtype),
+            indexing='ij',
+        )
+        cell_cx = (grid_x + 0.5) / W
+        cell_cy = (grid_y + 0.5) / H
+
+        # Offset trong khoảng (-1.0, +1.0) ô cell kể từ tâm cell
+        dx = (raw_box[:, 0].sigmoid() * 2.0 - 1.0) / W
+        dy = (raw_box[:, 1].sigmoid() * 2.0 - 1.0) / H
+
+        pred_cx = (cell_cx + dx).clamp(0.0, 1.0)
+        pred_cy = (cell_cy + dy).clamp(0.0, 1.0)
+        pred_w = raw_box[:, 2].sigmoid()
+        pred_h = raw_box[:, 3].sigmoid()
+
+        pred_boxes = torch.stack([pred_cx, pred_cy, pred_w, pred_h], dim=1)  # [B, 4, H, W]
         return cls_logits, pred_boxes, obj_logits
 
 
