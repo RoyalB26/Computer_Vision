@@ -22,7 +22,7 @@ data:
   train:
     dataset:
       type: "CustomLMDBDataset"
-      data_root: "D:/apps/Datasets/VisDrone/VisDrone_data.lmdb"
+      data_root: "/content/visdron.lmdb"
       split: "train"
       split_ratio: 0.8
       seed: 42
@@ -37,7 +37,7 @@ data:
   val:
     dataset:
       type: "CustomLMDBDataset"
-      data_root: "D:/apps/Datasets/VisDrone/VisDrone_data.lmdb"
+      data_root: "/content/visdron.lmdb"
       split: "val"
       split_ratio: 0.8
       seed: 42
