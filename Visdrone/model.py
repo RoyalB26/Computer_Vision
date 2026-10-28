@@ -179,39 +179,38 @@ class Deformable(nn.Module):
         attn_weights = F.softmax(attn_scores, dim=-1) # [B, C, K, 10]
         out = torch.einsum('bcks, bcksd -> bckd', attn_weights, v) # [B, C, K, dim]
 
-        grid_x = reference_x * 2.0 - 1.0  # [B, C, K]
-        grid_y = reference_y * 2.0 - 1.0  # [B, C, K]
-        # Ghép (x, y) -> [B, C, 1, K, 2] rồi gộp (B*C) -> [B*C, 1, K, 2]
-        grid = torch.stack([grid_x, grid_y], dim=-1).unsqueeze(2) # [B, C, 1, K, 2]
-        grid_bc = grid.view(B * C, 1, K, 2)                      # [B*C, 1, K, 2]
-        target_grads = out.permute(0, 1, 3, 2).reshape(B * C, dim, 1, K)
         B, C, dim, H, W = feat_map.shape
-        _, _, K, _ = out.shape
-        # 2. Scatter ngược lại feat_map bằng autograd của grid_sample
-        with torch.enable_grad():
-            dummy_feat_bc = torch.zeros(
-                B * C, dim, H, W, 
-                device=feat_map.device, 
-                dtype=feat_map.dtype, 
-                requires_grad=True
-            )
-            
-            dummy_sampled = F.grid_sample(
-                dummy_feat_bc, 
-                grid_bc, 
-                mode='bilinear', 
-                padding_mode='zeros', 
-                align_corners=False
-            )
-            
-            scattered_feat_bc = torch.autograd.grad(
-                outputs=dummy_sampled,
-                inputs=dummy_feat_bc,
-                grad_outputs=target_grads,
-                create_graph=False  # ĐỔI THÀNH FALSE ĐỂ KHÔNG TÍNH ĐẠO HÀM BẬC 2
-            )[0]
-            # 3. Định hình lại về shape 5D [B, C, dim, H, W]
-        scattered_feat_map = scattered_feat_bc.view(B, C, dim, H, W)
+        # 2. Bilinear Splatting (khả vi bậc 1 theo cả out lẫn reference_x, reference_y, chuẩn hóa biên độ đạo hàm tọa độ)
+        px = reference_x.detach() * W - 0.5 + (reference_x - reference_x.detach())  # [B, C, K]
+        py = reference_y.detach() * H - 0.5 + (reference_y - reference_y.detach())  # [B, C, K]
+
+        x0 = torch.floor(px).detach()
+        y0 = torch.floor(py).detach()
+        wx1 = px - x0  # Có đạo hàm theo reference_x
+        wy1 = py - y0  # Có đạo hàm theo reference_y
+        wx0 = 1.0 - wx1
+        wy0 = 1.0 - wy1
+
+        x0_i = x0.long()
+        y0_i = y0.long()
+        x1_i = x0_i + 1
+        y1_i = y0_i + 1
+
+        scattered_flat = torch.zeros(B, C, dim, H * W, device=feat_map.device, dtype=feat_map.dtype)
+        out_perm = out.permute(0, 1, 3, 2)  # [B, C, dim, K]
+
+        for xi, yi, wi in [
+            (x0_i, y0_i, wx0 * wy0),
+            (x1_i, y0_i, wx1 * wy0),
+            (x0_i, y1_i, wx0 * wy1),
+            (x1_i, y1_i, wx1 * wy1),
+        ]:
+            valid = (xi >= 0) & (xi < W) & (yi >= 0) & (yi < H)  # [B, C, K]
+            idx = (yi.clamp(0, H - 1) * W + xi.clamp(0, W - 1)).unsqueeze(2).expand(B, C, dim, K)
+            weighted_out = out_perm * (wi * valid.to(out.dtype)).unsqueeze(2)
+            scattered_flat = scattered_flat.scatter_add(-1, idx, weighted_out)
+
+        scattered_feat_map = scattered_flat.view(B, C, dim, H, W)
         updated_feat_map = feat_map + scattered_feat_map
 
         return updated_feat_map
@@ -222,31 +221,49 @@ class ClassSpecificDetHead(nn.Module):
         self.num_classes = num_classes
         self.dim = dim
 
-        # 1. Mỗi class 1 Cls Head riêng biệt (Dùng groups=num_classes)
-        # in_channels: num_classes * dim -> out_channels: num_classes * 1
+        # 1. Cls Head: Depthwise Separable Conv theo từng class (groups=num_classes*dim cho Depthwise)
+        # Giảm FLOPs gấp ~7 lần so với standard conv 3x3
         self.cls_head = nn.Sequential(
+            # Depthwise Conv 3x3: lọc không gian độc lập từng channel
             nn.Conv2d(
-                num_classes * dim, num_classes * dim, 
-                kernel_size=3, padding=1, groups=num_classes, bias=False
+                num_classes * dim, num_classes * dim,
+                kernel_size=3, padding=1, groups=num_classes * dim, bias=False
             ),
             nn.BatchNorm2d(num_classes * dim),
             nn.ReLU(inplace=True),
+            # Pointwise Conv 1x1: phối hợp các channels trong cùng class (groups=num_classes)
             nn.Conv2d(
-                num_classes * dim, num_classes, 
+                num_classes * dim, num_classes * dim,
+                kernel_size=1, groups=num_classes, bias=False
+            ),
+            nn.BatchNorm2d(num_classes * dim),
+            nn.ReLU(inplace=True),
+            # Final 1x1 Conv: dự đoán heatmap logits cho từng class
+            nn.Conv2d(
+                num_classes * dim, num_classes,
                 kernel_size=1, groups=num_classes
-            )  # Mỗi class ra đúng 1 heatmap độc lập
+            )
         )
 
-        # 2. Box Head: Dự đoán offset [dx, dy, w, h] cho từng ô lưới (trong khoảng [0, 1])
+        # 2. Box Head: Depthwise Separable Conv dự đoán offset [dx, dy, w, h] cho từng class
         self.box_head = nn.Sequential(
+            # Depthwise Conv 3x3: lọc không gian độc lập từng channel
             nn.Conv2d(
-                num_classes * dim, num_classes * dim, 
-                kernel_size=3, padding=1, groups=num_classes, bias=False
+                num_classes * dim, num_classes * dim,
+                kernel_size=3, padding=1, groups=num_classes * dim, bias=False
             ),
             nn.BatchNorm2d(num_classes * dim),
             nn.ReLU(inplace=True),
+            # Pointwise Conv 1x1: phối hợp các channels trong cùng class (groups=num_classes)
             nn.Conv2d(
-                num_classes * dim, num_classes * 4, 
+                num_classes * dim, num_classes * dim,
+                kernel_size=1, groups=num_classes, bias=False
+            ),
+            nn.BatchNorm2d(num_classes * dim),
+            nn.ReLU(inplace=True),
+            # Final 1x1 Conv: dự đoán 4 offset cho từng class
+            nn.Conv2d(
+                num_classes * dim, num_classes * 4,
                 kernel_size=1, groups=num_classes
             ),
             nn.Sigmoid()  # dx, dy là offset trong ô [0, 1], w, h chuẩn hóa [0, 1]
@@ -518,11 +535,15 @@ class VisDroneDetector(BaseModel):
         return torch.stack([x1, y1, x2, y2], dim=-1)
 
     def _compute_losses(self, cls_logits, pred_offsets, targets, device):
-        """Hàm dùng chung tính Focal Loss (cls) và DIoU Loss (box từ offset)."""
+        """Hàm dùng chung tính Focal Loss (cls), DIoU Loss (box từ offset) và các chỉ số tracking chẩn đoán."""
         batch_size, num_classes, grid_h, grid_w = cls_logits.shape
 
         total_cls_loss = torch.tensor(0.0, device=device)
         total_box_loss = torch.tensor(0.0, device=device)
+        total_cls_pos = torch.tensor(0.0, device=device)
+        total_cls_neg = torch.tensor(0.0, device=device)
+        prob_pos_sum = torch.tensor(0.0, device=device)
+        prob_neg_max = torch.tensor(0.0, device=device)
         num_pos_total = 0
 
         for b in range(batch_size):
@@ -570,14 +591,25 @@ class VisDroneDetector(BaseModel):
                     )
                     total_box_loss += box_loss
 
-            cls_loss = torchvision.ops.sigmoid_focal_loss(
+            focal_map = torchvision.ops.sigmoid_focal_loss(
                 img_cls,
                 cls_target,
                 alpha=0.25,
                 gamma=2.0,
-                reduction="sum",
+                reduction="none",
             )
-            total_cls_loss += cls_loss
+            total_cls_loss += focal_map.sum()
+
+            with torch.no_grad():
+                pos_mask = cls_target > 0.5
+                neg_mask = ~pos_mask
+                total_cls_pos += focal_map[pos_mask].sum()
+                total_cls_neg += focal_map[neg_mask].sum()
+                probs = img_cls.detach().sigmoid()
+                if pos_mask.any():
+                    prob_pos_sum += probs[pos_mask].sum()
+                if neg_mask.any():
+                    prob_neg_max = torch.maximum(prob_neg_max, probs[neg_mask].max())
 
         # Chuẩn hóa theo tổng số mẫu dương (num_pos_total), không chia cho toàn bộ số pixel (B * C * H * W)
         norm_pos = max(num_pos_total, 1)
@@ -589,6 +621,10 @@ class VisDroneDetector(BaseModel):
             "loss": total_loss,
             "loss_cls": total_cls_loss,
             "loss_box": total_box_loss,
+            "loss_cls_pos": (total_cls_pos / norm_pos).detach(),
+            "loss_cls_neg": (total_cls_neg / norm_pos).detach(),
+            "loss_prob_pos": (prob_pos_sum / norm_pos).detach(),
+            "loss_prob_neg_max": prob_neg_max.detach(),
         }
 
     def _post_process(self, cls_logits, pred_offsets, conf_threshold=0.10, nms_threshold=0.5, max_det=100):
