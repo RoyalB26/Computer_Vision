@@ -8,8 +8,8 @@ if root_dir not in sys.path:
     sys.path.insert(0, root_dir)
 
 # Import custom task modules to register them into DATASETS & MODELS
-import Visdrone.dataset
-import Visdrone.model
+import Visdrone_v3.dataset
+import Visdrone_v3.model
 
 from BaseModel.scripts.train import main
 

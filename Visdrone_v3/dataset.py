@@ -8,7 +8,7 @@ from BaseModel.dataset import BaseDataset, open_lmdb
 
 
 @DATASETS.register_module()
-class CustomLMDBDataset(BaseDataset):
+class VisDroneV3Dataset(BaseDataset):
     def __init__(
         self,
         data_root,

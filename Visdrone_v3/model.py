@@ -277,12 +277,12 @@ class StandardDetHead(nn.Module):
 
 
 
-def ciou_nms(boxes: torch.Tensor, scores: torch.Tensor, iou_threshold: float) -> torch.Tensor:
-    """Non-Maximum Suppression using Complete IoU (CIoU).
+def diou_nms(boxes: torch.Tensor, scores: torch.Tensor, iou_threshold: float) -> torch.Tensor:
+    """Non-Maximum Suppression using Distance IoU (DIoU).
     Args:
         boxes: Tensor shape (N, 4) in (x1, y1, x2, y2) format.
         scores: Tensor shape (N,) confidence scores.
-        iou_threshold: Threshold for CIoU suppression.
+        iou_threshold: Threshold for DIoU suppression.
     Returns:
         Tensor of indices to keep.
     """
@@ -297,19 +297,19 @@ def ciou_nms(boxes: torch.Tensor, scores: torch.Tensor, iou_threshold: float) ->
             break
         cur_box = boxes[i : i + 1]
         rem_boxes = boxes[order[1:]]
-        ciou = torchvision.ops.complete_box_iou(cur_box, rem_boxes).squeeze(0)
-        mask = ciou < iou_threshold
+        diou = torchvision.ops.distance_box_iou(cur_box, rem_boxes).squeeze(0)
+        mask = diou < iou_threshold
         order = order[1:][mask]
     return torch.tensor(keep, dtype=torch.long, device=boxes.device)
 
 
-def batched_ciou_nms(
+def batched_diou_nms(
     boxes: torch.Tensor,
     scores: torch.Tensor,
     idxs: torch.Tensor,
     iou_threshold: float,
 ) -> torch.Tensor:
-    """Per-category Batched NMS using Complete IoU (CIoU)."""
+    """Per-category Batched NMS using Distance IoU (DIoU)."""
     if boxes.numel() == 0:
         return torch.empty((0,), dtype=torch.long, device=boxes.device)
 
@@ -321,7 +321,7 @@ def batched_ciou_nms(
         cls_boxes = boxes[cls_indices]
         cls_scores = scores[cls_indices]
 
-        cls_keep = ciou_nms(cls_boxes, cls_scores, iou_threshold)
+        cls_keep = diou_nms(cls_boxes, cls_scores, iou_threshold)
         keep_list.append(cls_indices[cls_keep])
 
     if len(keep_list) == 0:
@@ -332,7 +332,8 @@ def batched_ciou_nms(
     return keep
 
 
-@MODELS.register_module()
+@MODELS.register_module(name="VisDroneDetectorV3")
+@MODELS.register_module(name="VisDroneDetectorNoSlot")
 class VisDroneDetectorNoSlot(BaseModel):
     """Detector for VisDrone dataset without Slot Attention."""
 
@@ -463,7 +464,7 @@ class VisDroneDetectorNoSlot(BaseModel):
                 grid_x = (gt_cx * grid_w).long()
                 grid_y = (gt_cy * grid_h).long()
 
-                valid_mask = (gt_labels >= 0) & (gt_labels < num_classes)
+                valid_mask = (gt_labels >= 0) & (gt_labels < num_classes) & (gt_boxes[:, 2] > 1e-4) & (gt_boxes[:, 3] > 1e-4)
                 valid_labels = gt_labels[valid_mask]
                 grid_x = grid_x[valid_mask]
                 grid_y = grid_y[valid_mask]
@@ -477,7 +478,7 @@ class VisDroneDetectorNoSlot(BaseModel):
 
                     p_box = img_box[:, grid_y, grid_x].permute(1, 0)  # [num_pos, 4] dạng [cx, cy, w, h]
 
-                    # Chuyển [cx, cy, w, h] sang [x1, y1, x2, y2] cho CIoU Loss
+                    # Chuyển [cx, cy, w, h] sang [x1, y1, x2, y2] cho DIoU Loss
                     p_x1 = (p_box[:, 0] - p_box[:, 2] / 2).clamp(min=0.0)
                     p_y1 = (p_box[:, 1] - p_box[:, 3] / 2).clamp(min=0.0)
                     p_x2 = (p_box[:, 0] + p_box[:, 2] / 2).clamp(max=1.0)
@@ -496,7 +497,11 @@ class VisDroneDetectorNoSlot(BaseModel):
                         dim=1,
                     )
 
-                    box_loss = torchvision.ops.complete_box_iou_loss(p_box_xyxy, gt_boxes_xyxy, reduction='sum')
+                    # Tính DIoU Loss an toàn tuyệt đối với FP16 AMP
+                    box_loss = torchvision.ops.distance_box_iou_loss(
+                        p_box_xyxy.float(), gt_boxes_xyxy.float(), reduction='sum'
+                    )
+                    box_loss = torch.nan_to_num(box_loss, nan=0.0)
                     total_box_loss += box_loss
 
             img_cls_clamped = torch.clamp(img_cls, min=-15.0, max=15.0)
@@ -592,7 +597,7 @@ class VisDroneDetectorNoSlot(BaseModel):
                         ],
                         dim=1,
                     )
-                    keep = batched_ciou_nms(xyxy, b_scores, b_labels, nms_threshold)
+                    keep = batched_diou_nms(xyxy, b_scores, b_labels, nms_threshold)
                     keep = keep[:max_det]
                     b_boxes = b_boxes[keep]
                     b_scores = b_scores[keep]
@@ -646,3 +651,7 @@ class VisDroneDetectorNoSlot(BaseModel):
         )
         output["preds"] = preds
         return output
+
+
+VisDroneDetectorV3 = VisDroneDetectorNoSlot
+

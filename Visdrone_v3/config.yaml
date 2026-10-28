@@ -1,18 +1,18 @@
 # Configuration for VisDrone Object Detection WITHOUT Slot Attention
-work_dir: "./work_dirs/visdrone_no_slot"
+work_dir: "./work_dirs/visdrone_v3"
 device: "cuda"  
 seed: 42
 tqdm: true
 accumulate: 1
 
 custom_imports:
-  - "Visdrone_no_slot.model"
-  - "Visdrone_no_slot.dataset"
-  - "Visdrone_no_slot.metrics"
+  - "Visdrone_v3.model"
+  - "Visdrone_v3.dataset"
+  - "Visdrone_v3.metrics"
 
 # 1. Model Configuration: Standard MobileNetV3 FPN Detector (No Slot)
 model:
-  type: "VisDroneDetectorNoSlot"
+  type: "VisDroneDetectorV3"
   num_classes: 10
   dim: 64
   images_size: 640
@@ -21,7 +21,7 @@ model:
 data:
   train:
     dataset:
-      type: "CustomLMDBDataset"
+      type: "VisDroneV3Dataset"
       data_root: "/content/visdron.lmdb"
       split: "train"
       split_ratio: 0.8
@@ -32,11 +32,11 @@ data:
         - type: "ToTensor"
     batch_size: 64
     shuffle: true
-    num_workers: 2
+    num_workers: 6
 
   val:
     dataset:
-      type: "CustomLMDBDataset"
+      type: "VisDroneV3Dataset"
       data_root: "/content/visdron.lmdb"
       split: "val"
       split_ratio: 0.8
@@ -47,7 +47,7 @@ data:
         - type: "ToTensor"
     batch_size: 64
     shuffle: false
-    num_workers: 0
+    num_workers: 4
 
 # 3. Optimizer Configuration
 optimizer:
