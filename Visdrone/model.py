@@ -520,7 +520,6 @@ class VisDroneDetector(BaseModel):
     def _compute_losses(self, cls_logits, pred_offsets, targets, device):
         """Hàm dùng chung tính Focal Loss (cls) và DIoU Loss (box từ offset)."""
         batch_size, num_classes, grid_h, grid_w = cls_logits.shape
-        pred_boxes = self._decode_boxes(pred_offsets)
 
         total_cls_loss = torch.tensor(0.0, device=device)
         total_box_loss = torch.tensor(0.0, device=device)
@@ -528,7 +527,7 @@ class VisDroneDetector(BaseModel):
 
         for b in range(batch_size):
             img_cls = cls_logits[b]
-            img_box = pred_boxes[b]
+            img_offset = pred_offsets[b]
             target_dict = targets[b] if targets is not None and b < len(targets) else None
             gt_boxes = target_dict.get("boxes", torch.empty((0, 4), device=device)) if target_dict else torch.empty((0, 4), device=device)
             gt_labels = target_dict.get("labels", torch.empty((0,), device=device, dtype=torch.long)) if target_dict else torch.empty((0,), device=device, dtype=torch.long)
@@ -554,10 +553,15 @@ class VisDroneDetector(BaseModel):
                 num_pos_total += num_pos
                 if num_pos > 0:
                     cls_target[valid_labels, grid_y, grid_x] = 1.0
-                    if img_box.dim() == 4:
-                        p_box = img_box[valid_labels, :, grid_y, grid_x]
+                    if img_offset.dim() == 4:
+                        p_off = img_offset[valid_labels, :, grid_y, grid_x]
                     else:
-                        p_box = img_box[:, grid_y, grid_x].permute(1, 0)
+                        p_off = img_offset[:, grid_y, grid_x].permute(1, 0)
+
+                    # Chỉ decode tọa độ box tại các ô lưới dương (positive cells)
+                    p_cx = (grid_x.to(p_off.dtype) + p_off[:, 0]) / grid_w
+                    p_cy = (grid_y.to(p_off.dtype) + p_off[:, 1]) / grid_h
+                    p_box = torch.stack([p_cx, p_cy, p_off[:, 2], p_off[:, 3]], dim=-1)
 
                     p_xyxy = self._cxcywh_to_xyxy(p_box)
                     gt_xyxy = self._cxcywh_to_xyxy(gt_boxes)
@@ -588,37 +592,37 @@ class VisDroneDetector(BaseModel):
         }
 
     def _post_process(self, cls_logits, pred_offsets, conf_threshold=0.10, nms_threshold=0.5, max_det=100):
-        """Decode offset thành box và chạy NMS tối ưu tốc độ."""
+        """Lọc ngưỡng vector hóa, chỉ decode các candidate vượt ngưỡng và chạy NMS tối ưu tốc độ."""
         batch_size, num_classes, grid_h, grid_w = cls_logits.shape
         cls_scores = cls_logits.sigmoid()
-        pred_boxes = self._decode_boxes(pred_offsets)
+        device = cls_logits.device
         results = []
+
         for b in range(batch_size):
-            b_boxes_list, b_scores_list, b_labels_list = [], [], []
-            for c in range(num_classes):
-                c_score = cls_scores[b, c]
-                mask = c_score >= conf_threshold
-                if not mask.any():
-                    continue
-                scores = c_score[mask]
-                labels = torch.full_like(scores, c, dtype=torch.long)
-                if pred_boxes.dim() == 5:
-                    boxes = pred_boxes[b, c, :, mask].permute(1, 0)
-                else:
-                    boxes = pred_boxes[b, :, mask].permute(1, 0)
-                b_boxes_list.append(boxes)
-                b_scores_list.append(scores)
-                b_labels_list.append(labels)
-            if len(b_boxes_list) > 0:
-                b_boxes = torch.cat(b_boxes_list, dim=0)
-                b_scores = torch.cat(b_scores_list, dim=0)
-                b_labels = torch.cat(b_labels_list, dim=0)
-                # Giới hạn Top-1000 candidates trước NMS để chạy siêu nhanh
+            b_scores_map = cls_scores[b]  # [C, H, W]
+            c_idx, y_idx, x_idx = torch.where(b_scores_map >= conf_threshold)
+
+            if len(c_idx) > 0:
+                b_scores = b_scores_map[c_idx, y_idx, x_idx]
+                b_labels = c_idx
+
+                # Giới hạn Top-1000 candidates trước khi decode box và chạy NMS
                 if len(b_scores) > 1000:
                     topk_idx = torch.topk(b_scores, 1000).indices
-                    b_boxes = b_boxes[topk_idx]
                     b_scores = b_scores[topk_idx]
                     b_labels = b_labels[topk_idx]
+                    y_idx = y_idx[topk_idx]
+                    x_idx = x_idx[topk_idx]
+
+                if pred_offsets.dim() == 5:
+                    offsets = pred_offsets[b, b_labels, :, y_idx, x_idx]
+                else:
+                    offsets = pred_offsets[b, :, y_idx, x_idx].permute(1, 0)
+
+                cx = (x_idx.to(offsets.dtype) + offsets[:, 0]) / grid_w
+                cy = (y_idx.to(offsets.dtype) + offsets[:, 1]) / grid_h
+                b_boxes = torch.stack([cx, cy, offsets[:, 2], offsets[:, 3]], dim=-1)
+
                 if nms_threshold is not None and len(b_boxes) > 0:
                     xyxy = self._cxcywh_to_xyxy(b_boxes)
                     keep = torchvision.ops.batched_nms(xyxy, b_scores, b_labels, nms_threshold)
@@ -627,10 +631,10 @@ class VisDroneDetector(BaseModel):
                     b_scores = b_scores[keep]
                     b_labels = b_labels[keep]
             else:
-                device = cls_logits.device
                 b_boxes = torch.empty((0, 4), device=device)
                 b_scores = torch.empty((0,), device=device)
                 b_labels = torch.empty((0,), dtype=torch.long, device=device)
+
             results.append({
                 "boxes": b_boxes,
                 "scores": b_scores,
