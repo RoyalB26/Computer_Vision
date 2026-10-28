@@ -121,54 +121,100 @@ class Deformable(nn.Module):
         self.to_k= nn.Linear(dim, dim)
         self.to_v= nn.Linear(dim, dim)
 
-    def forward(self, x: Tensor, feat_map: Tensor, attn: Tensor):
+    def forward(self, x: Tensor, pure_map: Tensor, feat_map: Tensor, attn: Tensor):
         """
         x: B, C, dim
-        feat_map: [B, C, dim, H, W]
+        feat_map: [B, C, dim, h, w]
+        pure_map: [B, dim, H, W]
         attn: [B, C, N]
         """
-        B, dim, H, W= feat_map.shape
+        B, C, dim, H, W= feat_map.shape
         reference_x= F.sigmoid(self.to_reference_x(attn)) # [B, C, K]
         feat = reference_x[:, :, :, None] + attn[:, :, None, :]
         reference_y= F.sigmoid(self.to_reference_y(feat).squeeze(-1)) # [B, C, K] 
+        B, dim, H, W = pure_map.shape
         _, C, K = reference_x.shape
-        grid_x = reference_x.view(B, -1) * 2.0 - 1.0  # [B, C*K]
-        grid_y = reference_y.view(B, -1) * 2.0 - 1.0  # [B, C*K]
-        # 2. Tạo grid có shape [B, 1, C*K, 2] (ở dạng (x, y))
-        grid = torch.stack([grid_x, grid_y], dim=-1).unsqueeze(1)  # [B, 1, C*K, 2]
-        # 3. Lấy mẫu cực nhanh trên GPU:
-        # out shape: [B, dim, 1, C*K]
-        sampled = F.grid_sample(feat_map, grid, mode='bilinear', padding_mode='zeros', align_corners=False)
-        # 4. Reshape lại về [B, C, K, dim]
-        sampled = sampled.squeeze(2).view(B, dim, C, K).permute(0, 2, 3, 1)  # [B, C, K, dim]
-
-        k= self.to_k(sampled) # [B, C, K, dim]
-        v= self.to_v(sampled) # [B, C, K, dim]
+        num_samples = 10  # 10 ô từ mỗi cặp (x, y)
+        # 1. Tọa độ gốc chuẩn hóa về dải [-1, 1]
+        # Shape ban đầu: [B, C*K, 1]
+        base_x = (reference_x.view(B, -1) * 2.0 - 1.0).unsqueeze(-1)  # [B, C*K, 1]
+        base_y = (reference_y.view(B, -1) * 2.0 - 1.0).unsqueeze(-1)  # [B, C*K, 1]
+        # 2. Định nghĩa offsets (ví dụ: 10 điểm lân cận)
+        # Lưu ý: 1 pixel trên trục x ứng với bước nhảy 2.0 / W
+        # 1 pixel trên trục y ứng với bước nhảy 2.0 / H
+        # Ví dụ 10 offsets (delta_x theo pixel, delta_y theo pixel):
+        # (Bao gồm điểm tâm (0,0) và 9 điểm xung quanh hoặc 10 vị trí tùy bạn chọn)
+        offsets_pixel = torch.tensor([
+            [0.0, 0.0],
+            [-1.0, 0.0], [1.0, 0.0], [0.0, -1.0], [0.0, 1.0],
+            [-1.0, -1.0], [1.0, -1.0], [-1.0, 1.0], [1.0, 1.0],
+            [0.0, 2.0]  # điểm thứ 10 ví dụ
+        ], device=pure_map.device)  # [10, 2]
+        # Chuyển đổi offset từ pixel sang dải tọa độ [-1, 1]
+        offset_x = offsets_pixel[:, 0] * (2.0 / W)  # [10]
+        offset_y = offsets_pixel[:, 1] * (2.0 / H)  # [10]
+        # 3. Mở rộng và cộng offset vào tọa độ gốc:
+        # [B, C*K, 1] + [10] -> [B, C*K, 10]
+        sample_x = base_x + offset_x.view(1, 1, num_samples)
+        sample_y = base_y + offset_y.view(1, 1, num_samples)
+        # 4. Gom lại thành Grid:
+        # Ghép (x, y) -> [B, C*K, 10, 2]
+        grid = torch.stack([sample_x, sample_y], dim=-1)
+        # 5. Lấy mẫu với grid_sample:
+        # pure_map: [B, dim, H, W]
+        # grid:     [B, C*K, 10, 2]
+        # sampled:  [B, dim, C*K, 10]
+        sampled = F.grid_sample(pure_map, grid, mode='bilinear', padding_mode='zeros', align_corners=False)
+        # 6. Định hình lại (Reshape) theo cấu trúc mong muốn:
+        # [B, dim, C, K, 10]
+        sampled = sampled.view(B, dim, C, K, num_samples)
+        sampled = sampled.permute(0, 2, 3, 4, 1) # [B, C, K, 10, dim]
+        k= self.to_k(sampled) # [B, C, K, 10, dim]
+        v= self.to_v(sampled) # [B, C, K, 10, dim]
         q= self.to_q(x) # [B, C, dim]
 
         dim = q.shape[-1]
         scale = dim ** -0.5
-        attn_scores = torch.einsum('bcd, bckd -> bck', q, k) * scale
-        attn_weights = F.softmax(attn_scores, dim=-1) # [B, C, K]
-        out = torch.einsum('bck, bckd -> bckd', attn_weights, v)
+        attn_scores = torch.einsum('bcd, bcksd -> bcks', q, k) * scale
+        attn_weights = F.softmax(attn_scores, dim=-1) # [B, C, K, 10]
+        out = torch.einsum('bcks, bcksd -> bckd', attn_weights, v) # [B, C, K, dim]
 
+        grid_x = reference_x * 2.0 - 1.0  # [B, C, K]
+        grid_y = reference_y * 2.0 - 1.0  # [B, C, K]
+        # Ghép (x, y) -> [B, C, 1, K, 2] rồi gộp (B*C) -> [B*C, 1, K, 2]
+        grid = torch.stack([grid_x, grid_y], dim=-1).unsqueeze(2) # [B, C, 1, K, 2]
+        grid_bc = grid.view(B * C, 1, K, 2)                      # [B*C, 1, K, 2]
+        target_grads = out.permute(0, 1, 3, 2).reshape(B * C, dim, 1, K)
+        B, C, dim, H, W = feat_map.shape
+        _, _, K, _ = out.shape
+        # 2. Scatter ngược lại feat_map bằng autograd của grid_sample
         with torch.enable_grad():
-            # Tạo một dummy tensor có requires_grad=True với kích thước giống feat_map
-            dummy_feat = torch.zeros_like(feat_map, requires_grad=True)
-            # Chạy grid_sample với dummy (grid lấy từ bước trước: [B, 1, C*K, 2])
-            dummy_sampled = F.grid_sample(dummy_feat, grid, mode='bilinear', padding_mode='zeros', align_corners=False)
-            # out_features cần đưa về: [B, dim, 1, C*K]
-            target_grads = out.view(B, -1, dim).permute(0, 2, 1).unsqueeze(2)
-            # autograd.grad sẽ tính toán chính xác việc "đẩy ngược lại 4 điểm xung quanh" theo trọng số song tuyến:
+            # Tạo dummy tensor 4D có shape [B*C, dim, H, W]
+            dummy_feat_bc = torch.zeros(
+                B * C, dim, H, W, 
+                device=feat_map.device, 
+                dtype=feat_map.dtype, 
+                requires_grad=True
+            )
             
-            scattered_feat_map = torch.autograd.grad(
+            # Lấy mẫu trên dummy bằng grid_bc: [B*C, 1, K, 2] -> out: [B*C, dim, 1, K]
+            dummy_sampled = F.grid_sample(
+                dummy_feat_bc, 
+                grid_bc, 
+                mode='bilinear', 
+                padding_mode='zeros', 
+                align_corners=False
+            )
+            
+            # Bắn ngược feature về dummy_feat_bc
+            scattered_feat_bc = torch.autograd.grad(
                 outputs=dummy_sampled,
-                inputs=dummy_feat,
+                inputs=dummy_feat_bc,
                 grad_outputs=target_grads,
-                create_graph=True  # True nếu muốn huấn luyện tiếp mạng phía sau
-            )[0]
-            # Kết quả: scattered_feat_map có shape [B, dim, H, W]
-            # Sau đó bạn có thể cộng vào feat_map gốc:
+                create_graph=True
+            )[0]  # [B*C, dim, H, W]
+        # 3. Định hình lại về shape 5D [B, C, dim, H, W]
+        scattered_feat_map = scattered_feat_bc.view(B, C, dim, H, W)
         updated_feat_map = feat_map + scattered_feat_map
 
         return updated_feat_map
@@ -245,6 +291,7 @@ class SlotCrossAttention(nn.Module):
         self.out_proj = nn.Conv2d(dim, dim, kernel_size=1)
         self.norm_feat = nn.BatchNorm2d(dim)
         self.norm_slot = nn.LayerNorm(dim)
+
     def forward(self, slots: torch.Tensor, feat_map: torch.Tensor) -> torch.Tensor:
         """
         Args:
@@ -279,7 +326,7 @@ class SlotCrossAttention(nn.Module):
         feat_expanded = feat_map.unsqueeze(1)                   # [B, 1, dim, H, W]
         # Class Feature Map: vừa giữ đặc trưng không gian nét, vừa được lọc theo đặc trưng của class!
         out = feat_expanded * torch.sigmoid(slot_context) + slot_context # [B, C, dim, H, W]
-        return out
+        return out, attn_weights.mean(dim= 2)
 
 @MODELS.register_module()
 class VisDroneDetector(BaseModel):
@@ -324,12 +371,15 @@ class VisDroneDetector(BaseModel):
             nn.BatchNorm2d(total_head * dim),
             nn.ReLU(inplace=True),
         )
+
+
         self.conv = nn.Conv2d(self.total_head, 1, 1, 1, 0)
+        self.conv2 = nn.Conv2d(3, dim, 1, 1, 0)
 
         self.norm_out = nn.LayerNorm(dim)
         self.downsample = DownSample(total_head * dim)
         self.up_sample = UpSample(dim)
-        self.deformable = Deformable(dim, (images_size // 32) ** 2, num_ref)
+        self.deformable = Deformable(dim, (images_size // 4) ** 2, num_ref)
         # Initialization
         nn.init.xavier_uniform_(self.mu)
         nn.init.zeros_(self.logsigma)
@@ -385,7 +435,7 @@ class VisDroneDetector(BaseModel):
         """Trích xuất đặc trưng qua Backbone và FPN."""
         B, C, H, W= x.shape
 
-
+        pure_map = self.conv2(x)
         c1,c3,c5,c12= self.backbone(x)
 
         B, C, H, W= c12.shape
@@ -426,8 +476,8 @@ class VisDroneDetector(BaseModel):
         B,D,H,W = c12.shape
         feat_map= self.up_sample(c1, c3, c5, c12) # [B, dim, H, W]
 
-        feat_map = self.cross_attn(slots, feat_map)  # [B, C, dim, H, W]
-        return slots, feat_map, attn
+        feat_map, attn_weights = self.cross_attn(slots, feat_map)  # [B, C, dim, H, W]
+        return slots, feat_map, attn_weights, pure_map
 
     def _compute_losses(self, cls_logits, pred_boxes, targets, device):
         """Hàm dùng chung tính Loss từ cls_logits và pred_boxes."""
@@ -548,12 +598,14 @@ class VisDroneDetector(BaseModel):
         return results
 
     def forward_train(self, inputs: torch.Tensor, targets=None, **kwargs):
-        slots, feat_map, attn = self.extract_features(inputs)
+        slots, feat_map, attn, pure_map = self.extract_features(inputs)
+        feat_map = self.deformable(slots, pure_map, feat_map, attn)
         cls_logits, pred_boxes = self.head(feat_map)
         return self._compute_losses(cls_logits, pred_boxes, targets, device=inputs.device)
     
     def predict(self, inputs: torch.Tensor, conf_threshold=0.001, nms_threshold=0.5, **kwargs):
-        slots, feat_map, attn = self.extract_features(inputs)
+        slots, feat_map, attn, pure_map = self.extract_features(inputs)
+        feat_map = self.deformable(slots, pure_map, feat_map, attn)
         cls_logits, pred_boxes = self.head(feat_map)
         return self._post_process(cls_logits, pred_boxes, conf_threshold=conf_threshold, nms_threshold=nms_threshold)
 
@@ -561,14 +613,15 @@ class VisDroneDetector(BaseModel):
         self,
         inputs: torch.Tensor,
         targets: Optional[List[Dict[str, torch.Tensor]]] = None,
-        conf_threshold: float = 0.001,
+        conf_threshold: float = 0.0001,
         nms_threshold: float = 0.5,
         max_det: int = 300,
         **kwargs,
     ) -> Dict[str, Any]:
         """Validation forward pass: Chỉ chạy mạng 1 LẦN duy nhất cho cả Loss và Predictions."""
         # 1. Chạy mạng 1 lần duy nhất
-        slots, feat_map, attn = self.extract_features(inputs)
+        slots, feat_map, attn, pure_map = self.extract_features(inputs)
+        feat_map = self.deformable(slots, pure_map, feat_map, attn)
         cls_logits, pred_boxes = self.head(feat_map)
         # 2. Tính val loss nếu có targets
         output = {}
