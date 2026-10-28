@@ -269,10 +269,10 @@ class StandardDetHead(nn.Module):
         self.obj_conv = ConvModule(dim, dim, kernel_size=3)
         self.obj_out = nn.Conv2d(dim, 1, kernel_size=1)
 
-    def forward(self, cls_feat_map, box_feat_map: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        cls_logits = self.cls_head(cls_feat_map)  # [B, num_classes, H, W]
-        raw_box = self.box_head(box_feat_map)     # [B, 4, H, W]
-        obj_logits = self.obj_out(self.obj_conv(cls_feat_map))
+    def forward(self, feat_map: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        cls_logits = self.cls_head(feat_map)  # [B, num_classes, H, W]
+        raw_box = self.box_head(feat_map)     # [B, 4, H, W]
+        obj_logits = self.obj_out(self.obj_conv(feat_map))
 
         # Decode tọa độ theo offset lân cận cell (-1, 1)
         B, _, H, W = raw_box.shape
@@ -380,7 +380,7 @@ class VisDroneDetectorNoSlot(BaseModel):
             nn.ReLU(inplace=True),
         )
         self.downsample = DownSample(dim)
-        self.up_sample_box = UpSample_Box(dim)
+        # self.up_sample_box = UpSample_Box(dim)
         self.up_sample_cls = UpSample_Cls(dim, dim)
 
         # Shape: (num_classes, dim) -> each slot gets unique learned mu and logsigma
@@ -441,9 +441,9 @@ class VisDroneDetectorNoSlot(BaseModel):
         c1, c3, c5, c12 = self.backbone(x)
         slots= self.initalize_slots(B, x.device)
         # c12 có 576 kênh, đưa trực tiếp vào up_sample
-        box_feat_map = self.up_sample_box(c1, c3, c5, c12)  # [B, dim, 160, 160]
-        cls_feat_map = self.up_sample_cls(slots, c1, c3, c5, c12)  # [B, dim, 160, 160]
-        return slots, cls_feat_map, box_feat_map
+        # box_feat_map = self.up_sample_box(c1, c3, c5, c12)  # [B, dim, 160, 160]
+        feat_map = self.up_sample_cls(slots, c1, c3, c5, c12)  # [B, dim, 160, 160]
+        return slots, feat_map
 
     def _compute_losses(
         self,
@@ -638,13 +638,13 @@ class VisDroneDetectorNoSlot(BaseModel):
         return results
 
     def forward_train(self, inputs: torch.Tensor, targets=None, **kwargs):
-        slots, cls_feat_map, box_feat_map = self.extract_features(inputs)
-        cls_logits, pred_boxes, obj_logits = self.head(cls_feat_map, box_feat_map)
+        slots, feat_map = self.extract_features(inputs)
+        cls_logits, pred_boxes, obj_logits = self.head(feat_map)
         return self._compute_losses(cls_logits, pred_boxes, obj_logits, slots, targets, device=inputs.device)
 
     def predict(self, inputs: torch.Tensor, conf_threshold=0.001, nms_threshold=0.5, **kwargs):
-        slots, cls_feat_map, box_feat_map = self.extract_features(inputs)
-        cls_logits, pred_boxes, obj_logits = self.head(cls_feat_map, box_feat_map)
+        slots, feat_map = self.extract_features(inputs)
+        cls_logits, pred_boxes, obj_logits = self.head(feat_map)
         return self._post_process(cls_logits, pred_boxes, obj_logits, conf_threshold=conf_threshold, nms_threshold=nms_threshold)
 
     def forward_val(
