@@ -129,9 +129,9 @@ class Deformable(nn.Module):
         attn: [B, C, N]
         """
         B, C, dim, H, W= feat_map.shape
-        reference_x= F.sigmoid(self.to_reference_x(attn)) # [B, C, K]
-        feat = reference_x[:, :, :, None] + attn[:, :, None, :]
-        reference_y= F.sigmoid(self.to_reference_y(feat).squeeze(-1)) # [B, C, K] 
+        reference_x = F.sigmoid(self.to_reference_x(attn)) # [B, C, K]
+        feat = reference_x[:, :, :, None] / attn.shape[-1] + attn[:, :, None, :]
+        reference_y = F.sigmoid(self.to_reference_y(feat).squeeze(-1)) # [B, C, K] 
         B, dim, H, W = pure_map.shape
         _, C, K = reference_x.shape
         num_samples = 10  # 10 ô từ mỗi cặp (x, y)
@@ -339,14 +339,14 @@ class SlotCrossAttention(nn.Module):
         # attn: [B, C, heads, N] x v: [B, N, heads, d] -> [B, C, heads, d]
         slot_context = torch.einsum('bchn, bnhd -> bchd', attn_weights, v)
         slot_context = slot_context.reshape(B, C, D) # [B, C, dim]
-        slots= slot_context
+        slots = slots + slot_context
         # 5. Phối hợp đặc trưng (Modulation):
         # Thay vì chỉ cộng broadcast đơn thuần, ta kết hợp cả cộng và nhân tương quan (Gate Modulation):
-        slot_context = slot_context.unsqueeze(-1).unsqueeze(-1) # [B, C, dim, 1, 1]
+        slot_mod = slots.unsqueeze(-1).unsqueeze(-1)            # [B, C, dim, 1, 1]
         feat_expanded = feat_map.unsqueeze(1)                   # [B, 1, dim, H, W]
         # Class Feature Map: vừa giữ đặc trưng không gian nét, vừa được lọc theo đặc trưng của class!
-        out = feat_expanded * torch.sigmoid(slot_context) + slot_context # [B, C, dim, H, W]
-        return slots, out, attn_weights.mean(dim= -2)
+        out = feat_expanded * torch.sigmoid(slot_mod) + slot_mod # [B, C, dim, H, W]
+        return slots, out, attn_weights.mean(dim=-2)
 
 @MODELS.register_module()
 class VisDroneDetector(BaseModel):
@@ -482,8 +482,9 @@ class VisDroneDetector(BaseModel):
         dot = torch.einsum("b c d, b n h d -> b c h n", q, k) # [B, num_classes + 1, head, N]
         dot = dot / (self.dim ** 0.5)
 
-        attn = torch.softmax(dot, dim= 1) # [B, num_classes + 1, head, N]
-        x = torch.einsum("b c h n, b n h d -> b c h d", attn, v) # [B, num_classes + 1, head, dim]
+        attn = torch.softmax(dot, dim=1) + 1e-8 # [B, num_classes, head, N]
+        attn = attn / attn.sum(dim=-1, keepdim=True) # Chuẩn hóa tổng trọng số trên N về 1 (Weighted Mean chuẩn Slot Attention)
+        x = torch.einsum("b c h n, b n h d -> b c h d", attn, v) # [B, num_classes, head, dim]
         x = x.permute(0, 2, 1, 3) # [B, head, num_classes + 1, dim]
         x_slots = self.conv(x).squeeze(1) # [B, num_classes + 1, dim]
         x_slots = self.fc2(F.relu(self.fc1(self.norm_out(x_slots))))
