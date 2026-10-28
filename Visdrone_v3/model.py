@@ -657,8 +657,8 @@ class VisDroneDetectorNoSlot(BaseModel):
         **kwargs,
     ) -> Dict[str, Any]:
         """Validation forward pass: Chỉ chạy mạng 1 LẦN duy nhất."""
-        slots, cls_feat_map, box_feat_map = self.extract_features(inputs)
-        cls_logits, pred_boxes, obj_logits = self.head(cls_feat_map, box_feat_map)
+        slots, feat_map = self.extract_features(inputs)
+        cls_logits, pred_boxes, obj_logits = self.head(feat_map)
 
         output = {}
         if targets is not None:
