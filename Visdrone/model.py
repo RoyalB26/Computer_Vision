@@ -189,7 +189,6 @@ class Deformable(nn.Module):
         _, _, K, _ = out.shape
         # 2. Scatter ngược lại feat_map bằng autograd của grid_sample
         with torch.enable_grad():
-            # Tạo dummy tensor 4D có shape [B*C, dim, H, W]
             dummy_feat_bc = torch.zeros(
                 B * C, dim, H, W, 
                 device=feat_map.device, 
@@ -197,7 +196,6 @@ class Deformable(nn.Module):
                 requires_grad=True
             )
             
-            # Lấy mẫu trên dummy bằng grid_bc: [B*C, 1, K, 2] -> out: [B*C, dim, 1, K]
             dummy_sampled = F.grid_sample(
                 dummy_feat_bc, 
                 grid_bc, 
@@ -206,14 +204,13 @@ class Deformable(nn.Module):
                 align_corners=False
             )
             
-            # Bắn ngược feature về dummy_feat_bc
             scattered_feat_bc = torch.autograd.grad(
                 outputs=dummy_sampled,
                 inputs=dummy_feat_bc,
                 grad_outputs=target_grads,
-                create_graph=True
-            )[0]  # [B*C, dim, H, W]
-        # 3. Định hình lại về shape 5D [B, C, dim, H, W]
+                create_graph=False  # ĐỔI THÀNH FALSE ĐỂ KHÔNG TÍNH ĐẠO HÀM BẬC 2
+            )[0]
+            # 3. Định hình lại về shape 5D [B, C, dim, H, W]
         scattered_feat_map = scattered_feat_bc.view(B, C, dim, H, W)
         updated_feat_map = feat_map + scattered_feat_map
 
