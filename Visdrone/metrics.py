@@ -59,6 +59,7 @@ class VisDroneMAP(BaseMetric):
         num_classes: int = 10,
         box_format: str = "cxcywh",
         iou_thresholds: Optional[List[float]] = None,
+        class_names: Optional[List[str]] = None,
     ):
         self.num_classes = num_classes
         self.box_format = box_format.lower()
@@ -66,6 +67,20 @@ class VisDroneMAP(BaseMetric):
             self.iou_thresholds = sorted(iou_thresholds)
         else:
             self.iou_thresholds = [round(x, 2) for x in np.linspace(0.5, 0.95, 10).tolist()]
+
+        # Tên chuẩn 10 classes của VisDrone
+        self.class_names = class_names or [
+            "pedestrian",
+            "people",
+            "bicycle",
+            "car",
+            "van",
+            "truck",
+            "tricycle",
+            "awning-tricycle",
+            "bus",
+            "motorcycle",
+        ]
 
         self.reset()
 
@@ -184,6 +199,9 @@ class VisDroneMAP(BaseMetric):
 
         ap_table: Dict[float, List[float]] = {th: [] for th in all_eval_thresholds}
 
+        # Lưu AP chi tiết của từng class ở ngưỡng IoU 0.50
+        per_class_ap50: Dict[int, float] = {}
+
         for c in class_list:
             # Gom Ground Truths của class c
             gt_by_img: Dict[int, torch.Tensor] = {}
@@ -221,6 +239,18 @@ class VisDroneMAP(BaseMetric):
                     total_gt=total_gt,
                 )
                 ap_table[th].append(ap)
+                if th == 0.50:
+                    per_class_ap50[c] = round(ap * 100.0, 2)
+
+        # In bảng thống kê chi tiết khả năng nhận diện từng class ra terminal
+        print("\n" + "=" * 62)
+        print(f"{'Class ID':<10} {'Class Name':<28} {'AP@50 (%)':<15}")
+        print("-" * 62)
+        for c in range(self.num_classes):
+            c_name = self.class_names[c] if c < len(self.class_names) else f"class_{c}"
+            ap_val = per_class_ap50.get(c, 0.0)
+            print(f"{c:<10} {c_name:<28} {ap_val:<15.2f}")
+        print("=" * 62 + "\n")
 
         # Tính mean AP theo phần trăm (0 - 100%)
         map_per_thresh: Dict[float, float] = {}
@@ -234,8 +264,17 @@ class VisDroneMAP(BaseMetric):
         coco_maps = [map_per_thresh.get(th, 0.0) for th in coco_thresholds]
         map_50_95 = float(np.mean(coco_maps)) if coco_maps else 0.0
 
-        return {
+        results = {
             "mAP_50": round(map_50, 4),
             "mAP_75": round(map_75, 4),
             "mAP_50_95": round(map_50_95, 4),
         }
+
+        # Lưu per-class AP50 vào results dictionary (ví dụ: 'AP50_car', 'AP50_pedestrian'...)
+        for c in range(self.num_classes):
+            c_name = self.class_names[c] if c < len(self.class_names) else f"class_{c}"
+            # Chuẩn hóa tên bỏ khoảng trắng
+            clean_name = c_name.replace(" ", "_")
+            results[f"AP50_{clean_name}"] = per_class_ap50.get(c, 0.0)
+
+        return results

@@ -14,7 +14,7 @@ from torchvision.models.feature_extraction import create_feature_extractor
 from BaseModel.model.layers_module import (
     AnchorFreeDetHead,
 )
-
+from .modules import Conv, C3k2, SPPF, C2PSA, Token_Cross_Attention, Slots_Cross_Attention
 
 class BackBone(nn.Module):
     def __init__(self):
@@ -112,66 +112,6 @@ class DownSample(nn.Module):
         x = self.fuse3(x)                           # [B, dim, 20, 20]
         return x
 
-class Deformable(nn.Module):
-    def __init__(self, dim, num_patches, num_reference_point:int= 4):
-        super().__init__()
-        self.to_reference_x = nn.Linear(num_patches, num_reference_point)
-        self.to_reference_y = nn.Linear(num_patches, 1)
-        self.to_q= nn.Linear(dim, dim)
-        self.to_k= nn.Linear(dim, dim)
-        self.to_v= nn.Linear(dim, dim)
-
-    def forward(self, x: Tensor, feat_map: Tensor, attn: Tensor):
-        """
-        x: B, C, dim
-        feat_map: [B, dim, H, W]
-        attn: [B, C, N]
-        """
-        B, dim, H, W= feat_map.shape
-        reference_x= F.sigmoid(self.to_reference_x(attn)) # [B, C, K]
-        feat = reference_x[:, :, :, None] + attn[:, :, None, :]
-        reference_y= F.sigmoid(self.to_reference_y(feat).squeeze(-1)) # [B, C, K] 
-        _, C, K = reference_x.shape
-        grid_x = reference_x.view(B, -1) * 2.0 - 1.0  # [B, C*K]
-        grid_y = reference_y.view(B, -1) * 2.0 - 1.0  # [B, C*K]
-        # 2. Tạo grid có shape [B, 1, C*K, 2] (ở dạng (x, y))
-        grid = torch.stack([grid_x, grid_y], dim=-1).unsqueeze(1)  # [B, 1, C*K, 2]
-        # 3. Lấy mẫu cực nhanh trên GPU:
-        # out shape: [B, dim, 1, C*K]
-        sampled = F.grid_sample(feat_map, grid, mode='bilinear', padding_mode='zeros', align_corners=False)
-        # 4. Reshape lại về [B, C, K, dim]
-        sampled = sampled.squeeze(2).view(B, dim, C, K).permute(0, 2, 3, 1)  # [B, C, K, dim]
-
-        k= self.to_k(sampled) # [B, C, K, dim]
-        v= self.to_v(sampled) # [B, C, K, dim]
-        q= self.to_q(x) # [B, C, dim]
-
-        dim = q.shape[-1]
-        scale = dim ** -0.5
-        attn_scores = torch.einsum('bcd, bckd -> bck', q, k) * scale
-        attn_weights = F.softmax(attn_scores, dim=-1) # [B, C, K]
-        out = torch.einsum('bck, bckd -> bckd', attn_weights, v)
-
-        with torch.enable_grad():
-            # Tạo một dummy tensor có requires_grad=True với kích thước giống feat_map
-            dummy_feat = torch.zeros_like(feat_map, requires_grad=True)
-            # Chạy grid_sample với dummy (grid lấy từ bước trước: [B, 1, C*K, 2])
-            dummy_sampled = F.grid_sample(dummy_feat, grid, mode='bilinear', padding_mode='zeros', align_corners=False)
-            # out_features cần đưa về: [B, dim, 1, C*K]
-            target_grads = out.view(B, -1, dim).permute(0, 2, 1).unsqueeze(2)
-            # autograd.grad sẽ tính toán chính xác việc "đẩy ngược lại 4 điểm xung quanh" theo trọng số song tuyến:
-            
-            scattered_feat_map = torch.autograd.grad(
-                outputs=dummy_sampled,
-                inputs=dummy_feat,
-                grad_outputs=target_grads,
-                create_graph=True  # True nếu muốn huấn luyện tiếp mạng phía sau
-            )[0]
-            # Kết quả: scattered_feat_map có shape [B, dim, H, W]
-            # Sau đó bạn có thể cộng vào feat_map gốc:
-        updated_feat_map = feat_map + scattered_feat_map
-
-        return updated_feat_map
 
 @MODELS.register_module(name="Hand_Digit_Detector")
 class Hand_Digit_Detector(BaseModel):
@@ -181,7 +121,7 @@ class Hand_Digit_Detector(BaseModel):
         self,
         num_classes: int = 80,
         dim: int = 16,
-        total_head: int = 4,
+        total_head: int = 16,
         images_size: int = 640,
         num_ref: int = 4,
     ):
@@ -189,39 +129,29 @@ class Hand_Digit_Detector(BaseModel):
         self.num_classes = num_classes
         self.total_head = total_head
         self.dim= dim
-        self.to_k = nn.Linear(dim, dim)
-        self.to_v = nn.Linear(dim, dim)
-        self.to_q = nn.Linear(dim, dim)
-        
+        self.num_slots= num_classes + 1
         # Shape: (num_classes, dim) -> each slot gets unique learned mu and logsigma
-        self.mu = nn.Parameter(torch.randn(self.num_classes, dim))
-        self.logsigma = nn.Parameter(torch.zeros(self.num_classes, dim))
+        self.mu = nn.Parameter(torch.randn(self.num_slots, self.total_head, dim))
+        self.logsigma = nn.Parameter(torch.zeros(self.num_slots, self.total_head, dim))
 
-        self.fc1 = nn.Linear(dim, dim)
-        self.fc2 = nn.Linear(dim, dim)
-        self.relu = nn.ReLU()
-        self.norm = nn.LayerNorm(dim)
+        self.feature = nn.ModuleList([
+            Conv(3, dim, k=1, s=1),                           # 0
+            Slots_Cross_Attention(self.total_head, dim, dim),
+            Conv(dim, 2 * dim, k=3, s=2),                          # 1
+            Slots_Cross_Attention(self.total_head, dim, 2 * dim),
+            C3k2(2 * dim, 4 * dim, n=1, c3k=False, e=0.25),            # 2
+            Conv(4 * dim, 4 * dim, k=3, s=2),                          # 3
+            Slots_Cross_Attention(self.total_head, dim, 4 * dim),
+            C3k2(4 * dim, 8 * dim, n=1, c3k=False, e=0.25),           # 4
+            Conv(8 * dim, 8 * dim, k=3, s=2),                        # 5
+            Slots_Cross_Attention(self.total_head, dim, 8 * dim),
+            C3k2(8 * dim, 8 * dim, n=1, c3k=True, e=0.5),            # 6
+            Conv(8 * dim, 16 * dim, k=3, s=2),                        # 7
+            C3k2(16 * dim, 16 * dim, n=1, c3k=True, e=0.5),            # 8
+            Slots_Cross_Attention(self.total_head, dim, 16 * dim),
+            Token_Cross_Attention(self.total_head, dim, dim)
+        ])
 
-        # self.FC1 = nn.Linear(dim, dim)
-        # self.FC2 = nn.Linear(dim, dim)
-        # self.LN = nn.LayerNorm(dim)
-
-        # Backbone setup
-        self.backbone = BackBone()
-
-        self.projector = nn.Sequential(
-            nn.Conv2d(
-                in_channels=576, out_channels=total_head * dim, kernel_size=1, bias=False
-            ),
-            nn.BatchNorm2d(total_head * dim),
-            nn.ReLU(inplace=True),
-        )
-        self.conv = nn.Conv2d(self.total_head, 1, 1, 1, 0)
-
-        self.norm_out = nn.LayerNorm(dim)
-        self.downsample = DownSample(total_head * dim)
-        self.up_sample = UpSample(dim)
-        self.deformable = Deformable(dim, (images_size // 32) ** 2, num_ref)
         # Initialization
         nn.init.xavier_uniform_(self.mu)
         nn.init.zeros_(self.logsigma)
@@ -243,7 +173,7 @@ class Hand_Digit_Detector(BaseModel):
         mu = self.mu.to(device)
         sigma = torch.exp(self.logsigma).to(device)
 
-        noise = torch.randn(batch_size, self.num_classes, self.dim, device=device)
+        noise = torch.randn(batch_size, self.num_slots, self.total_head, self.dim, device=device)
 
         slots = mu.unsqueeze(0) + sigma.unsqueeze(0) * noise
 
@@ -275,78 +205,69 @@ class Hand_Digit_Detector(BaseModel):
     def extract_features(self, x: torch.Tensor) -> torch.Tensor:
         """Trích xuất đặc trưng qua Backbone và FPN."""
         B, C, H, W= x.shape
+        slots = self.initalize_slots(B, x.device)
+        feat= None
+        for i,f in enumerate(self.feature):
+            # print(i, slots.shape)
+            if i in [1,3,6,9,13]:
+                slots= f(slots, feat)
+            elif i == 14:
+                feat_map= f(slots, x)
+            elif i == 0:
+                x = f(x)
+                feat= x
+            else:
+                feat= f(feat)
+        return slots, feat_map
 
 
-        c1,c3,c5,c12= self.backbone(x)
-
-        B, C, H, W= c12.shape
-        D= self.total_head * self.dim
-        x= self.projector(c12) # [B, D, H, W]
-        x= self.downsample(c1,c3,c5,c12) + x
-        x= x.permute(0, 2, 3, 1) # [B, H, W, D]
-        x= x.reshape(B, H*W, D) # [B, N, D]
-
+    def slot_orthogonality_loss(self, slots, eps=1e-8):
+        """
+        slots: [B, num_slots, num_heads, head_dim]  (B, K, H, D)
+        Loss ép cosine similarity giữa các cặp slot khác nhau về 0 cho từng head.
+        """
+        B, K, H, D = slots.shape
         
-
-        position: np.ndarray = self.positional_encoding(H, W, D) 
-        position: Tensor = torch.from_numpy(position).to(x.dtype).to(x.device) # [N, D]
-
-        x = x + position # [B, N, D]
-        B,N,D= x.shape
-        x = x.view(B, N, self.total_head, self.dim) # [B, N, head, dim]
-        k = self.to_k(x) # [B, N, dim]
-        v = self.to_v(x) #  [B, N, head, dim]
-        slots = self.initalize_slots(batch_size= B,device= x.device) # [B, num_classes + 1, dim]
-        q = self.to_q(slots) # [B, num_classes + 1, dim]
-
-
-        dot = torch.einsum("b c d, b n h d -> b c h n", q, k) # [B, num_classes + 1, head, N]
-        dot = dot / (self.dim ** 0.5)
-
-        attn = torch.softmax(dot, dim= 1) # [B, num_classes + 1, head, N]
-        x = torch.einsum("b c h n, b n h d -> b c h d", attn, v) # [B, num_classes + 1, head, dim]
-        x = x.permute(0, 2, 1, 3) # [B, head, num_classes + 1, dim]
-        x = self.conv(x).squeeze(1) # [B, num_classes + 1, dim]
-        x = self.fc2(F.relu(self.fc1(self.norm_out(x))))
-        slots = slots + x
-        slots = slots[:, :self.num_classes, :] # [B, num_classes, dim]
-
-        attn[:, :self.num_classes, :, :]
-        attn = attn.permute(0, 2, 1, 3)
-        attn = self.conv(attn).squeeze(1) # [B, num_classes, N]
-        B,D,H,W = c12.shape
-        N = H * W
-        c12_flat = c12.view(B, D, N)  # [B, D, N]
-        c12 = c12_flat.unsqueeze(1).expand(-1, self.num_classes, -1, -1)  # [B, C, D, N]
-        c12= torch.einsum("b c d n, b c n -> b d n", c12, attn)
-        c12= c12.view(B, D, H, W)
-        feat_map = self.up_sample(c1, c3, c5, c12)
-        return slots, feat_map, attn
+        # 1. Chuyển vị về dạng [B, H, K, D] để xử lý song song các heads
+        slots = slots.permute(0, 2, 1, 3)  # [B, H, K, D]
+        
+        # Gom (B, H) thành batch dimension để tận dụng torch.bmm: [B * H, K, D]
+        slots = slots.reshape(B * H, K, D)
+        
+        # 2. Chuẩn hóa L2 dọc theo chiều feature D
+        slots_norm = F.normalize(slots, p=2, dim=-1, eps=eps)  # [B * H, K, D]
+        
+        # 3. Tính ma trận Cosine Similarity giữa các cặp slot trong từng head
+        # [B * H, K, D] x [B * H, D, K] -> [B * H, K, K]
+        cos_sim = torch.bmm(slots_norm, slots_norm.transpose(1, 2))
+        
+        # 4. Loại bỏ đường chéo chính (tự so với chính nó)
+        eye = torch.eye(K, device=slots.device).unsqueeze(0)  # [1, K, K]
+        off_diagonal = cos_sim - eye                          # [B * H, K, K]
+        
+        # 5. Phạt bình phương các giá trị ngoài đường chéo
+        # Số lượng cặp ngoài đường chéo là K * (K - 1)
+        loss = (off_diagonal ** 2).sum(dim=(-2, -1)) / (K * (K - 1))  # [B * H]
+        
+        return loss.mean()
 
 
-
-    def forward_train(
+    def compute_loss(
         self,
-        inputs: torch.Tensor,
+        cls_logits: torch.Tensor,
+        pred_boxes: torch.Tensor,
+        obj_logits: torch.Tensor,
+        slots: torch.Tensor,
         targets: Optional[List[Dict[str, torch.Tensor]]] = None,
-        **kwargs,
     ) -> Dict[str, torch.Tensor]:
-        """Tính toán Detection Loss: Classification + Bounding Box Regression + Objectness."""
-        device = inputs.device
-        slots, feat_map, attn = self.extract_features(inputs)
-        feat = self.deformable(slots, feat_map, attn)
-        B,D,H,W = feat.shape
-        cls_logits, pred_boxes, obj_logits= self.head(feat)
-        # print(cls_logits.shape)
-        # print(pred_boxes.shape)
-        # print(obj_logits.shape)
-
-        # cls_logits, pred_boxes, obj_logits = self.head(feat)
+        """Tính toán Detection Loss: Classification + Bounding Box Regression + Objectness + Orthogonality."""
+        device = cls_logits.device
         batch_size, _, grid_h, grid_w = cls_logits.shape
 
         total_cls_loss = torch.tensor(0.0, device=device)
         total_box_loss = torch.tensor(0.0, device=device)
         total_obj_loss = torch.tensor(0.0, device=device)
+        pos_weight = torch.tensor([5.0], device=device)
 
         for b in range(batch_size):
             img_cls = cls_logits[b]      # (num_classes, H, W)
@@ -377,45 +298,39 @@ class Hand_Digit_Detector(BaseModel):
                 p_box = img_box[:, grid_y, grid_x].permute(1, 0)
 
                 valid_labels = gt_labels.clamp(0, self.num_classes - 1)
-                cls_loss = F.cross_entropy(p_cls, valid_labels)
-                box_loss = F.smooth_l1_loss(p_box, gt_boxes)
+                total_cls_loss += F.cross_entropy(p_cls, valid_labels)
+                total_box_loss += F.smooth_l1_loss(p_box, gt_boxes)
 
-                total_cls_loss += cls_loss
-                total_box_loss += box_loss
-
-            obj_loss = F.binary_cross_entropy_with_logits(
-                img_obj, obj_target, pos_weight=torch.tensor([5.0], device=device)
+            total_obj_loss += F.binary_cross_entropy_with_logits(
+                img_obj, obj_target, pos_weight=pos_weight
             )
-            total_obj_loss += obj_loss
 
         total_cls_loss /= max(batch_size, 1)
         total_box_loss /= max(batch_size, 1)
         total_obj_loss /= max(batch_size, 1)
 
-        total_loss = total_cls_loss + 2.0 * total_box_loss + total_obj_loss
+        ortho_loss = self.slot_orthogonality_loss(slots)
 
+        total_loss = total_cls_loss + 2.0 * total_box_loss + total_obj_loss + ortho_loss
+        
         return {
             "loss": total_loss,
             "loss_cls": total_cls_loss,
             "loss_box": total_box_loss,
             "loss_obj": total_obj_loss,
+            "ortho_loss": ortho_loss,
         }
 
-    def predict(
+    def decode_predictions(
         self,
-        inputs: torch.Tensor,
+        cls_logits: torch.Tensor,
+        pred_boxes: torch.Tensor,
+        obj_logits: torch.Tensor,
         conf_threshold: float = 0.05,
         nms_threshold: float = 0.5,
-        **kwargs,
     ) -> List[Dict[str, torch.Tensor]]:
-        """Dự đoán bounding box, class label và confidence score khi suy luận / đánh giá."""
-        slots, feat_map, attn = self.extract_features(inputs)
-        feat = self.deformable(slots, feat_map, attn)
-        B,D,H,W = feat.shape
-        cls_logits, pred_boxes, obj_logits= self.head(feat)
-
+        """Decode bounding box, class label và confidence score từ output head."""
         batch_size = cls_logits.shape[0]
-
         cls_probs = cls_logits.softmax(dim=1)
         obj_scores = obj_logits.sigmoid()
 
@@ -430,13 +345,13 @@ class Hand_Digit_Detector(BaseModel):
             b_labels = labels[mask]                         # (K,)
 
             if len(b_boxes) > 0 and nms_threshold is not None:
-                # Chuyển đổi cxcywh sang xyxy để chạy NMS
+                cx, cy, w, h = b_boxes.unbind(dim=1)
                 xyxy = torch.stack(
                     [
-                        b_boxes[:, 0] - b_boxes[:, 2] / 2,
-                        b_boxes[:, 1] - b_boxes[:, 3] / 2,
-                        b_boxes[:, 0] + b_boxes[:, 2] / 2,
-                        b_boxes[:, 1] + b_boxes[:, 3] / 2,
+                        cx - w / 2,
+                        cy - h / 2,
+                        cx + w / 2,
+                        cy + h / 2,
                     ],
                     dim=1,
                 )
@@ -453,18 +368,50 @@ class Hand_Digit_Detector(BaseModel):
 
         return results
 
-    def forward_val(
+    def forward_train(
         self,
         inputs: torch.Tensor,
         targets: Optional[List[Dict[str, torch.Tensor]]] = None,
         **kwargs,
+    ) -> Dict[str, torch.Tensor]:
+        """Tính toán Detection Loss: Classification + Bounding Box Regression + Objectness."""
+        slots, feat_map = self.extract_features(inputs)
+        cls_logits, pred_boxes, obj_logits = self.head(feat_map)
+        return self.compute_loss(cls_logits, pred_boxes, obj_logits, slots, targets)
+
+    def predict(
+        self,
+        inputs: torch.Tensor,
+        conf_threshold: float = 0.05,
+        nms_threshold: float = 0.5,
+        **kwargs,
+    ) -> List[Dict[str, torch.Tensor]]:
+        """Dự đoán bounding box, class label và confidence score khi suy luận / đánh giá."""
+        slots, feat_map = self.extract_features(inputs)
+        cls_logits, pred_boxes, obj_logits = self.head(feat_map)
+        return self.decode_predictions(
+            cls_logits, pred_boxes, obj_logits, conf_threshold=conf_threshold, nms_threshold=nms_threshold
+        )
+
+    def forward_val(
+        self,
+        inputs: torch.Tensor,
+        targets: Optional[List[Dict[str, torch.Tensor]]] = None,
+        conf_threshold: float = 0.05,
+        nms_threshold: float = 0.5,
+        **kwargs,
     ) -> Dict[str, Any]:
-        """Validation forward pass: sinh dự đoán cho mAP và tính val loss."""
-        preds = self.predict(inputs, **kwargs)
+        """Validation forward pass tối ưu: chỉ chạy forward 1 lần duy nhất."""
+        slots, feat_map = self.extract_features(inputs)
+        cls_logits, pred_boxes, obj_logits = self.head(feat_map)
+
+        preds = self.decode_predictions(
+            cls_logits, pred_boxes, obj_logits, conf_threshold=conf_threshold, nms_threshold=nms_threshold
+        )
         output = {"preds": preds}
 
         if targets is not None:
-            train_out = self.forward_train(inputs, targets, **kwargs)
-            output.update(train_out)
+            losses = self.compute_loss(cls_logits, pred_boxes, obj_logits, slots, targets)
+            output.update(losses)
 
         return output
