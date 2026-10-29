@@ -105,7 +105,9 @@ class ExcelTracker(BaseHook):
     Tracks metrics across multiple sheets in an .xlsx file:
     1. 'Epoch_Overview': Epoch, Train_Loss, Val_Loss, Lr, sub-losses, val metrics, time, etc.
     2. 'Gradients_Detail': Epoch, Total_Grad_Norm, grad_norm_backbone, grad_norm_neck, etc.
-    3. Custom Sheets: Any additional sheets added by user.
+    3. 'Detection': Detailed decomposition of feat_map into components (FPN, Slot, Deform_Local,
+       Deform_Global) and their influence ratios on cls_logits and pred_offsets.
+    4. Custom Sheets: Any additional sheets added by user.
 
     Features:
     - Completely silent: Does not print or emit logs to the terminal/console.
@@ -121,6 +123,9 @@ class ExcelTracker(BaseHook):
             If None, automatically inspects model's top-level children.
         track_gradients: Whether to compute and record gradient norms (default: True).
         grad_interval: Frequency (in batches) to sample gradients (default: 1, every batch).
+        track_detection: Whether to decompose detection features and analyze influence on
+            cls_logits and pred_offsets in a dedicated 'Detection' sheet (default: True).
+        detection_interval: Frequency (in batches) to sample detection components (default: 10).
         auto_save: Whether to automatically save after each epoch (default: True).
         resume: Whether to load existing sheets if the file exists (default: True).
     """
@@ -131,6 +136,8 @@ class ExcelTracker(BaseHook):
         submodules: Optional[List[str]] = None,
         track_gradients: bool = True,
         grad_interval: int = 1,
+        track_detection: bool = True,
+        detection_interval: int = 10,
         auto_save: bool = True,
         resume: bool = True,
     ):
@@ -144,6 +151,8 @@ class ExcelTracker(BaseHook):
         self.submodules = list(submodules) if submodules else None
         self.track_gradients = track_gradients
         self.grad_interval = max(1, int(grad_interval))
+        self.track_detection = track_detection
+        self.detection_interval = max(1, int(detection_interval))
         self.auto_save = auto_save
         self.resume = resume
 
@@ -152,6 +161,8 @@ class ExcelTracker(BaseHook):
             "Epoch_Overview": [],
             "Gradients_Detail": [],
         }
+        if self.track_detection:
+            self.sheets_data["Detection"] = []
 
         # Registered custom metric callbacks: {sheet_name: {metric_name: callable(trainer)}}
         self.custom_metrics: Dict[str, Dict[str, Callable[[Any], Any]]] = defaultdict(dict)
@@ -161,6 +172,8 @@ class ExcelTracker(BaseHook):
         self._epoch_loss_count = 0
         self._epoch_grad_norms: Dict[str, float] = defaultdict(float)
         self._epoch_grad_count = 0
+        self._epoch_detection_metrics: Dict[str, float] = defaultdict(float)
+        self._epoch_detection_count = 0
         self._epoch_start_time = 0.0
         self._last_val_metrics: Dict[str, float] = {}
         self.filepath: str = filename
@@ -249,6 +262,22 @@ class ExcelTracker(BaseHook):
 
         self.sheets_data["Gradients_Detail"].append(row)
 
+    def log_detection(
+        self,
+        epoch: int,
+        metrics: Optional[Dict[str, Any]] = None,
+        **extra_metrics,
+    ) -> None:
+        """Helper to manually log an entry to 'Detection' sheet without BaseTrainer."""
+        row: Dict[str, Any] = {"Epoch": epoch}
+        if metrics:
+            row.update(metrics)
+        for k, v in extra_metrics.items():
+            row[k] = v
+        if "Detection" not in self.sheets_data:
+            self.sheets_data["Detection"] = []
+        self.sheets_data["Detection"].append(row)
+
     # =========================================================================
     # Lifecycle Hook Methods (BaseHook Integration)
     # =========================================================================
@@ -275,8 +304,44 @@ class ExcelTracker(BaseHook):
         self._epoch_loss_count = 0
         self._epoch_grad_norms.clear()
         self._epoch_grad_count = 0
+        self._epoch_detection_metrics.clear()
+        self._epoch_detection_count = 0
         self._epoch_start_time = time.time()
         self._last_val_metrics = {}
+
+    def _sample_detection_from_batch(self, trainer: "BaseTrainer", data_batch: Any) -> None:
+        """Sample detection component decomposition metrics from the model."""
+        if not self.track_detection:
+            return
+        underlying = getattr(trainer.model, "module", trainer.model)
+        if hasattr(underlying, "analyze_detection_components"):
+            inputs = None
+            if isinstance(data_batch, dict):
+                inputs = data_batch.get("image", data_batch.get("inputs", None))
+            elif isinstance(data_batch, (list, tuple)) and len(data_batch) > 0:
+                inputs = data_batch[0]
+            elif isinstance(data_batch, torch.Tensor):
+                inputs = data_batch
+
+            if inputs is not None and isinstance(inputs, torch.Tensor):
+                sample = inputs[:min(4, len(inputs))]
+                try:
+                    stats = underlying.analyze_detection_components(sample)
+                    for k, v in stats.items():
+                        self._epoch_detection_metrics[k] += v
+                    self._epoch_detection_count += 1
+                except Exception:
+                    pass
+
+    def before_train_iter(self, trainer: "BaseTrainer", batch_idx: int, data_batch: Any) -> None:
+        """Sample detection component influence at configured intervals during training."""
+        if self.track_detection and ((batch_idx + 1) % self.detection_interval == 0 or batch_idx == 0):
+            self._sample_detection_from_batch(trainer, data_batch)
+
+    def before_val_iter(self, trainer: "BaseTrainer", batch_idx: int, data_batch: Any) -> None:
+        """Sample detection component influence during validation if no train batches were sampled."""
+        if self.track_detection and (self._epoch_detection_count == 0 or (batch_idx + 1) % self.detection_interval == 0):
+            self._sample_detection_from_batch(trainer, data_batch)
 
     def after_train_iter(self, trainer: "BaseTrainer", batch_idx: int, outputs: Dict[str, Any]) -> None:
         """Accumulate train batch losses and sample gradient norms."""
@@ -361,10 +426,34 @@ class ExcelTracker(BaseHook):
         self.sheets_data["Gradients_Detail"].append(grad_row)
 
         # ---------------------------------------------------------
-        # 3. Custom Registered Sheets
+        # 3. Sheet: Detection (Head Input Components & Output Impact)
+        # ---------------------------------------------------------
+        if self.track_detection and self._epoch_detection_count > 0:
+            det_row: Dict[str, Any] = {"Epoch": epoch_idx}
+            det_count = max(1, self._epoch_detection_count)
+            for k, v in self._epoch_detection_metrics.items():
+                if "Ratio" in k or "Impact" in k:
+                    det_row[k] = round(v / det_count, 2)
+                else:
+                    det_row[k] = round(v / det_count, 5)
+
+            # Execute registered custom metric callbacks for Detection
+            if "Detection" in self.custom_metrics:
+                for col_name, callback in self.custom_metrics["Detection"].items():
+                    try:
+                        det_row[col_name] = callback(trainer)
+                    except Exception:
+                        det_row[col_name] = None
+
+            if "Detection" not in self.sheets_data:
+                self.sheets_data["Detection"] = []
+            self.sheets_data["Detection"].append(det_row)
+
+        # ---------------------------------------------------------
+        # 4. Custom Registered Sheets
         # ---------------------------------------------------------
         for sheet_name, metric_dict in self.custom_metrics.items():
-            if sheet_name not in ["Epoch_Overview", "Gradients_Detail"]:
+            if sheet_name not in ["Epoch_Overview", "Gradients_Detail", "Detection"]:
                 custom_row: Dict[str, Any] = {"Epoch": epoch_idx}
                 for col_name, callback in metric_dict.items():
                     try:
@@ -446,8 +535,11 @@ class ExcelTracker(BaseHook):
                         cell.number_format = "0"
                     elif isinstance(val, float):
                         cell.alignment = right_align
-                        if headers[col_idx - 1].lower() == "lr" or val < 1e-4:
+                        header_name = headers[col_idx - 1]
+                        if header_name.lower() == "lr" or val < 1e-4:
                             cell.number_format = "0.000000"
+                        elif "Ratio" in header_name or "Impact" in header_name:
+                            cell.number_format = '0.00"%"'
                         else:
                             cell.number_format = "0.0000"
                     else:

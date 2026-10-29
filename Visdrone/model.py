@@ -125,74 +125,84 @@ class DownSample(nn.Module):
         return p3, p5, p12
 
 class Deformable(nn.Module):
-    def __init__(self, dim, num_patches, num_reference_point:int= 4):
+    def __init__(self, dim: int, num_patches: int = None, num_reference_point: int = 16):
         super().__init__()
-        self.to_reference_x = nn.Linear(num_patches, num_reference_point)
-        self.to_reference_y = nn.Linear(num_patches, 1)
-        self.to_q= nn.Linear(dim, dim)
-        self.to_k= nn.Linear(dim, dim)
-        self.to_v= nn.Linear(dim, dim)
+        self.dim = dim
+        self.num_reference_point = num_reference_point
+        # MLP trích xuất K tọa độ reference 2D độc lập trực tiếp từ vector ngữ nghĩa slots của từng class
+        self.ref_mlp = nn.Sequential(
+            nn.Linear(dim, dim * 2),
+            nn.ReLU(inplace=True),
+            nn.Linear(dim * 2, num_reference_point * 2),
+        )
+        # Khởi tạo reference points phân bố đều trên lưới không gian 2D [0, 1] x [0, 1]
+        grid_size = int(math.isqrt(num_reference_point))
+        if grid_size * grid_size == num_reference_point:
+            xs = [(i + 0.5) / grid_size for i in range(grid_size)]
+            ys = [(j + 0.5) / grid_size for j in range(grid_size)]
+            grid = torch.tensor([[x, y] for y in ys for x in xs], dtype=torch.float32)
+        else:
+            grid = torch.rand(num_reference_point, 2, dtype=torch.float32) * 0.8 + 0.1
+        grid = grid.clamp(0.01, 0.99)
+        bias = torch.log(grid / (1.0 - grid)).view(-1)
+        nn.init.zeros_(self.ref_mlp[-1].weight)
+        self.ref_mlp[-1].bias.data.copy_(bias)
 
-    def forward(self, x: Tensor, pure_map: Tensor, feat_map: Tensor, attn: Tensor):
+        self.to_q = nn.Linear(dim, dim)
+        self.to_k = nn.Linear(dim, dim)
+        self.to_v = nn.Linear(dim, dim)
+
+    def forward(self, x: Tensor, pure_map: Tensor, feat_map: Tensor, attn: Tensor = None, return_components: bool = False):
         """
-        x: B, C, dim
-        feat_map: [B, C, dim, h, w]
+        x: [B, C, dim] (slots)
         pure_map: [B, dim, H, W]
-        attn: [B, C, N]
+        feat_map: [B, C, dim, H, W]
+        attn: [B, C, N] (optional)
         """
-        B, C, dim, H, W= feat_map.shape
-        reference_x = F.sigmoid(self.to_reference_x(attn)) # [B, C, K]
-        feat = reference_x[:, :, :, None] / attn.shape[-1] + attn[:, :, None, :]
-        reference_y = F.sigmoid(self.to_reference_y(feat).squeeze(-1)) # [B, C, K] 
+        B, C, dim, H, W = feat_map.shape
+        # Dự đoán trực tiếp K điểm reference 2D độc lập từ semantic slots của từng class
+        ref_raw = self.ref_mlp(x).view(B, C, self.num_reference_point, 2)
+        ref_points = torch.sigmoid(ref_raw)  # [B, C, K, 2] in [0, 1]
+        reference_x = ref_points[..., 0]      # [B, C, K]
+        reference_y = ref_points[..., 1]      # [B, C, K]
+
         B, dim, H, W = pure_map.shape
-        _, C, K = reference_x.shape
+        K = self.num_reference_point
         num_samples = 10  # 10 ô từ mỗi cặp (x, y)
         # 1. Tọa độ gốc chuẩn hóa về dải [-1, 1]
-        # Shape ban đầu: [B, C*K, 1]
         base_x = (reference_x.view(B, -1) * 2.0 - 1.0).unsqueeze(-1)  # [B, C*K, 1]
         base_y = (reference_y.view(B, -1) * 2.0 - 1.0).unsqueeze(-1)  # [B, C*K, 1]
-        # 2. Định nghĩa offsets (ví dụ: 10 điểm lân cận)
-        # Lưu ý: 1 pixel trên trục x ứng với bước nhảy 2.0 / W
-        # 1 pixel trên trục y ứng với bước nhảy 2.0 / H
-        # Ví dụ 10 offsets (delta_x theo pixel, delta_y theo pixel):
-        # (Bao gồm điểm tâm (0,0) và 9 điểm xung quanh hoặc 10 vị trí tùy bạn chọn)
+        # 2. Định nghĩa offsets (10 điểm lân cận)
         offsets_pixel = torch.tensor([
             [0.0, 0.0],
             [-1.0, 0.0], [1.0, 0.0], [0.0, -1.0], [0.0, 1.0],
             [-1.0, -1.0], [1.0, -1.0], [-1.0, 1.0], [1.0, 1.0],
-            [0.0, 2.0]  # điểm thứ 10 ví dụ
+            [0.0, 2.0]
         ], device=pure_map.device)  # [10, 2]
-        # Chuyển đổi offset từ pixel sang dải tọa độ [-1, 1]
         offset_x = offsets_pixel[:, 0] * (2.0 / W)  # [10]
         offset_y = offsets_pixel[:, 1] * (2.0 / H)  # [10]
         # 3. Mở rộng và cộng offset vào tọa độ gốc:
-        # [B, C*K, 1] + [10] -> [B, C*K, 10]
         sample_x = base_x + offset_x.view(1, 1, num_samples)
         sample_y = base_y + offset_y.view(1, 1, num_samples)
-        # 4. Gom lại thành Grid:
-        # Ghép (x, y) -> [B, C*K, 10, 2]
+        # 4. Gom lại thành Grid: [B, C*K, 10, 2]
         grid = torch.stack([sample_x, sample_y], dim=-1)
         # 5. Lấy mẫu với grid_sample:
-        # pure_map: [B, dim, H, W]
-        # grid:     [B, C*K, 10, 2]
-        # sampled:  [B, dim, C*K, 10]
         sampled = F.grid_sample(pure_map, grid, mode='bilinear', padding_mode='zeros', align_corners=False)
-        # 6. Định hình lại (Reshape) theo cấu trúc mong muốn:
-        # [B, dim, C, K, 10]
+        # 6. Reshape và Attention:
         sampled = sampled.view(B, dim, C, K, num_samples)
-        sampled = sampled.permute(0, 2, 3, 4, 1) # [B, C, K, 10, dim]
-        k= self.to_k(sampled) # [B, C, K, 10, dim]
-        v= self.to_v(sampled) # [B, C, K, 10, dim]
-        q= self.to_q(x) # [B, C, dim]
+        sampled = sampled.permute(0, 2, 3, 4, 1)  # [B, C, K, 10, dim]
+        k = self.to_k(sampled)                    # [B, C, K, 10, dim]
+        v = self.to_v(sampled)                    # [B, C, K, 10, dim]
+        q = self.to_q(x)                          # [B, C, dim]
 
         dim = q.shape[-1]
         scale = dim ** -0.5
         attn_scores = torch.einsum('bcd, bcksd -> bcks', q, k) * scale
-        attn_weights = F.softmax(attn_scores, dim=-1) # [B, C, K, 10]
-        out = torch.einsum('bcks, bcksd -> bckd', attn_weights, v) # [B, C, K, dim]
+        attn_weights = F.softmax(attn_scores, dim=-1)  # [B, C, K, 10]
+        out = torch.einsum('bcks, bcksd -> bckd', attn_weights, v)  # [B, C, K, dim]
 
         B, C, dim, H, W = feat_map.shape
-        # 2. Bilinear Splatting (khả vi bậc 1 theo cả out lẫn reference_x, reference_y, chuẩn hóa biên độ đạo hàm tọa độ)
+        # 2. Bilinear Splatting (khả vi bậc 1 theo cả out lẫn reference_x, reference_y)
         px = reference_x.detach() * W - 0.5 + (reference_x - reference_x.detach())  # [B, C, K]
         py = reference_y.detach() * H - 0.5 + (reference_y - reference_y.detach())  # [B, C, K]
 
@@ -223,11 +233,12 @@ class Deformable(nn.Module):
             scattered_flat = scattered_flat.scatter_add(-1, idx, weighted_out)
 
         scattered_feat_map = scattered_flat.view(B, C, dim, H, W)
-        # Kết hợp đặc trưng cục bộ tại K điểm reference (scattered_feat_map) và ngữ cảnh toàn cục của K điểm (global_context)
+        # Kết hợp đặc trưng cục bộ (scattered_feat_map) và ngữ cảnh toàn cục (global_context)
         global_context = out.mean(dim=2).unsqueeze(-1).unsqueeze(-1)  # [B, C, dim, 1, 1]
         updated_feat_map = feat_map + scattered_feat_map + global_context
-        ref_points = torch.stack([reference_x, reference_y], dim=-1)  # [B, C, K, 2]
 
+        if return_components:
+            return updated_feat_map, ref_points, scattered_feat_map, global_context
         return updated_feat_map, ref_points
 
 class ClassSpecificDetHead(nn.Module):
@@ -329,11 +340,12 @@ class SlotCrossAttention(nn.Module):
         self.norm_feat = nn.BatchNorm2d(dim)
         self.norm_slot = nn.LayerNorm(dim)
 
-    def forward(self, slots: torch.Tensor, feat_map: torch.Tensor) -> torch.Tensor:
+    def forward(self, slots: torch.Tensor, feat_map: torch.Tensor, return_components: bool = False):
         """
         Args:
             slots: [B, C, dim] (C = num_classes)
             feat_map: [B, dim, H, W] (từ up_sample FPN, ví dụ 160x160)
+            return_components: Whether to return individual components (feat_fpn_mod, slot_bias)
         Returns:
             class_feat_map: [B, C, dim, H, W] (Mỗi class có 1 heatmap đặc trưng tương tác sâu)
         """
@@ -363,7 +375,11 @@ class SlotCrossAttention(nn.Module):
         slot_mod = slots.unsqueeze(-1).unsqueeze(-1)            # [B, C, dim, 1, 1]
         feat_expanded = feat_map.unsqueeze(1)                   # [B, 1, dim, H, W]
         # Class Feature Map: vừa giữ đặc trưng không gian nét, vừa được lọc theo đặc trưng của class!
-        out = feat_expanded * torch.sigmoid(slot_mod) + slot_mod # [B, C, dim, H, W]
+        feat_fpn_mod = feat_expanded * torch.sigmoid(slot_mod)
+        slot_bias = slot_mod
+        out = feat_fpn_mod + slot_bias # [B, C, dim, H, W]
+        if return_components:
+            return slots, out, attn_weights.mean(dim=-2), feat_fpn_mod, slot_bias
         return slots, out, attn_weights.mean(dim=-2)
 
 @MODELS.register_module()
@@ -482,7 +498,7 @@ class VisDroneDetector(BaseModel):
         out = np.einsum('m,d->md', grid, omega) # [N, D // 2]
         return np.concatenate([np.sin(out), np.cos(out)], axis=1) # [N, D]
 
-    def extract_features(self, x: torch.Tensor) -> torch.Tensor:
+    def extract_features(self, x: torch.Tensor, return_components: bool = False) -> torch.Tensor:
         """Trích xuất đặc trưng qua Backbone và FPN."""
         B, C, H, W= x.shape
 
@@ -521,8 +537,130 @@ class VisDroneDetector(BaseModel):
         # Nối trực tiếp PANet Spatial Highway: truyền p3, p5, x_top từ DownSample vào UpSample
         feat_map = self.up_sample(c1, p3, p5, x_top) # [B, dim, H, W]
 
+        if return_components:
+            slots, feat_map, attn_weights, feat_fpn_mod, slot_bias = self.cross_attn(
+                slots, feat_map, return_components=True
+            )
+            return slots, feat_map, attn_weights, pure_map, feat_fpn_mod, slot_bias
+
         slots, feat_map, attn_weights = self.cross_attn(slots, feat_map)  # [B, C, dim, H, W]
         return slots, feat_map, attn_weights, pure_map
+
+    def decompose_detection(self, inputs: torch.Tensor) -> Dict[str, Any]:
+        """Tách các thành phần độc lập cấu thành feat_map đầu vào của self.head:
+        feat_total = feat_fpn + feat_slot + feat_deform_local + feat_deform_global.
+        
+        Tất cả 4 thành phần có shape [B, C, dim, H, W] và cộng lại chính xác bằng feat_total.
+        """
+        slots, feat_map, attn, pure_map, feat_fpn, feat_slot = self.extract_features(
+            inputs, return_components=True
+        )
+        updated_feat_map, ref_points, feat_deform_local, feat_deform_global = self.deformable(
+            slots, pure_map, feat_map, attn, return_components=True
+        )
+        return {
+            "feat_total": updated_feat_map,
+            "feat_fpn": feat_fpn,
+            "feat_slot": feat_slot,
+            "feat_deform_local": feat_deform_local,
+            "feat_deform_global": feat_deform_global,
+            "ref_points": ref_points,
+        }
+    
+    def analyze_detection_components(self, inputs: torch.Tensor) -> Dict[str, float]:
+        """Phân tích chi tiết tỷ lệ đóng góp của các thành phần trong feat_map và mức độ
+        ảnh hưởng (Ablation Impact) lên kết quả cuối cùng cls_logits, pred_offsets = self.head(feat_map).
+        4 thành phần cơ sở:
+        1. FPN: Đặc trưng không gian FPN từ Backbone/PANet được điều chế bởi Class Slots.
+        2. Slot: Đặc trưng ngữ nghĩa Class Slots (Semantic Slot prior) từ Slot Attention."""
+        was_training = self.training
+        self.eval()
+        with torch.no_grad():
+            decomp = self.decompose_detection(inputs)
+            feat_total = decomp["feat_total"]
+            comps = {
+                "FPN": decomp["feat_fpn"],
+                "Slot": decomp["feat_slot"],
+                "Deform_Local": decomp["feat_deform_local"],
+                "Deform_Global": decomp["feat_deform_global"],
+            }
+            # 1. Tỷ lệ độ lớn năng lượng đặc trưng (Feature Energy/Norm Ratios)
+            norms = {k: v.abs().mean().item() for k, v in comps.items()}
+            total_norm = sum(norms.values())
+            eps = 1e-8
+            feat_ratios = {
+                f"Feat_Ratio_{k}": (v / max(total_norm, eps)) * 100.0
+                for k, v in norms.items()
+            }
+            # 2. Đầu ra Head hoàn chỉnh khi có đủ cả 4 thành phần
+            cls_logits_full, pred_offsets_full = self.head(feat_total)
+            # 3. Phân tích độ nhạy / mức độ ảnh hưởng (Ablation Impact) khi loại bỏ từng thành phần
+            cls_deltas = {}
+            box_deltas = {}
+            for k, comp in comps.items():
+                feat_ablated = feat_total - comp
+                cls_abl, box_abl = self.head(feat_ablated)
+                cls_deltas[k] = (cls_logits_full - cls_abl).abs().mean().item()
+                box_deltas[k] = (pred_offsets_full - box_abl).abs().mean().item()
+            total_cls_delta = sum(cls_deltas.values())
+            total_box_delta = sum(box_deltas.values())
+            cls_impacts = {
+                f"Cls_Impact_{k}": (v / max(total_cls_delta, eps)) * 100.0
+                for k, v in cls_deltas.items()
+            }
+            box_impacts = {
+                f"Box_Impact_{k}": (v / max(total_box_delta, eps)) * 100.0
+                for k, v in box_deltas.items()
+            }
+            # 4. Thống kê phân phối đầu ra của Head
+            cls_mean = cls_logits_full.mean().item()
+            cls_max = cls_logits_full.max().item()
+            cls_prob_max = cls_logits_full.sigmoid().max().item()
+            box_w_mean = pred_offsets_full[:, :, 2].mean().item()
+            box_h_mean = pred_offsets_full[:, :, 3].mean().item()
+            results = {
+                # Tỷ lệ năng lượng đặc trưng (%)
+                "Feat_Ratio_FPN": round(feat_ratios["Feat_Ratio_FPN"], 2),
+                "Feat_Ratio_Slot": round(feat_ratios["Feat_Ratio_Slot"], 2),
+                "Feat_Ratio_Deform_Local": round(feat_ratios["Feat_Ratio_Deform_Local"], 2),
+                "Feat_Ratio_Deform_Global": round(feat_ratios["Feat_Ratio_Deform_Global"], 2),
+                # Tỷ lệ ảnh hưởng lên kết quả phân loại cls_logits (%)
+                "Cls_Impact_FPN": round(cls_impacts["Cls_Impact_FPN"], 2),
+                "Cls_Impact_Slot": round(cls_impacts["Cls_Impact_Slot"], 2),
+                "Cls_Impact_Deform_Local": round(cls_impacts["Cls_Impact_Deform_Local"], 2),
+                "Cls_Impact_Deform_Global": round(cls_impacts["Cls_Impact_Deform_Global"], 2),
+                # Tỷ lệ ảnh hưởng lên kết quả hồi quy bounding box pred_offsets (%)
+                "Box_Impact_FPN": round(box_impacts["Box_Impact_FPN"], 2),
+                "Box_Impact_Slot": round(box_impacts["Box_Impact_Slot"], 2),
+                "Box_Impact_Deform_Local": round(box_impacts["Box_Impact_Deform_Local"], 2),
+                "Box_Impact_Deform_Global": round(box_impacts["Box_Impact_Deform_Global"], 2),
+                # Độ lệch tuyệt đối trên cls_logits khi loại bỏ từng thành phần (Ablation Delta)
+                "Delta_Cls_FPN": round(cls_deltas["FPN"], 5),
+                "Delta_Cls_Slot": round(cls_deltas["Slot"], 5),
+                "Delta_Cls_Deform_Local": round(cls_deltas["Deform_Local"], 5),
+                "Delta_Cls_Deform_Global": round(cls_deltas["Deform_Global"], 5),
+                # Độ lệch tuyệt đối trên pred_offsets khi loại bỏ từng thành phần (Ablation Delta)
+                "Delta_Box_FPN": round(box_deltas["FPN"], 5),
+                "Delta_Box_Slot": round(box_deltas["Slot"], 5),
+                "Delta_Box_Deform_Local": round(box_deltas["Deform_Local"], 5),
+                "Delta_Box_Deform_Global": round(box_deltas["Deform_Global"], 5),
+                # Cường độ L1 trung bình của từng thành phần
+                "Norm_Feat_FPN": round(norms["FPN"], 5),
+                "Norm_Feat_Slot": round(norms["Slot"], 5),
+                "Norm_Feat_Deform_Local": round(norms["Deform_Local"], 5),
+                "Norm_Feat_Deform_Global": round(norms["Deform_Global"], 5),
+                "Norm_Feat_Total": round(feat_total.abs().mean().item(), 5),
+                # Thống kê phân phối đầu ra Head
+                "Cls_Logits_Mean": round(cls_mean, 4),
+                "Cls_Logits_Max": round(cls_max, 4),
+                "Cls_Prob_Max": round(cls_prob_max, 4),
+                "Box_Pred_W_Mean": round(box_w_mean, 4),
+                "Box_Pred_H_Mean": round(box_h_mean, 4),
+            }
+        if was_training:
+            self.train()
+        return results
+
 
     def _decode_boxes(self, pred_offsets: torch.Tensor) -> torch.Tensor:
         """Decode offset dự đoán [dx, dy, w, h] tại mỗi ô lưới thành tọa độ box chuẩn hóa [cx, cy, w, h]."""
@@ -564,7 +702,7 @@ class VisDroneDetector(BaseModel):
         return torch.stack([x1, y1, x2, y2], dim=-1)
 
     def _compute_losses(self, cls_logits, pred_offsets, targets, device, ref_points=None):
-        """Hàm dùng chung tính Focal Loss (cls), DIoU Loss (box), Reference Loss (deformable) và các chỉ số tracking."""
+        """Hàm dùng chung tính Gaussian Focal Loss (cls), DIoU Loss (box), Reference Loss (deformable) và các chỉ số tracking."""
         batch_size, num_classes, grid_h, grid_w = cls_logits.shape
 
         total_cls_loss = torch.tensor(0.0, device=device)
@@ -576,6 +714,13 @@ class VisDroneDetector(BaseModel):
         prob_neg_max = torch.tensor(0.0, device=device)
         num_pos_total = 0
 
+        # Gaussian smoothing kernel 3x3 (sigma = 1.0)
+        gaussian_k = torch.tensor([
+            [0.3679, 0.6065, 0.3679],
+            [0.6065, 1.0000, 0.6065],
+            [0.3679, 0.6065, 0.3679]
+        ], device=device)
+
         for b in range(batch_size):
             img_cls = cls_logits[b]
             img_offset = pred_offsets[b]
@@ -584,7 +729,7 @@ class VisDroneDetector(BaseModel):
             gt_labels = target_dict.get("labels", torch.empty((0,), device=device, dtype=torch.long)) if target_dict else torch.empty((0,), device=device, dtype=torch.long)
             num_gt = len(gt_boxes)
 
-            cls_target = torch.zeros((num_classes, grid_h, grid_w), device=device)
+            cls_center = torch.zeros((num_classes, grid_h, grid_w), device=device)
             if num_gt > 0:
                 gt_boxes = gt_boxes.to(device)
                 gt_labels = gt_labels.to(device)
@@ -605,7 +750,7 @@ class VisDroneDetector(BaseModel):
                 num_pos = len(valid_labels)
                 num_pos_total += num_pos
                 if num_pos > 0:
-                    cls_target[valid_labels, grid_y, grid_x] = 1.0
+                    cls_center[valid_labels, grid_y, grid_x] = 1.0
                     if img_offset.dim() == 4:
                         p_off = img_offset[valid_labels, :, grid_y, grid_x]
                     else:
@@ -640,31 +785,32 @@ class VisDroneDetector(BaseModel):
                             ref_to_gt = ref_to_gt + dists_c.min(dim=0).values.mean() * c_mask.sum()
                         total_ref_loss += gt_to_ref + 0.5 * ref_to_gt
 
-            focal_map = torchvision.ops.sigmoid_focal_loss(
-                img_cls,
-                cls_target,
-                alpha=0.25,
-                gamma=2.0,
-                reduction="none",
-            )
-            # Giảm phạt negative (Penalty-Reduced Focal Loss) ở vùng 3x3 sát cạnh tâm vật thể để không triệt tiêu đạo hàm của tâm
-            if num_gt > 0:
-                near_pos = F.max_pool2d(cls_target.unsqueeze(0), kernel_size=3, stride=1, padding=1).squeeze(0)
-                neg_weight = torch.where((near_pos > 0.5) & (cls_target < 0.5), 0.1, 1.0)
-                focal_map = focal_map * neg_weight
+            # Tạo Gaussian heatmap target cho phân loại (CenterNet-style)
+            padded = F.pad(cls_center.unsqueeze(0), (1, 1, 1, 1), mode='constant', value=0.0)
+            cls_target = torch.zeros_like(cls_center)
+            for dy in range(3):
+                for dx in range(3):
+                    cls_target = torch.maximum(cls_target, padded[0, :, dy:dy+grid_h, dx:dx+grid_w] * gaussian_k[dy, dx])
 
-            total_cls_loss += focal_map.sum()
+            # Gaussian Focal Loss: giảm phạt negative ở các pixel lân cận tâm, phạt mạnh true background
+            probs = img_cls.sigmoid().clamp(min=1e-6, max=1.0 - 1e-6)
+            pos_mask = cls_target >= 0.99
+            neg_mask = ~pos_mask
+
+            pos_loss = - ((1.0 - probs[pos_mask]) ** 2.0) * torch.log(probs[pos_mask])
+            neg_weight = ((1.0 - cls_target[neg_mask]) ** 4.0) * (probs[neg_mask] ** 2.0)
+            neg_loss = - neg_weight * torch.log(1.0 - probs[neg_mask])
+
+            total_cls_loss += pos_loss.sum() + neg_loss.sum()
 
             with torch.no_grad():
-                pos_mask = cls_target > 0.5
-                neg_mask = ~pos_mask
-                total_cls_pos += focal_map[pos_mask].sum()
-                total_cls_neg += focal_map[neg_mask].sum()
-                probs = img_cls.detach().sigmoid()
+                total_cls_pos += pos_loss.sum()
+                total_cls_neg += neg_loss.sum()
                 if pos_mask.any():
                     prob_pos_sum += probs[pos_mask].sum()
-                if neg_mask.any():
-                    prob_neg_max = torch.maximum(prob_neg_max, probs[neg_mask].max())
+                true_bg_mask = cls_target < 0.05
+                if true_bg_mask.any():
+                    prob_neg_max = torch.maximum(prob_neg_max, probs[true_bg_mask].max())
 
         # Chuẩn hóa theo tổng số mẫu dương (num_pos_total), không chia cho toàn bộ số pixel (B * C * H * W)
         norm_pos = max(num_pos_total, 1)
@@ -685,9 +831,13 @@ class VisDroneDetector(BaseModel):
         }
 
     def _post_process(self, cls_logits, pred_offsets, conf_threshold=0.10, nms_threshold=0.5, max_det=100):
-        """Lọc ngưỡng vector hóa, chỉ decode các candidate vượt ngưỡng và chạy NMS tối ưu tốc độ."""
+        """Lọc ngưỡng vector hóa với CenterNet Local Peak Max Pooling và Batched NMS tối ưu tốc độ."""
         batch_size, num_classes, grid_h, grid_w = cls_logits.shape
         cls_scores = cls_logits.sigmoid()
+        # 1. Local Peak Max Pooling (3x3): Giữ lại đỉnh cực đại cục bộ, loại bỏ ngay các pixel lân cận sườn đồi
+        hmax = F.max_pool2d(cls_scores, kernel_size=3, stride=1, padding=1)
+        cls_scores = cls_scores * (cls_scores == hmax).float()
+
         device = cls_logits.device
         results = []
 

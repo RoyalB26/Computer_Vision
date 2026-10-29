@@ -10,6 +10,7 @@ custom_imports:
   - "Visdrone.model"
   - "Visdrone.dataset"
   - "Visdrone.metrics"
+  - "Visdrone.tracker"
 
 # 1. Model Configuration: Modular VisDrone Detector with FPN
 model:
@@ -24,7 +25,7 @@ data:
   train:
     dataset:
       type: "CustomLMDBDataset"
-      data_root: "/content/visdron.lmdb"
+      data_root: "D:/apps/Datasets/VisDrone/VisDrone_data.lmdb"
       split: "train"
       split_ratio: 0.8
       seed: 42
@@ -39,7 +40,7 @@ data:
   val:
     dataset:
       type: "CustomLMDBDataset"
-      data_root: "/content/visdron.lmdb"
+      data_root: "D:/apps/Datasets/VisDrone/VisDrone_data.lmdb"
       split: "val"
       split_ratio: 0.8
       seed: 42
@@ -47,9 +48,9 @@ data:
         - type: "Resize"
           size: [640, 640]
         - type: "ToTensor"
-    batch_size: 32
+    batch_size: 8
     shuffle: false
-    num_workers: 4
+    num_workers: 1
 optimizer:
   type: "AdamW"
   lr: 0.001
@@ -71,15 +72,46 @@ hooks:
     filename: "training_metrics_visdrone.xlsx"       # File sẽ được lưu trong thư mục work_dir
     track_gradients: true                   # Bật tracking gradient chi tiết
     grad_interval: 1                        # Chu kỳ lấy mẫu gradient (mỗi 1 batch)
+    track_detection: true                   # Bật tracking tab Detection phân tích cls_logits & pred_offsets
+    detection_interval: 10                  # Chu kỳ lấy mẫu phân tích detection (mỗi 10 batch)
     submodules:
+      # 1. Trích xuất đặc trưng & Khởi tạo (Backbone, Projector, Stem)
       - "backbone"
-      - "downsample"
-      - "up_sample"
-      - "cross_attn"
-      - "deformable"
+      - "projector"
       - "conv2"
-      - "head.cls_head"
-      - "head.box_head"
+
+      # 2. PANet Không gian đa tỷ lệ (Multi-scale Spatial Highway)
+      - "downsample"
+      - "downsample.fuse1"                  # Tầng 80x80
+      - "downsample.fuse2"                  # Tầng 40x40
+      - "downsample.fuse3"                  # Tầng 20x20
+      - "up_sample"
+      - "up_sample.conv1"                   # Tái tạo 40x40
+      - "up_sample.conv2"                   # Tái tạo 80x80
+      - "up_sample.conv3"                   # Tái tạo 160x160
+
+      # 3. Cơ chế Slot Attention & Slot Cross-Attention
+      - "to_q"
+      - "to_k"
+      - "to_v"
+      - "fc1"
+      - "fc2"
+      - "cross_attn"
+      - "cross_attn.q_proj"
+      - "cross_attn.out_proj"
+
+      # 4. Deformable Attention & Bộ sinh tọa độ Reference Points
+      - "deformable"
+      - "deformable.ref_mlp"                 # MLP dự đoán tọa độ K điểm reference
+      - "deformable.to_q"                    # Slot Query projection
+      - "deformable.to_k"                    # Sampled Key projection
+      - "deformable.to_v"                    # Sampled Value projection
+
+      # 5. Detection Heads (Phân loại & Hồi quy Bounding Box)
+      - "head.cls_head"                     # Toàn bộ nhánh Class Head
+      - "head.cls_head.6"                   # Lớp Conv 1x1 dự đoán heatmap logits
+      - "head.box_head"                     # Toàn bộ nhánh Box Head
+      - "head.box_head.6"                   # Lớp Conv 1x1 dự đoán offsets [dx, dy, w, h]
 
 # 5. Training Engine Configuration
 train_cfg:
