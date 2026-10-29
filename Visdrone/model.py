@@ -793,12 +793,14 @@ class VisDroneDetector(BaseModel):
                     cls_target = torch.maximum(cls_target, padded[0, :, dy:dy+grid_h, dx:dx+grid_w] * gaussian_k[dy, dx])
 
             # Gaussian Focal Loss: giảm phạt negative ở các pixel lân cận tâm, phạt mạnh true background
+            # Áp dụng alpha = 0.25 chuẩn RetinaNet để cân bằng thang đo loss và gradient
+            alpha = 0.25
             probs = img_cls.sigmoid().clamp(min=1e-6, max=1.0 - 1e-6)
             pos_mask = cls_target >= 0.99
             neg_mask = ~pos_mask
 
-            pos_loss = - ((1.0 - probs[pos_mask]) ** 2.0) * torch.log(probs[pos_mask])
-            neg_weight = ((1.0 - cls_target[neg_mask]) ** 4.0) * (probs[neg_mask] ** 2.0)
+            pos_loss = - alpha * ((1.0 - probs[pos_mask]) ** 2.0) * torch.log(probs[pos_mask])
+            neg_weight = (1.0 - alpha) * ((1.0 - cls_target[neg_mask]) ** 4.0) * (probs[neg_mask] ** 2.0)
             neg_loss = - neg_weight * torch.log(1.0 - probs[neg_mask])
 
             total_cls_loss += pos_loss.sum() + neg_loss.sum()
