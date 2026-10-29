@@ -34,22 +34,34 @@ class BackBone(nn.Module):
         return feats['feat_1'], feats['feat_3'], feats['feat_5'], feats['feat_last']
 
 class UpSample(nn.Module):
-    def __init__(self, dim):
+    def __init__(self, dim: int, top_channels: int = 128):
         super().__init__()
-        self.conv1= nn.Conv2d(in_channels=616, out_channels=96, kernel_size= 1, padding= 0)
-        self.conv2= nn.Conv2d(in_channels=120, out_channels=48, kernel_size=1, padding= 0)
-        self.conv3= nn.Conv2d(in_channels=64, out_channels=dim,kernel_size= 1, padding= 0)
+        self.conv1 = nn.Sequential(
+            nn.Conv2d(in_channels=top_channels + 96, out_channels=96, kernel_size=1, padding=0, bias=False),
+            nn.BatchNorm2d(96),
+            nn.ReLU(inplace=True),
+        )
+        self.conv2 = nn.Sequential(
+            nn.Conv2d(in_channels=96 + 48, out_channels=48, kernel_size=1, padding=0, bias=False),
+            nn.BatchNorm2d(48),
+            nn.ReLU(inplace=True),
+        )
+        self.conv3 = nn.Sequential(
+            nn.Conv2d(in_channels=48 + 16, out_channels=dim, kernel_size=1, padding=0, bias=False),
+            nn.BatchNorm2d(dim),
+            nn.ReLU(inplace=True),
+        )
 
-    def forward(self, c1: Tensor,c3: Tensor,c5: Tensor,x: Tensor):
-        x= F.interpolate(x, scale_factor=2, mode='nearest') # [B, 576, 40, 40]
-        x= torch.cat([x, c5], dim = 1) #[B, 616, 40, 40]
-        x= self.conv1(x) #[B, 96, 40, 40]
-        x= F.interpolate(x, scale_factor=2, mode='nearest') # [B, 96, 80, 80]
-        x=torch.cat([x,c3], dim = 1) #[B, 120, 80, 80]
-        x= self.conv2(x) # [B, 48, 80, 80]
-        x= F.interpolate(x, scale_factor=2, mode='nearest') # [B, 48, 160, 160]
-        x=torch.cat([x,c1], dim = 1) #[B, 64, 160, 160]
-        x= self.conv3(x) #[B, dim, 160, 160]
+    def forward(self, c1: Tensor, p3: Tensor, p5: Tensor, x: Tensor) -> Tensor:
+        x = F.interpolate(x, scale_factor=2, mode='nearest')  # [B, top_channels, 40, 40]
+        x = torch.cat([x, p5], dim=1)                         # [B, top_channels + 96, 40, 40]
+        x = self.conv1(x)                                     # [B, 96, 40, 40]
+        x = F.interpolate(x, scale_factor=2, mode='nearest')  # [B, 96, 80, 80]
+        x = torch.cat([x, p3], dim=1)                         # [B, 144, 80, 80]
+        x = self.conv2(x)                                     # [B, 48, 80, 80]
+        x = F.interpolate(x, scale_factor=2, mode='nearest')  # [B, 48, 160, 160]
+        x = torch.cat([x, c1], dim=1)                         # [B, 64, 160, 160]
+        x = self.conv3(x)                                     # [B, dim, 160, 160]
         return x
 
 class DownBlock(nn.Module):
@@ -100,17 +112,17 @@ class DownSample(nn.Module):
         # x : [B, 576, 20, 20]
         # 1. 160x160 -> 80x80
         c1_down = self.down1(c1)                    # [B, 16, 80, 80]
-        c3 = torch.cat([c1_down, c3], dim=1)        # [B, 16 + 24 = 40, 80, 80]
-        c3 = self.fuse1(c3)                         # [B, 48, 80, 80]
+        p3 = torch.cat([c1_down, c3], dim=1)        # [B, 16 + 24 = 40, 80, 80]
+        p3 = self.fuse1(p3)                         # [B, 48, 80, 80]
         # 2. 80x80 -> 40x40
-        c3_down = self.down2(c3)                    # [B, 48, 40, 40]
-        c5 = torch.cat([c3_down, c5], dim=1)        # [B, 48 + 40 = 88, 40, 40]
-        c5 = self.fuse2(c5)                         # [B, 96, 40, 40]
+        c3_down = self.down2(p3)                    # [B, 48, 40, 40]
+        p5 = torch.cat([c3_down, c5], dim=1)        # [B, 48 + 40 = 88, 40, 40]
+        p5 = self.fuse2(p5)                         # [B, 96, 40, 40]
         # 3. 40x40 -> 20x20
-        c5_down = self.down3(c5)                    # [B, 96, 20, 20]
-        x = torch.cat([c5_down, x], dim=1)          # [B, 96 + 576 = 672, 20, 20]
-        x = self.fuse3(x)                           # [B, dim, 20, 20]
-        return x
+        c5_down = self.down3(p5)                    # [B, 96, 20, 20]
+        p12 = torch.cat([c5_down, x], dim=1)        # [B, 96 + 576 = 672, 20, 20]
+        p12 = self.fuse3(p12)                       # [B, dim, 20, 20]
+        return p3, p5, p12
 
 class Deformable(nn.Module):
     def __init__(self, dim, num_patches, num_reference_point:int= 4):
@@ -211,9 +223,12 @@ class Deformable(nn.Module):
             scattered_flat = scattered_flat.scatter_add(-1, idx, weighted_out)
 
         scattered_feat_map = scattered_flat.view(B, C, dim, H, W)
-        updated_feat_map = feat_map + scattered_feat_map
+        # Kết hợp đặc trưng cục bộ tại K điểm reference (scattered_feat_map) và ngữ cảnh toàn cục của K điểm (global_context)
+        global_context = out.mean(dim=2).unsqueeze(-1).unsqueeze(-1)  # [B, C, dim, 1, 1]
+        updated_feat_map = feat_map + scattered_feat_map + global_context
+        ref_points = torch.stack([reference_x, reference_y], dim=-1)  # [B, C, K, 2]
 
-        return updated_feat_map
+        return updated_feat_map, ref_points
 
 class ClassSpecificDetHead(nn.Module):
     def __init__(self, dim: int, num_classes: int = 10):
@@ -269,10 +284,13 @@ class ClassSpecificDetHead(nn.Module):
             nn.Sigmoid()  # dx, dy là offset trong ô [0, 1], w, h chuẩn hóa [0, 1]
         )
 
-        # Khởi tạo bias cho cls_head theo chuẩn Focal Loss (prior_prob = 0.01)
+        # Khởi tạo weight (std=0.01) và bias (prior_prob=0.01) cho cls_head & box_head theo chuẩn RetinaNet/CenterNet
         prior_prob = 0.01
         bias_value = -math.log((1.0 - prior_prob) / prior_prob)
+        nn.init.normal_(self.cls_head[-1].weight, mean=0.0, std=0.01)
         nn.init.constant_(self.cls_head[-1].bias, bias_value)
+        nn.init.normal_(self.box_head[-2].weight, mean=0.0, std=0.01)
+        nn.init.zeros_(self.box_head[-2].bias)
 
     def forward(self, feat_map: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         # feat_map: [B, C, dim, H, W]
@@ -394,11 +412,23 @@ class VisDroneDetector(BaseModel):
 
 
         self.conv = nn.Conv2d(self.total_head, 1, 1, 1, 0)
-        self.conv2 = nn.Conv2d(3, dim, 1, 1, 0)
+        self.conv2 = nn.Sequential(
+            # 1. Conv 3x3 (stride=2): Trích xuất cạnh/kết cấu từ ảnh RGB (640x640 -> 320x320)
+            nn.Conv2d(3, dim, kernel_size=3, stride=2, padding=1, bias=False),
+            nn.BatchNorm2d(dim),
+            nn.ReLU(inplace=True),
+            # 2. Depthwise Separable Conv 3x3: Mở rộng Receptive Field lên 7x7 pixels trên ảnh gốc
+            nn.Conv2d(dim, dim, kernel_size=3, stride=1, padding=1, groups=dim, bias=False),
+            nn.BatchNorm2d(dim),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(dim, dim, kernel_size=1, stride=1, padding=0, bias=False),
+            nn.BatchNorm2d(dim),
+            nn.ReLU(inplace=True),
+        )
 
         self.norm_out = nn.LayerNorm(dim)
         self.downsample = DownSample(total_head * dim)
-        self.up_sample = UpSample(dim)
+        self.up_sample = UpSample(dim, top_channels=total_head * dim)
         self.deformable = Deformable(dim, (images_size // 4) ** 2, num_ref)
         # Initialization
         nn.init.xavier_uniform_(self.mu)
@@ -406,7 +436,8 @@ class VisDroneDetector(BaseModel):
         torch.manual_seed(42)
 
         self.head = ClassSpecificDetHead(
-            dim= dim
+            dim=dim,
+            num_classes=num_classes,
         )
 
         self.cross_attn = SlotCrossAttention(dim=dim, num_heads=total_head)
@@ -458,14 +489,11 @@ class VisDroneDetector(BaseModel):
         pure_map = self.conv2(x)
         c1,c3,c5,c12= self.backbone(x)
 
-        B, C, H, W= c12.shape
-        D= self.total_head * self.dim
-        x= self.projector(c12) # [B, D, H, W]
-        x= self.downsample(c1,c3,c5,c12) + x
-        x= x.permute(0, 2, 3, 1) # [B, H, W, D]
-        x= x.reshape(B, H*W, D) # [B, N, D]
-
-        
+        B, C, H, W = c12.shape
+        D = self.total_head * self.dim
+        p3, p5, p12 = self.downsample(c1, c3, c5, c12)
+        x_top = p12 + self.projector(c12)  # [B, D, 20, 20]
+        x = x_top.permute(0, 2, 3, 1).reshape(B, H * W, D)  # [B, N, D]
 
         position: np.ndarray = self.positional_encoding(H, W, D) 
         position: Tensor = torch.from_numpy(position).to(x.dtype).to(x.device) # [N, D]
@@ -490,8 +518,8 @@ class VisDroneDetector(BaseModel):
         x_slots = self.fc2(F.relu(self.fc1(self.norm_out(x_slots))))
         slots = slots + x_slots
         slots = slots[:, :self.num_classes, :] # [B, num_classes, dim]
-        B,D,H,W = c12.shape
-        feat_map= self.up_sample(c1, c3, c5, c12) # [B, dim, H, W]
+        # Nối trực tiếp PANet Spatial Highway: truyền p3, p5, x_top từ DownSample vào UpSample
+        feat_map = self.up_sample(c1, p3, p5, x_top) # [B, dim, H, W]
 
         slots, feat_map, attn_weights = self.cross_attn(slots, feat_map)  # [B, C, dim, H, W]
         return slots, feat_map, attn_weights, pure_map
@@ -535,12 +563,13 @@ class VisDroneDetector(BaseModel):
         y2 = cy + h / 2.0
         return torch.stack([x1, y1, x2, y2], dim=-1)
 
-    def _compute_losses(self, cls_logits, pred_offsets, targets, device):
-        """Hàm dùng chung tính Focal Loss (cls), DIoU Loss (box từ offset) và các chỉ số tracking chẩn đoán."""
+    def _compute_losses(self, cls_logits, pred_offsets, targets, device, ref_points=None):
+        """Hàm dùng chung tính Focal Loss (cls), DIoU Loss (box), Reference Loss (deformable) và các chỉ số tracking."""
         batch_size, num_classes, grid_h, grid_w = cls_logits.shape
 
         total_cls_loss = torch.tensor(0.0, device=device)
         total_box_loss = torch.tensor(0.0, device=device)
+        total_ref_loss = torch.tensor(0.0, device=device)
         total_cls_pos = torch.tensor(0.0, device=device)
         total_cls_neg = torch.tensor(0.0, device=device)
         prob_pos_sum = torch.tensor(0.0, device=device)
@@ -570,6 +599,8 @@ class VisDroneDetector(BaseModel):
                 grid_x = grid_x[valid_mask]
                 grid_y = grid_y[valid_mask]
                 gt_boxes = gt_boxes[valid_mask]
+                valid_cx = gt_cx[valid_mask]
+                valid_cy = gt_cy[valid_mask]
 
                 num_pos = len(valid_labels)
                 num_pos_total += num_pos
@@ -592,6 +623,23 @@ class VisDroneDetector(BaseModel):
                     )
                     total_box_loss += box_loss
 
+                    # Tính Reference Point Loss (Chamfer L1) dẫn đường cho K điểm reference của từng class về đúng tâm vật thể
+                    if ref_points is not None:
+                        img_ref = ref_points[b]  # [C, K, 2]
+                        gt_centers = torch.stack([valid_cx, valid_cy], dim=-1)  # [num_pos, 2]
+                        pos_refs = img_ref[valid_labels]  # [num_pos, K, 2]
+                        # Khoảng cách L1 từ mỗi GT center đến K điểm reference của cùng class: [num_pos, K]
+                        dists = (pos_refs - gt_centers.unsqueeze(1)).abs().sum(dim=-1)
+                        # 1. Mỗi GT hút điểm reference gần nhất
+                        gt_to_ref = dists.min(dim=1).values.sum()
+                        # 2. Mỗi điểm reference của các class có mặt trong ảnh được hút về GT gần nhất của class đó
+                        ref_to_gt = torch.tensor(0.0, device=device)
+                        for c_id in torch.unique(valid_labels):
+                            c_mask = valid_labels == c_id
+                            dists_c = dists[c_mask]  # [M_c, K]
+                            ref_to_gt = ref_to_gt + dists_c.min(dim=0).values.mean() * c_mask.sum()
+                        total_ref_loss += gt_to_ref + 0.5 * ref_to_gt
+
             focal_map = torchvision.ops.sigmoid_focal_loss(
                 img_cls,
                 cls_target,
@@ -599,6 +647,12 @@ class VisDroneDetector(BaseModel):
                 gamma=2.0,
                 reduction="none",
             )
+            # Giảm phạt negative (Penalty-Reduced Focal Loss) ở vùng 3x3 sát cạnh tâm vật thể để không triệt tiêu đạo hàm của tâm
+            if num_gt > 0:
+                near_pos = F.max_pool2d(cls_target.unsqueeze(0), kernel_size=3, stride=1, padding=1).squeeze(0)
+                neg_weight = torch.where((near_pos > 0.5) & (cls_target < 0.5), 0.1, 1.0)
+                focal_map = focal_map * neg_weight
+
             total_cls_loss += focal_map.sum()
 
             with torch.no_grad():
@@ -616,12 +670,14 @@ class VisDroneDetector(BaseModel):
         norm_pos = max(num_pos_total, 1)
         total_cls_loss = total_cls_loss / norm_pos
         total_box_loss = (total_box_loss / norm_pos) if num_pos_total > 0 else (total_box_loss * 0.0)
-        total_loss = 2.0 * total_cls_loss + 1.0 * total_box_loss
+        total_ref_loss = (total_ref_loss / norm_pos) if num_pos_total > 0 else (total_ref_loss * 0.0)
+        total_loss = 2.0 * total_cls_loss + 1.0 * total_box_loss + 0.5 * total_ref_loss
 
         return {
             "loss": total_loss,
             "loss_cls": total_cls_loss,
             "loss_box": total_box_loss,
+            "loss_ref": total_ref_loss,
             "loss_cls_pos": (total_cls_pos / norm_pos).detach(),
             "loss_cls_neg": (total_cls_neg / norm_pos).detach(),
             "loss_prob_pos": (prob_pos_sum / norm_pos).detach(),
@@ -681,13 +737,13 @@ class VisDroneDetector(BaseModel):
 
     def forward_train(self, inputs: torch.Tensor, targets=None, **kwargs):
         slots, feat_map, attn, pure_map = self.extract_features(inputs)
-        feat_map = self.deformable(slots, pure_map, feat_map, attn)
+        feat_map, ref_points = self.deformable(slots, pure_map, feat_map, attn)
         cls_logits, pred_offsets = self.head(feat_map)
-        return self._compute_losses(cls_logits, pred_offsets, targets, device=inputs.device)
+        return self._compute_losses(cls_logits, pred_offsets, targets, device=inputs.device, ref_points=ref_points)
     
     def predict(self, inputs: torch.Tensor, conf_threshold=0.001, nms_threshold=0.5, **kwargs):
         slots, feat_map, attn, pure_map = self.extract_features(inputs)
-        feat_map = self.deformable(slots, pure_map, feat_map, attn)
+        feat_map, _ = self.deformable(slots, pure_map, feat_map, attn)
         cls_logits, pred_offsets = self.head(feat_map)
         return self._post_process(cls_logits, pred_offsets, conf_threshold=conf_threshold, nms_threshold=nms_threshold)
 
@@ -703,14 +759,14 @@ class VisDroneDetector(BaseModel):
         """Validation forward pass: Chỉ chạy mạng 1 LẦN duy nhất cho cả Loss và Predictions."""
         # 1. Chạy mạng 1 lần duy nhất
         slots, feat_map, attn, pure_map = self.extract_features(inputs)
-        feat_map = self.deformable(slots, pure_map, feat_map, attn)
+        feat_map, ref_points = self.deformable(slots, pure_map, feat_map, attn)
         cls_logits, pred_offsets = self.head(feat_map)
         # 2. Tính val loss nếu có targets
         output = {}
         if targets is not None:
             # Gọi trực tiếp hàm tính loss bằng chính logits vừa tính ra
             # (Đảm bảo không phải chạy lại extract_features)
-            loss_dict = self._compute_losses(cls_logits, pred_offsets, targets, device=inputs.device)
+            loss_dict = self._compute_losses(cls_logits, pred_offsets, targets, device=inputs.device, ref_points=ref_points)
             output.update(loss_dict)
         # 3. Decode predictions phục vụ tính mAP
         preds = self._post_process(
