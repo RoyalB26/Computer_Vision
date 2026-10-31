@@ -7,7 +7,6 @@ from typing import Any, Dict, List, Optional, Union
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
-
 from .hooks.base_hook import BaseHook
 from .hooks.checkpoint_hook import CheckpointHook
 from .hooks.logger_hook import LoggerHook

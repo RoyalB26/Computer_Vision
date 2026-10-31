@@ -4,7 +4,7 @@ from torch.utils.data import DataLoader, Dataset
 from ..core.registrar import COLLATE_FUNCTIONS, DATASETS
 from ..core.registry import build_from_cfg
 from .base_dataset import BaseDataset
-
+import torch
 
 def build_collate_fn(cfg: Union[str, Dict[str, Any], Callable]) -> Callable:
     """Build a collate function from name string, config dict, or return callable."""
