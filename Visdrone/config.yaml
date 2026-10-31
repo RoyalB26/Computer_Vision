@@ -33,7 +33,7 @@ data:
         - type: "Resize"
           size: [640, 640]
         - type: "ToTensor"
-    batch_size: 32
+    batch_size: 8
     shuffle: true
     num_workers: 4
 
@@ -48,7 +48,7 @@ data:
         - type: "Resize"
           size: [640, 640]
         - type: "ToTensor"
-    batch_size: 32
+    batch_size: 8
     shuffle: false
     num_workers: 1
 
