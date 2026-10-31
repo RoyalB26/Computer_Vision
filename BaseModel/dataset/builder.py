@@ -54,10 +54,17 @@ def build_dataloader(
     else:
         collate_fn = BaseDataset.collate_fn
 
+    sampler = kwargs.pop("sampler", None)
+    if sampler is None and torch.distributed.is_available() and torch.distributed.is_initialized():
+        from torch.utils.data.distributed import DistributedSampler
+        sampler = DistributedSampler(dataset, shuffle=shuffle, drop_last=drop_last)
+        shuffle = False  # Shuffle được xử lý bởi DistributedSampler
+
     return DataLoader(
         dataset=dataset,
         batch_size=batch_size,
         shuffle=shuffle,
+        sampler=sampler,
         num_workers=num_workers,
         pin_memory=pin_memory,
         drop_last=drop_last,

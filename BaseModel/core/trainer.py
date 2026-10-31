@@ -73,7 +73,10 @@ class BaseTrainer:
                     "  pip install accelerate"
                 )
             ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=True)
-            self.accelerator = Accelerator(kwargs_handlers=[ddp_kwargs])
+            self.accelerator = Accelerator(
+                split_batches=False,
+                kwargs_handlers=[ddp_kwargs],
+            )
             self.device = self.accelerator.device
             self.model, self.optimizer, self.train_loader = self.accelerator.prepare(
                 model, optimizer, train_loader
@@ -204,6 +207,12 @@ class BaseTrainer:
         """Loop over all batches in the training dataloader."""
         self.model.train()
 
+        # Đồng bộ epoch cho DistributedSampler trong Multi-GPU training
+        if hasattr(self.train_loader, "sampler") and hasattr(self.train_loader.sampler, "set_epoch"):
+            self.train_loader.sampler.set_epoch(self.epoch)
+        elif hasattr(self.train_loader, "batch_sampler") and hasattr(self.train_loader.batch_sampler, "sampler") and hasattr(self.train_loader.batch_sampler.sampler, "set_epoch"):
+            self.train_loader.batch_sampler.sampler.set_epoch(self.epoch)
+
         loader = self.train_loader
         if self.use_tqdm:
             from tqdm import tqdm
@@ -215,8 +224,7 @@ class BaseTrainer:
 
         for batch_idx, batch in enumerate(loader):
             self.iter += 1
-            if not self.use_accelerate:
-                batch = self.to_device(batch)
+            batch = self.to_device(batch)
             self.call_hook("before_train_iter", batch_idx=batch_idx, data_batch=batch)
 
             is_last_batch = (batch_idx + 1 == len(self.train_loader))
@@ -362,8 +370,7 @@ class BaseTrainer:
 
         with torch.no_grad():
             for batch_idx, batch in enumerate(loader):
-                if not self.use_accelerate:
-                    batch = self.to_device(batch)
+                batch = self.to_device(batch)
                 self.call_hook("before_val_iter", batch_idx=batch_idx, data_batch=batch)
 
                 outputs = self.val_step(batch, batch_idx)

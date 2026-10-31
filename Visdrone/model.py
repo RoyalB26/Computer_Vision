@@ -739,7 +739,15 @@ class VisDroneDetector(BaseModel):
                 if true_bg_mask.any():
                     prob_neg_max = torch.maximum(prob_neg_max, probs[true_bg_mask].max())
 
-        norm_pos = max(num_pos_total, 1)
+        # Đồng bộ số lượng positive targets qua các GPU trong Distributed / Accelerate Training
+        if torch.distributed.is_available() and torch.distributed.is_initialized():
+            num_pos_tensor = torch.tensor([num_pos_total], dtype=torch.float32, device=device)
+            torch.distributed.all_reduce(num_pos_tensor, op=torch.distributed.ReduceOp.SUM)
+            world_size = torch.distributed.get_world_size()
+            norm_pos = max(float(num_pos_tensor.item()) / float(world_size), 1.0)
+        else:
+            norm_pos = max(float(num_pos_total), 1.0)
+
         total_cls_loss = total_cls_loss / norm_pos
         total_map_loss = total_map_loss / norm_pos
         total_slot_attn_loss = total_slot_attn_loss / norm_pos
@@ -904,7 +912,7 @@ class VisDroneDetector(BaseModel):
         self,
         inputs: torch.Tensor,
         targets: Optional[List[Dict[str, torch.Tensor]]] = None,
-        conf_threshold: float = 0.05,
+        conf_threshold: float = 0.25,
         nms_threshold: float = 0.5,
         max_det: int = 300,
         **kwargs,
