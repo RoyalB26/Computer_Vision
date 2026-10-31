@@ -4,7 +4,6 @@ work_dir: "./work_dirs/visdrone_detection"
 device: "cuda"  
 seed: 42
 tqdm: true
-accumulate: 8
 
 custom_imports:
   - "Visdrone.model"
@@ -33,9 +32,9 @@ data:
         - type: "Resize"
           size: [640, 640]
         - type: "ToTensor"
-    batch_size: 4
+    batch_size: 16
     shuffle: true
-    num_workers: 4
+    num_workers: 8
 
   val:
     dataset:
@@ -48,9 +47,9 @@ data:
         - type: "Resize"
           size: [640, 640]
         - type: "ToTensor"
-    batch_size: 4
+    batch_size: 16
     shuffle: false
-    num_workers: 1
+    num_workers: 4
 
 optimizer:
   type: "AdamW"
