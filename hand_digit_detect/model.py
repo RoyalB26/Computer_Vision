@@ -372,7 +372,6 @@ class Hand_Digit_Detector(BaseModel):
 
         self.fc1 = nn.Linear(dim, dim)
         self.fc2 = nn.Linear(dim, dim)
-        self.norm = nn.LayerNorm(dim)
 
         self.FC1 = nn.Linear(dim, dim)
         self.FC2 = nn.Linear(dim, dim)
@@ -775,12 +774,17 @@ class Hand_Digit_Detector(BaseModel):
         if slots is not None:
             ortho_loss = self.slot_orthogonality_loss(slots)
 
+        # Đảm bảo 100% decoupled box prediction heads và slot_box_scale luôn kết nối vào computation graph
+        # giúp tránh lỗi unused parameter reduction timing mismatch khi chạy DDP / Accelerate
+        dummy_box_reg = 0.0 * (pred_boxes.sum() + self.head.slot_box_scale.sum())
+
         total_loss = (
             2.0 * total_cls_loss 
             + 1.0 * total_box_loss 
             + 0.5 * loss_deform
             + 0.1 * ortho_loss 
             + 0.1 * (total_map_loss + total_slot_attn_loss + total_slot_correlation_loss + total_bg_loss)
+            + dummy_box_reg
         )
 
         return {

@@ -66,13 +66,14 @@ class BaseTrainer:
 
         if self.use_accelerate:
             try:
-                from accelerate import Accelerator
+                from accelerate import Accelerator, DistributedDataParallelKwargs
             except ImportError:
                 raise ImportError(
                     "Accelerate is not installed. To use --accelerate, please install it via:\n"
                     "  pip install accelerate"
                 )
-            self.accelerator = Accelerator()
+            ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=True)
+            self.accelerator = Accelerator(kwargs_handlers=[ddp_kwargs])
             self.device = self.accelerator.device
             self.model, self.optimizer, self.train_loader = self.accelerator.prepare(
                 model, optimizer, train_loader

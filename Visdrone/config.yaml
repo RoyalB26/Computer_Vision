@@ -18,7 +18,7 @@ model:
   num_classes: 10
   dim: 32
   total_head: 4
-  images_size: 320
+  images_size: 640
   num_ref: 16
 # 2. Dataset Configuration
 data:
@@ -66,9 +66,9 @@ lr_scheduler:
 # 5. Metrics Configuration: mAP Evaluation (mAP_50, mAP_75, mAP_50:95)
 metrics:
   mAP:
-    type: "MeanAveragePrecision"
+    type: "VisDroneMAP"
     num_classes: 10
-    iou_thresholds: [0.5, 0.55, 0.6, 0.65, 0.7, 0.75, 0.8, 0.85, 0.9, 0.95]
+    box_format: "cxcywh"
 
 # 6. Comprehensive Tracking & Lifecycle Hooks
 hooks:
@@ -127,7 +127,7 @@ hooks:
 # 7. Training Engine Configuration
 train_cfg:
   max_epochs: 100
-  val_interval: 10                           # Đánh giá validation và tính mAP ở MỌI epoch để tracking liên tục
+  val_interval: 1                           # Đánh giá validation và tính mAP ở MỌI epoch để tracking liên tục
   log_interval: 2500                          # In log tiến trình 6 lần mỗi epoch (150 batches / 25)
   grad_clip: 1.0                            # Gradient clipping chuẩn 1.0 chống gradient explosion
   use_amp: false                            # Chạy FP32 chính xác cao
