@@ -280,7 +280,7 @@ class AnchorFreeDetHead(nn.Module):
     def __init__(self, in_channels: int, num_classes: int = 10):
         super().__init__()
         self.num_classes = num_classes
-        self.cls_conv = ConvModule(in_channels, in_channels, kernel_size=3)
+        self.cls_conv = ConvModule(in_channels, in_channels, kernel_size=1)
         self.cls_out = nn.Conv2d(in_channels, num_classes, kernel_size=1)
 
         self.box_conv = ConvModule(in_channels, in_channels, kernel_size=3)

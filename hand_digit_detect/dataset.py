@@ -6,7 +6,6 @@ from PIL import Image
 from BaseModel.core import DATASETS
 from BaseModel.dataset import BaseDataset, open_lmdb
 
-
 @DATASETS.register_module()
 class Hand_Digit_LMDBDataset(BaseDataset):
     def __init__(
@@ -34,7 +33,7 @@ class Hand_Digit_LMDBDataset(BaseDataset):
         # 1. Đọc tổng số mẫu trong file LMDB
         env, txn = open_lmdb(self.data_root, readonly=True)
         length_bytes = txn.get(b"num-samples")
-        total = 1000 #int(length_bytes.decode()) if length_bytes else txn.stat()["entries"] // 2
+        total = 3000 #int(length_bytes.decode()) if length_bytes else txn.stat()["entries"] // 2
 
         # 2. Tạo danh sách index và xáo trộn đồng nhất bằng seed
         indices = list(range(total))

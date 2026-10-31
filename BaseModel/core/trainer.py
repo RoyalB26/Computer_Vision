@@ -77,6 +77,7 @@ class BaseTrainer:
             self.model, self.optimizer, self.train_loader = self.accelerator.prepare(
                 model, optimizer, train_loader
             )
+
             self.val_loader = self.accelerator.prepare(val_loader) if val_loader is not None else None
             self.lr_scheduler = self.accelerator.prepare(lr_scheduler) if lr_scheduler is not None else None
 

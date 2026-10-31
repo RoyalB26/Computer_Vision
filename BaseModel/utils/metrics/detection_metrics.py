@@ -230,11 +230,11 @@ class MeanAveragePrecision(BaseMetric):
                 )
                 ap_table[th].append(ap)
 
-        # 3. Calculate mean APs across classes (in percentage 0-100%)
+        # 3. Calculate mean APs across classes (in 0-1)
         map_per_thresh: Dict[float, float] = {}
         for th in all_eval_thresholds:
             aps = ap_table[th]
-            map_per_thresh[th] = (float(np.mean(aps)) * 100.0) if len(aps) > 0 else 0.0
+            map_per_thresh[th] = (float(np.mean(aps))) if len(aps) > 0 else 0.0
 
         map_50 = map_per_thresh.get(0.50, 0.0)
         map_75 = map_per_thresh.get(0.75, 0.0)
