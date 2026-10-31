@@ -348,7 +348,7 @@ class DeformableSlotDetectionHead(nn.Module):
         return obj_logits, pred_boxes, sampling_info
 
 
-@MODELS.register_module(name="Hand_Digit_Detector")
+@MODELS.register_module(name="VisDroneDetector")
 class VisDroneDetector(BaseModel):
     """Detector for Hand Digit Object Detection predicting bounding boxes and class labels with FPN."""
     def __init__(
