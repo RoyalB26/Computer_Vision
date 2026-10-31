@@ -127,7 +127,7 @@ hooks:
 # 7. Training Engine Configuration
 train_cfg:
   max_epochs: 100
-  val_interval: 1                           # Đánh giá validation và tính mAP ở MỌI epoch để tracking liên tục
+  val_interval: 10                           # Đánh giá validation và tính mAP ở MỌI epoch để tracking liên tục
   log_interval: 2500                          # In log tiến trình 6 lần mỗi epoch (150 batches / 25)
   grad_clip: 1.0                            # Gradient clipping chuẩn 1.0 chống gradient explosion
   use_amp: false                            # Chạy FP32 chính xác cao
