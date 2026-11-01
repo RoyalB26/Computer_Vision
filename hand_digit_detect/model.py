@@ -68,21 +68,22 @@ class FeaturePyramidNetwork(nn.Module):
         self.lat_c1 = nn.Conv2d(in_channels['c1'], out_dim, kernel_size=1)
         self.lat_c0 = nn.Conv2d(in_channels['c0'], out_dim, kernel_size=1)
 
-        self.smooth_p5 = nn.Sequential(
-            nn.Conv2d(out_dim, out_dim, kernel_size=3, padding=1, bias=False),
-            nn.BatchNorm2d(out_dim),
-            nn.ReLU(inplace=True),
-        )
-        self.smooth_p2 = nn.Sequential(
-            nn.Conv2d(out_dim, out_dim, kernel_size=3, padding=1, bias=False),
-            nn.BatchNorm2d(out_dim),
-            nn.ReLU(inplace=True),
-        )
-        self.smooth_p1 = nn.Sequential(
-            nn.Conv2d(out_dim, out_dim, kernel_size=3, padding=1, bias=False),
-            nn.BatchNorm2d(out_dim),
-            nn.ReLU(inplace=True),
-        )
+        # Depthwise Separable Convolutions: Giảm ~86% FLOPs so với Standard Conv 3x3
+        def build_dw_separable_conv(dim: int) -> nn.Sequential:
+            return nn.Sequential(
+                # Depthwise Conv 3x3
+                nn.Conv2d(dim, dim, kernel_size=3, padding=1, groups=dim, bias=False),
+                nn.BatchNorm2d(dim),
+                nn.ReLU(inplace=True),
+                # Pointwise Conv 1x1
+                nn.Conv2d(dim, dim, kernel_size=1, bias=False),
+                nn.BatchNorm2d(dim),
+                nn.ReLU(inplace=True),
+            )
+
+        self.smooth_p5 = build_dw_separable_conv(out_dim)
+        self.smooth_p2 = build_dw_separable_conv(out_dim)
+        self.smooth_p1 = build_dw_separable_conv(out_dim)
 
     def forward(self, features: Dict[str, torch.Tensor]) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         c0 = features['c0']
@@ -494,6 +495,18 @@ class Hand_Digit_Detector(BaseModel):
             return loss.mean()
         return torch.tensor(0.0, device=slots.device)
 
+    def _get_crop_grid(self, H: int, W: int, device: torch.device) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Cache tọa độ lưới cho binary crop mask để tránh tạo meshgrid liên tục."""
+        if not hasattr(self, "_cached_crop_grids"):
+            self._cached_crop_grids = {}
+        key = (H, W, device)
+        if key not in self._cached_crop_grids:
+            y_coords = (torch.arange(H, device=device, dtype=torch.float32) + 0.5) / H
+            x_coords = (torch.arange(W, device=device, dtype=torch.float32) + 0.5) / W
+            grid_y, grid_x = torch.meshgrid(y_coords, x_coords, indexing="ij")
+            self._cached_crop_grids[key] = (grid_y.unsqueeze(0), grid_x.unsqueeze(0))
+        return self._cached_crop_grids[key]
+
     def create_crop_mask_single_image(
         self,
         image: torch.Tensor, 
@@ -519,11 +532,7 @@ class Hand_Digit_Detector(BaseModel):
         x2 = x2.view(N, 1, 1)
         y2 = y2.view(N, 1, 1)
 
-        y_coords = (torch.arange(H, device=device, dtype=torch.float32) + 0.5) / H
-        x_coords = (torch.arange(W, device=device, dtype=torch.float32) + 0.5) / W
-        grid_y, grid_x = torch.meshgrid(y_coords, x_coords, indexing="ij")
-        grid_y = grid_y.unsqueeze(0)
-        grid_x = grid_x.unsqueeze(0)
+        grid_y, grid_x = self._get_crop_grid(H, W, device)
 
         mask = (grid_x >= x1) & (grid_x < x2) & (grid_y >= y1) & (grid_y < y2)
         if combine:
@@ -594,31 +603,21 @@ class Hand_Digit_Detector(BaseModel):
         attn_map: Optional[torch.Tensor] = None,
         sampling_info: Optional[Dict[str, torch.Tensor]] = None,
     ) -> Dict[str, torch.Tensor]:
-        """Tính toán Gaussian Focal Loss (cls), DIoU Loss (box), Deformable Sampling Loss và Orthogonality Loss."""
+        """Tính toán Gaussian Focal Loss (cls), DIoU Loss (box), Deformable Sampling Loss và Orthogonality Loss (Vectorized)."""
         batch_size, num_classes, grid_h, grid_w = cls_logits.shape
 
-        total_cls_loss = torch.tensor(0.0, device=device)
         total_box_loss = torch.tensor(0.0, device=device)
         total_deform_in_box = torch.tensor(0.0, device=device)
-        total_cls_pos = torch.tensor(0.0, device=device)
-        total_cls_neg = torch.tensor(0.0, device=device)
-        prob_pos_sum = torch.tensor(0.0, device=device)
-        prob_neg_max = torch.tensor(0.0, device=device)
         total_map_loss = torch.tensor(0.0, device=device)
         total_slot_correlation_loss = torch.tensor(0.0, device=device)
         total_slot_attn_loss = torch.tensor(0.0, device=device)
         total_bg_loss = torch.tensor(0.0, device=device)
         num_pos_total = 0
 
-        # Gaussian smoothing kernel 3x3 (sigma = 1.0)
-        gaussian_k = torch.tensor([
-            [0.3679, 0.6065, 0.3679],
-            [0.6065, 1.0000, 0.6065],
-            [0.3679, 0.6065, 0.3679]
-        ], device=device, dtype=cls_logits.dtype)
+        # Khởi tạo center mask cho toàn bộ batch [B, num_classes, H, W]
+        cls_center = torch.zeros((batch_size, num_classes, grid_h, grid_w), device=device, dtype=cls_logits.dtype)
 
         for b in range(batch_size):
-            img_cls = cls_logits[b]      # [num_classes, grid_h, grid_w]
             img_box = pred_boxes[b]      # [num_classes, grid_h, grid_w, 4]
             target_dict = targets[b] if targets is not None and b < len(targets) else None
             gt_boxes = target_dict.get("boxes", torch.empty((0, 4), device=device)) if target_dict else torch.empty((0, 4), device=device)
@@ -636,7 +635,6 @@ class Hand_Digit_Detector(BaseModel):
                         total_slot_attn_loss += torch.sqrt((N - norm.sum())**2) / N
                         total_slot_correlation_loss += norm.numel()**2 * torch.var(norm, unbiased=False)
 
-            cls_center = torch.zeros((num_classes, grid_h, grid_w), device=device, dtype=cls_logits.dtype)
             if num_gt > 0:
                 gt_boxes = gt_boxes.to(device)
                 gt_labels = gt_labels.to(device)
@@ -674,7 +672,7 @@ class Hand_Digit_Detector(BaseModel):
                 num_pos = len(valid_labels)
                 num_pos_total += num_pos
                 if num_pos > 0:
-                    cls_center[valid_labels, grid_y, grid_x] = 1.0
+                    cls_center[b, valid_labels, grid_y, grid_x] = 1.0
 
                     p_box = img_box[valid_labels, grid_y, grid_x]  # [num_pos, 4] dạng [cx, cy, w, h]
                     p_xyxy = self._cxcywh_to_xyxy(p_box)
@@ -711,33 +709,41 @@ class Hand_Digit_Detector(BaseModel):
                         weighted_dist = (in_box_dist * pos_w).sum(dim=(-2, -1))  # [num_pos]
                         total_deform_in_box += weighted_dist.sum()
 
-            # Tạo Gaussian heatmap target cho phân loại (CenterNet-style)
-            padded = F.pad(cls_center.unsqueeze(0), (1, 1, 1, 1), mode='constant', value=0.0)
-            cls_target = torch.zeros_like(cls_center)
-            for dy in range(3):
-                for dx in range(3):
-                    cls_target = torch.maximum(cls_target, padded[0, :, dy:dy+grid_h, dx:dx+grid_w] * gaussian_k[dy, dx])
+        # ========================================================
+        # 1. VECTORIZED GAUSSIAN HEATMAP TARGET GENERATION
+        # ========================================================
+        gaussian_k = torch.tensor([
+            [0.3679, 0.6065, 0.3679],
+            [0.6065, 1.0000, 0.6065],
+            [0.3679, 0.6065, 0.3679]
+        ], device=device, dtype=cls_logits.dtype)
+        padded = F.pad(cls_center, (1, 1, 1, 1), mode="constant", value=0.0)
+        shifts = [
+            padded[:, :, dy:dy+grid_h, dx:dx+grid_w] * gaussian_k[dy, dx]
+            for dy in range(3) for dx in range(3)
+        ]
+        cls_target = torch.stack(shifts, dim=0).amax(dim=0)  # [B, num_classes, grid_h, grid_w]
 
-            # Gaussian Focal Loss: giảm phạt negative ở các pixel lân cận tâm, phạt mạnh true background
-            alpha = 0.25
-            probs = img_cls.sigmoid().clamp(min=1e-6, max=1.0 - 1e-6)
-            pos_mask = cls_target >= 0.99
-            neg_mask = ~pos_mask
+        # ========================================================
+        # 2. VECTORIZED DENSE GAUSSIAN FOCAL LOSS (NO DYNAMIC INDEXING)
+        # ========================================================
+        alpha = 0.25
+        probs = cls_logits.sigmoid().clamp(min=1e-6, max=1.0 - 1e-6)
+        pos_mask = (cls_target >= 0.99).float()
+        neg_mask = 1.0 - pos_mask
 
-            pos_loss = - alpha * ((1.0 - probs[pos_mask]) ** 2.0) * torch.log(probs[pos_mask])
-            neg_weight = (1.0 - alpha) * ((1.0 - cls_target[neg_mask]) ** 4.0) * (probs[neg_mask] ** 2.0)
-            neg_loss = - neg_weight * torch.log(1.0 - probs[neg_mask])
+        pos_loss = - alpha * ((1.0 - probs) ** 2.0) * torch.log(probs) * pos_mask
+        neg_weight = (1.0 - alpha) * ((1.0 - cls_target) ** 4.0) * (probs ** 2.0)
+        neg_loss = - neg_weight * torch.log(1.0 - probs) * neg_mask
 
-            total_cls_loss += pos_loss.sum() + neg_loss.sum()
+        total_cls_pos = pos_loss.sum()
+        total_cls_neg = neg_loss.sum()
+        total_cls_loss = total_cls_pos + total_cls_neg
 
-            with torch.no_grad():
-                total_cls_pos += pos_loss.sum()
-                total_cls_neg += neg_loss.sum()
-                if pos_mask.any():
-                    prob_pos_sum += probs[pos_mask].sum()
-                true_bg_mask = cls_target < 0.05
-                if true_bg_mask.any():
-                    prob_neg_max = torch.maximum(prob_neg_max, probs[true_bg_mask].max())
+        with torch.no_grad():
+            prob_pos_sum = (probs * pos_mask).sum()
+            true_bg_mask = cls_target < 0.05
+            prob_neg_max = probs[true_bg_mask].max() if true_bg_mask.any() else torch.tensor(0.0, device=device)
 
         # Đồng bộ số lượng positive targets qua các GPU trong Distributed / Accelerate Training
         if torch.distributed.is_available() and torch.distributed.is_initialized():
