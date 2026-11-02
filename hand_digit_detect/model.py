@@ -918,7 +918,7 @@ class Hand_Digit_Detector(BaseModel):
         self,
         inputs: torch.Tensor,
         targets: Optional[List[Dict[str, torch.Tensor]]] = None,
-        conf_threshold: float = 0.05,
+        conf_threshold: float = 0.25,
         nms_threshold: float = 0.5,
         max_det: int = 300,
         **kwargs,
