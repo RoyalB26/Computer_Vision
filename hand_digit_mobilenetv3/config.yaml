@@ -1,0 +1,115 @@
+# Configuration for MobileNetV3 Hand Digit Object Detection with DeformableHead (Focal Loss + DIoU Loss)
+
+work_dir: "./work_dirs/hand_digit_mobilenetv3"
+device: "cuda"  
+seed: 42
+tqdm: true
+
+custom_imports:
+  - "hand_digit_mobilenetv3"
+  - "hand_digit_mobilenetv3.dataset"
+  - "hand_digit_mobilenetv3.transform"
+  - "hand_digit_mobilenetv3.model"
+
+# 1. Model Configuration: Pure MobileNetV3 + FPN + DeformableHead
+model:
+  type: "HandDigitMobileNetV3Detector"
+  num_classes: 10
+  dim: 64
+  head_type: "MobileNetDetectionHead"   # Sử dụng DeformableHead
+  num_heads: 4                  # 4 attention heads
+  num_points: 4                 # 4 điểm deformable sampling xung quanh mỗi query
+
+# 2. Dataset Configuration (LMDB Dataset & Pipeline)
+data:
+  train:
+    dataset:
+      type: "Hand_Digit_LMDBDataset"
+      data_root: "D:/apps/Datasets/Hand_Digit/train_data.lmdb"
+      split: "train"
+      split_ratio: 0.8
+      num_classes: 10
+      task: "detection"
+      seed: 42
+      pipeline:
+        - type: "ToTensor"
+        - type: "NormalizeBoxes"
+    batch_size: 16
+    shuffle: true
+    num_workers: 3
+    collate_fn:
+      type: "DetectionCollate"
+
+  val:
+    dataset:
+      type: "Hand_Digit_LMDBDataset"
+      data_root: "D:/apps/Datasets/Hand_Digit/train_data.lmdb"
+      split: "val"
+      split_ratio: 0.8
+      num_classes: 10
+      task: "detection"
+      seed: 42
+      pipeline:
+        - type: "ToTensor"
+        - type: "NormalizeBoxes"
+    batch_size: 16
+    shuffle: false
+    num_workers: 0
+    collate_fn:
+      type: "DetectionCollate"
+
+# 3. Optimizer Configuration
+optimizer:
+  type: "AdamW"
+  lr: 0.001
+  weight_decay: 0.0001
+
+# 4. Learning Rate Scheduler Configuration
+lr_scheduler:
+  type: "CosineAnnealingLR"
+  T_max: 100
+  eta_min: 0.00001
+
+# 5. Metrics Configuration: mAP Evaluation (mAP_50, mAP_75, mAP_50:95)
+metrics:
+  mAP:
+    type: "MeanAveragePrecision"
+    num_classes: 10
+    iou_thresholds: [0.5, 0.55, 0.6, 0.65, 0.7, 0.75, 0.8, 0.85, 0.9, 0.95]
+
+# 6. Lifecycle Hooks & Tracking
+hooks:
+  - type: "ExcelTracker"
+    filename: "training_metrics.xlsx"
+    track_gradients: true
+    grad_interval: 1
+    track_detection: true
+    detection_interval: 5
+    auto_save: true
+    resume: true
+    submodules:
+      - "backbone"
+      - "neck"
+      - "head"
+      - "head.query_proj"
+      - "head.value_proj"
+      - "head.sampling_offsets"
+      - "head.attention_weights"
+      - "head.output_proj"
+      - "head.cls_head"
+      - "head.box_head"
+
+  - type: "CheckpointHook"
+    interval: 1
+    save_best: "mAP_50"
+    mode: "max"
+    max_keep_ckpts: 5
+    filename_tmpl: "epoch_{}.pth"
+
+# 7. Training Engine Configuration
+train_cfg:
+  max_epochs: 100
+  val_interval: 5
+  log_interval: 2500
+  grad_clip: 1.0
+  use_amp: false

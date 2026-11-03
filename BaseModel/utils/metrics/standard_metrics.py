@@ -30,6 +30,10 @@ class Accuracy(BaseMetric):
         preds = preds.detach().cpu()
         targets = targets.detach().cpu()
 
+        # If targets are one-hot encoded (same 2D shape as preds), convert to class indices
+        if targets.ndim == 2 and preds.ndim == 2 and targets.shape == preds.shape:
+            targets = targets.argmax(dim=-1)
+
         max_k = max(self.topk)
         batch_size = targets.size(0)
 
