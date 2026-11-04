@@ -36,8 +36,16 @@ data:
       seed: 42
       pipeline:
         - type: "Resize"
-          size: [960,960]
+          size: [960, 960]
+        - type: "CLAHE"
+          clip_limit: 2.0
+          tile_grid_size: [8, 8]
+          p: 1.0
         - type: "ToTensor"
+        - type: "StaticSquaredDeviationNorm"
+          per_channel: true
+          factor: 5.0
+          p: 0.5
     batch_size: 16
     shuffle: true
     num_workers: 8
@@ -53,9 +61,13 @@ data:
       seed: 42
       pipeline:
         - type: "Resize"
-          size: [960,960]
+          size: [960, 960]
+        - type: "CLAHE"
+          clip_limit: 2.0
+          tile_grid_size: [8, 8]
+          p: 1.0
         - type: "ToTensor"
-    batch_size: 16
+    batch_size: 1
     shuffle: false
     num_workers: 4
 

@@ -120,3 +120,68 @@ class NormalizeBoxes:
         if "target" in data and "boxes" in data['target']:
             data["target"]['boxes'] /= image_size
         return data
+
+
+
+@TRANSFORMS.register_module(name="StaticSquaredDeviationNorm", force=True)
+class StaticSquaredDeviationNorm:
+    """Norm thuần túy (không học):
+    Tính trực tiếp trên từng sample độc lập, áp dụng biến đổi:
+        out = exp(factor * |x - mean(x)|)
+
+    Hỗ trợ xử lý trực tiếp trên PIL Image, numpy array hoặc torch.Tensor trong pipeline transform.
+
+    Args:
+        per_channel (bool):
+            - False: tính mean trên toàn bộ ảnh (C, H, W).
+            - True: tính mean riêng cho từng channel (H, W).
+        factor (float): Hệ số nhân trong số mũ exp (mặc định: 5.0).
+        p (float): Xác suất áp dụng transform (0.0 đến 1.0, ví dụ 0.5 cho 50% dataset).
+    """
+
+    def __init__(self, per_channel: bool = True, factor: float = 5.0, p: float = 0.5):
+        self.per_channel = per_channel
+        self.factor = float(factor)
+        self.p = float(p)
+
+    def _apply_tensor(self, x: torch.Tensor) -> torch.Tensor:
+        if self.per_channel:
+            # x shape: [C, H, W] -> mean trên (H, W) giữ nguyên C
+            mean = x.mean(dim=(-2, -1), keepdim=True)
+        else:
+            mean = x.mean()
+        return torch.exp(self.factor * torch.abs(x - mean))
+
+    def __call__(self, data: Dict[str, Any]) -> Dict[str, Any]:
+        if "image" not in data or self.p <= 0.0:
+            return data
+
+        if self.p < 1.0 and random.random() > self.p:
+            return data
+
+        img = data["image"]
+
+        if isinstance(img, torch.Tensor):
+            data["image"] = self._apply_tensor(img)
+        elif isinstance(img, Image.Image):
+            arr = np.array(img, dtype=np.float32) / 255.0  # [H, W, C]
+            tensor = torch.from_numpy(arr).permute(2, 0, 1) # [C, H, W]
+            out = self._apply_tensor(tensor)
+            # Chuẩn hóa về [0, 255] uint8 nếu giữ định dạng PIL
+            out_np = (out.permute(1, 2, 0).numpy() * 255.0).clip(0, 255).astype(np.uint8)
+            data["image"] = Image.fromarray(out_np)
+        elif isinstance(img, np.ndarray):
+            is_float = img.dtype in [np.float32, np.float64]
+            arr = img.astype(np.float32) if is_float else img.astype(np.float32) / 255.0
+            if arr.ndim == 3:
+                tensor = torch.from_numpy(arr).permute(2, 0, 1)
+                out = self._apply_tensor(tensor).permute(1, 2, 0).numpy()
+            else:
+                tensor = torch.from_numpy(arr)
+                out = self._apply_tensor(tensor).numpy()
+            data["image"] = out if is_float else (out * 255.0).clip(0, 255).astype(np.uint8)
+
+        return data
+
+    def __repr__(self) -> str:
+        return f"{self.__class__.__name__}(per_channel={self.per_channel}, factor={self.factor}, p={self.p})"

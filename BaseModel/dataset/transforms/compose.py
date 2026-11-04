@@ -202,3 +202,57 @@ class CLAHE:
 
     def __repr__(self) -> str:
         return f"{self.__class__.__name__}(clip_limit={self.clip_limit}, tile_grid_size={self.tile_grid_size}, p={self.p})"
+
+
+
+@TRANSFORMS.register_module(name="StaticSquaredDeviationNorm", force=True)
+class StaticSquaredDeviationNorm:
+    """Norm transform applying out = exp(factor * |x - mean(x)|) with probability p."""
+
+    def __init__(self, per_channel: bool = True, factor: float = 5.0, p: float = 0.5):
+        self.per_channel = per_channel
+        self.factor = float(factor)
+        self.p = float(p)
+
+    def _apply_tensor(self, x: torch.Tensor) -> torch.Tensor:
+        if self.per_channel:
+            mean = x.mean(dim=(-2, -1), keepdim=True)
+        else:
+            mean = x.mean()
+        return torch.exp(self.factor * torch.abs(x - mean))
+
+    def __call__(self, data: Dict[str, Any]) -> Dict[str, Any]:
+        import random
+        from PIL import Image
+
+        if "image" not in data or self.p <= 0.0:
+            return data
+
+        if self.p < 1.0 and random.random() > self.p:
+            return data
+
+        img = data["image"]
+
+        if isinstance(img, torch.Tensor):
+            data["image"] = self._apply_tensor(img)
+        elif isinstance(img, Image.Image):
+            arr = np.array(img, dtype=np.float32) / 255.0
+            tensor = torch.from_numpy(arr).permute(2, 0, 1)
+            out = self._apply_tensor(tensor)
+            out_np = (out.permute(1, 2, 0).numpy() * 255.0).clip(0, 255).astype(np.uint8)
+            data["image"] = Image.fromarray(out_np)
+        elif isinstance(img, np.ndarray):
+            is_float = img.dtype in [np.float32, np.float64]
+            arr = img.astype(np.float32) if is_float else img.astype(np.float32) / 255.0
+            if arr.ndim == 3:
+                tensor = torch.from_numpy(arr).permute(2, 0, 1)
+                out = self._apply_tensor(tensor).permute(1, 2, 0).numpy()
+            else:
+                tensor = torch.from_numpy(arr)
+                out = self._apply_tensor(tensor).numpy()
+            data["image"] = out if is_float else (out * 255.0).clip(0, 255).astype(np.uint8)
+
+        return data
+
+    def __repr__(self) -> str:
+        return f"{self.__class__.__name__}(per_channel={self.per_channel}, factor={self.factor}, p={self.p})"
