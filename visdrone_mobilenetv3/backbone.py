@@ -416,3 +416,68 @@ class YOLOv11SmallBackbone(nn.Module):
             elif idx == 10:
                 feats["c12"] = x  # Stride 32 [B, 512, H/32, W/32]
         return feats
+
+
+
+@BACKBONES.register_module(name=["YOLOv11NanoBackbone", "YOLO11NanoBackbone", "YOLOv11nBackbone"], force=True)
+class YOLOv11NanoBackbone(nn.Module):
+    """
+    YOLOv11-Nano (YOLO11n) Feature Extractor:
+      - c0:  stride 2  (16 channels)  - High-resolution spatial features
+      - c1:  stride 4  (32 channels)  - Fine-grained object boundaries
+      - c3:  stride 8  (64 channels)  - Primary detection feature level (P3)
+      - c5:  stride 16 (128 channels) - Medium object feature level (P4)
+      - c12: stride 32 (256 channels) - Semantic context feature level (P5 / SPPF / C2PSA)
+    """
+
+    def __init__(
+        self,
+        pretrained: Union[bool, str] = True,
+        weights_path: Optional[str] = "yolo11n.pt",
+    ):
+        super().__init__()
+        from ultralytics import YOLO
+
+        yolo_model = YOLO(weights_path if (pretrained and weights_path) else "yolo11n.pt")
+        self.stages = nn.ModuleList(list(yolo_model.model.model[:11]))
+
+        # Mở khóa toàn bộ tham số để cho phép huấn luyện (trainable)
+        for param in self.stages.parameters():
+            param.requires_grad = True
+
+        if not pretrained:
+            self._init_weights()
+
+        self.out_channels: Dict[str, int] = {
+            "c0": 16,   # Stage 0: Conv stride 2 (16 ch)
+            "c1": 32,   # Stage 1: Conv stride 2 (32 ch)
+            "c3": 64,   # Stage 3: Conv stride 2 (64 ch)
+            "c5": 128,  # Stage 5: Conv stride 2 (128 ch)
+            "c12": 256, # Stage 10: C2PSA stride 2 (256 ch)
+        }
+
+    def _init_weights(self):
+        for m in self.modules():
+            if isinstance(m, nn.Conv2d):
+                nn.init.kaiming_normal_(m.weight, mode="fan_out", nonlinearity="relu")
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
+            elif isinstance(m, (nn.BatchNorm2d, nn.GroupNorm)):
+                nn.init.ones_(m.weight)
+                nn.init.zeros_(m.bias)
+
+    def forward(self, x: torch.Tensor) -> Dict[str, torch.Tensor]:
+        feats: Dict[str, torch.Tensor] = {}
+        for idx, stage in enumerate(self.stages):
+            x = stage(x)
+            if idx == 0:
+                feats["c0"] = x   # Stride 2  [B, 16, H/2, W/2]
+            elif idx == 1:
+                feats["c1"] = x   # Stride 4  [B, 32, H/4, W/4]
+            elif idx == 3:
+                feats["c3"] = x   # Stride 8  [B, 64, H/8, W/8]
+            elif idx == 5:
+                feats["c5"] = x   # Stride 16 [B, 128, H/16, W/16]
+            elif idx == 10:
+                feats["c12"] = x  # Stride 32 [B, 256, H/32, W/32]
+        return feats

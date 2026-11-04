@@ -18,10 +18,10 @@ model:
   num_classes: 10
   dim: 32
   head_type: "DeformableHead"   # Sử dụng DeformableHead
-  backbone: "YOLOv11SmallBackbone"
+  backbone: "YOLOv11NanoBackbone"
   neck: "PANet"
   num_heads: 4                  # 4 attention heads
-  num_points: 64                 # 4 điểm deformable sampling xung quanh mỗi query
+  num_points: 64                 # 64 điểm deformable sampling xung quanh mỗi query
 
 # 2. Dataset Configuration (LMDB Dataset & Pipeline)
 data:
