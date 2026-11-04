@@ -80,7 +80,7 @@ class MobileNetFPN(nn.Module):
         return map_pred
 
 
-@NECKS.register_module(name=["VPANet"])
+@NECKS.register_module(name=["PANet"])
 class MobileNetPANet(nn.Module):
     """
     Path Aggregation Network (PANet) cho MobileNetV3 / NormalBackbone:

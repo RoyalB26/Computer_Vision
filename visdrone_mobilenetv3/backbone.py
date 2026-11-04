@@ -9,7 +9,7 @@ from torchvision.models.feature_extraction import create_feature_extractor
 from BaseModel.core.registrar import BACKBONES
 
 
-@BACKBONES.register_module(name="VMobileNetV3Backbone")
+@BACKBONES.register_module(name="MobileNetV3Backbone")
 class MobileNetV3Backbone(nn.Module):
     """
     MobileNetV3-Small Feature Extractor:

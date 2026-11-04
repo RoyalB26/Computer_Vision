@@ -8,7 +8,7 @@ from torch import Tensor
 from BaseModel.core.registrar import HEADS
 
 
-@HEADS.register_module(name="VMobileNetDetectionHead")
+@HEADS.register_module(name="MobileNetDetectionHead")
 class MobileNetDetectionHead(nn.Module):
     """
     Standard Anchor-Free / CenterNet Detection Head:
@@ -134,7 +134,7 @@ def build_2d_sincos_position_embedding(H: int, W: int, embed_dim: int, device=No
     return pos_emb
 
 
-@HEADS.register_module(name="VDeformableDetectionHead")
+@HEADS.register_module(name="DeformableDetectionHead")
 class DeformableHead(nn.Module):
     """
     Deformable Detection Head cho MobileNetV3:

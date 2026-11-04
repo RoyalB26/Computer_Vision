@@ -9,17 +9,17 @@ custom_imports:
   - "visdrone_mobilenetv3"
   - "visdrone_mobilenetv3.model"
   - "visdrone_mobilenetv3.metrics"
-  - "hand_digit_mobilenetv3.dataset"
-  - "hand_digit_mobilenetv3.transform"
+  - "visdrone_mobilenetv3.dataset"
+  - "visdrone_mobilenetv3.transform"
 
 # 1. Model Configuration: Pure MobileNetV3 + FPN + DeformableHead
 model:
   type: "VisdroneDetector"
   num_classes: 10
   dim: 32
-  head_type: "VDeformableDetectionHead"   # Sử dụng DeformableHead
-  backbone: "VMobileNetV3Backbone"
-  neck: "VPANet"
+  head_type: "DeformableHead"   # Sử dụng DeformableHead
+  backbone: "MobileNetV3Backbone"
+  neck: "PANet"
   num_heads: 4                  # 4 attention heads
   num_points: 32                 # 4 điểm deformable sampling xung quanh mỗi query
 
@@ -36,13 +36,11 @@ data:
       seed: 42
       pipeline:
         - type: "Resize"
-          size: [960, 960]
+          size: [960,960]
         - type: "ToTensor"
     batch_size: 16
     shuffle: true
-    num_workers: 3
-    collate_fn:
-      type: "DetectionCollate"
+    num_workers: 8
 
   val:
     dataset:
@@ -55,13 +53,11 @@ data:
       seed: 42
       pipeline:
         - type: "Resize"
-          size: [960, 960]
+          size: [960,960]
         - type: "ToTensor"
     batch_size: 16
     shuffle: false
-    num_workers: 0
-    collate_fn:
-      type: "DetectionCollate"
+    num_workers: 4
 
 # 3. Optimizer Configuration
 optimizer:
@@ -116,7 +112,7 @@ hooks:
 # 7. Training Engine Configuration
 train_cfg:
   max_epochs: 100
-  val_interval: 1
+  val_interval: 5
   log_interval: 2500
   grad_clip: 1.0
   use_amp: false
