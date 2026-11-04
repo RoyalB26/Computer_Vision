@@ -4,7 +4,7 @@ import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-
+from torch import Tensor
 from BaseModel.core.registrar import HEADS
 
 
@@ -41,6 +41,13 @@ class MobileNetDetectionHead(nn.Module):
             nn.Conv2d(head_conv, 4, kernel_size=1),
         )
 
+        self.obj_head = nn.Sequential(
+            nn.Conv2d(dim, head_conv, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(head_conv),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(head_conv, 1, kernel_size=1),
+        )
+
         self._reset_parameters()
 
     def _reset_parameters(self):
@@ -53,6 +60,10 @@ class MobileNetDetectionHead(nn.Module):
         nn.init.kaiming_uniform_(self.cls_head[0].weight, a=1)
         nn.init.constant_(self.cls_head[-1].weight, 0.0)
         nn.init.constant_(self.cls_head[-1].bias, cls_bias_val)
+
+        nn.init.kaiming_uniform_(self.obj_head[0].weight, a=1)
+        nn.init.constant_(self.obj_head[-1].weight, 0.0)
+        nn.init.constant_(self.obj_head[-1].bias, cls_bias_val)
 
     def _get_reference_grid(
         self, H: int, W: int, device: torch.device, dtype: torch.dtype
@@ -75,10 +86,12 @@ class MobileNetDetectionHead(nn.Module):
 
     def forward(
         self, feat_map: torch.Tensor, feat_deform: Optional[torch.Tensor] = None
-    ) -> Tuple[torch.Tensor, torch.Tensor, Optional[Dict[str, torch.Tensor]]]:
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, Optional[Dict[str, torch.Tensor]]]:
         B, _, H, W = feat_map.shape
+
         cls_logits = self.cls_head(feat_map)
         box_deltas = self.box_head(feat_map)
+        obj_logits = self.obj_head(feat_map)
 
         _, anchor_logits = self._get_reference_grid(H, W, device=feat_map.device, dtype=feat_map.dtype)
         anchor_logits = anchor_logits.expand(B, -1, -1, -1)
@@ -88,7 +101,37 @@ class MobileNetDetectionHead(nn.Module):
         wh = (0.12 * scale_factor).clamp(min=1e-3, max=1.0)
 
         pred_boxes = torch.cat([cxcy, wh], dim=1)
-        return cls_logits, pred_boxes, None
+        return cls_logits, pred_boxes, obj_logits, None
+
+def build_2d_sincos_position_embedding(H: int, W: int, embed_dim: int, device=None, dtype=torch.float32) -> Tensor:
+    """
+    Tạo 2D Sin-Cos Positional Encoding hoàn toàn bằng PyTorch trên device thích hợp.
+    Output shape: [1, embed_dim, H, W]
+    """
+    assert embed_dim % 4 == 0, f"embed_dim ({embed_dim}) phải chia hết cho 4."
+    dim_per_axis = embed_dim // 2
+    # Tọa độ lưới
+    grid_y, grid_x = torch.meshgrid(
+        torch.arange(H, device=device, dtype=dtype),
+        torch.arange(W, device=device, dtype=dtype),
+        indexing='ij'
+    )
+    grid_x = grid_x.reshape(-1)  # [H * W]
+    grid_y = grid_y.reshape(-1)  # [H * W]
+
+    def get_1d_sincos(grid: Tensor, dim: int) -> Tensor:
+        omega = torch.arange(dim // 2, device=device, dtype=dtype)
+        omega /= (dim / 2.0)
+        omega = 1.0 / (10000.0 ** omega)  # [dim // 2]
+        out = torch.einsum('n, d -> nd', grid, omega)  # [H * W, dim // 2]
+        return torch.cat([torch.sin(out), torch.cos(out)], dim=-1)  # [H * W, dim]
+
+    emb_x = get_1d_sincos(grid_x, dim_per_axis)  # [H * W, dim_per_axis]
+    emb_y = get_1d_sincos(grid_y, dim_per_axis)  # [H * W, dim_per_axis]
+    pos_emb = torch.cat([emb_x, emb_y], dim=-1)  # [H * W, embed_dim]
+    # Đổi về format chuẩn ảnh: [1, embed_dim, H, W]
+    pos_emb = pos_emb.view(H, W, embed_dim).permute(2, 0, 1).unsqueeze(0)
+    return pos_emb
 
 
 @HEADS.register_module(name="DeformableHead")
@@ -118,70 +161,86 @@ class DeformableHead(nn.Module):
         self.num_points = num_points
         self.head_dim = dim // num_heads
 
-        # 1. Spatial Query Projection
-        self.query_proj = nn.Sequential(
-            nn.Conv2d(dim, dim, kernel_size=1, bias=False),
-            nn.BatchNorm2d(dim),
-            nn.ReLU(inplace=True),
-        )
+        self.to_q= nn.Linear(dim, dim)
+        self.to_k= nn.Linear(dim, dim)
+        self.to_v= nn.Linear(dim, dim)
+        self.scale= 1 / math.sqrt(dim)
 
+        self.to_q2= nn.Linear(dim, dim)
+        self.to_k2= nn.Linear(dim, dim)
+        self.to_v2= nn.Linear(dim, dim)
+        self.scale2= 1 / math.sqrt(dim)
+
+        self.query_proj = nn.Sequential(
+            nn.Linear(dim, dim),
+            nn.ReLU(),
+            nn.Linear(dim, 2)
+        )
         # 2. Deformable Attention Engine
         self.value_proj = nn.Linear(dim, dim)
-        self.sampling_offsets = nn.Linear(dim, num_heads * num_points * 2)
+        self.sampling_offsets = nn.Sequential(
+            nn.Linear(dim, dim),
+            nn.ReLU(),
+            nn.Linear(dim, num_points * 2)
+        )
         self.attention_weights = nn.Linear(dim, num_heads * num_points)
         self.output_proj = nn.Linear(dim, dim)
 
         # 3. Prediction Heads
         self.cls_head = nn.Sequential(
-            nn.Conv2d(dim, dim, kernel_size=3, padding=1, bias=False),
-            nn.BatchNorm2d(dim),
+            nn.Conv2d(dim, dim, kernel_size=1, padding=0, bias=False),
             nn.ReLU(inplace=True),
             nn.Conv2d(dim, num_classes, kernel_size=1),
         )
 
         self.box_head = nn.Sequential(
-            nn.Conv2d(dim, dim, kernel_size=3, padding=1, bias=False),
-            nn.BatchNorm2d(dim),
+            nn.Conv2d(dim, dim, kernel_size=1, padding=0, bias=False),
             nn.ReLU(inplace=True),
             nn.Conv2d(dim, 4, kernel_size=1),
+        )
+
+        self.obj_head = nn.Sequential(
+            nn.Conv2d(dim, dim, kernel_size=1, padding=0, bias=False),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(dim, 1, kernel_size=1),
         )
 
         self._reset_parameters()
 
     def _reset_parameters(self):
-        # 1. Sampling Offsets tỏa đều các hướng
-        nn.init.constant_(self.sampling_offsets.weight, 0.0)
-        thetas = torch.arange(self.num_heads, dtype=torch.float32) * (2.0 * math.pi / self.num_heads)
-        grid_init = torch.stack([thetas.cos(), thetas.sin()], -1)
-        grid_init = (
-            (grid_init / grid_init.abs().max(-1, keepdim=True)[0])
-            .view(self.num_heads, 1, 1, 2)
-            .repeat(1, 1, self.num_points, 1)
-        )
-        for i in range(self.num_points):
-            grid_init[:, :, i, :] *= (i + 1)
-        with torch.no_grad():
-            self.sampling_offsets.bias.copy_(grid_init.view(-1))
-
-        # 2. Attention Weights & Linear Projections
-        nn.init.constant_(self.attention_weights.weight, 0.0)
-        nn.init.constant_(self.attention_weights.bias, 0.0)
-        nn.init.xavier_uniform_(self.value_proj.weight)
-        nn.init.constant_(self.value_proj.bias, 0.0)
-        nn.init.xavier_uniform_(self.output_proj.weight)
-        nn.init.constant_(self.output_proj.bias, 0.0)
-
-        # 3. Box Head Init
         nn.init.kaiming_uniform_(self.box_head[0].weight, a=1)
         nn.init.normal_(self.box_head[-1].weight, std=1e-3)
         nn.init.constant_(self.box_head[-1].bias, 0.0)
 
-        # 4. Cls Head Init (Focal Prior p=0.01)
         prior_prob = 0.01
         cls_bias_val = -math.log((1.0 - prior_prob) / prior_prob)
         nn.init.kaiming_uniform_(self.cls_head[0].weight, a=1)
         nn.init.constant_(self.cls_head[-1].weight, 0.0)
         nn.init.constant_(self.cls_head[-1].bias, cls_bias_val)
+
+        nn.init.kaiming_uniform_(self.obj_head[0].weight, a=1)
+        nn.init.constant_(self.obj_head[-1].weight, 0.0)
+        nn.init.constant_(self.obj_head[-1].bias, cls_bias_val)
+
+        # Trong _reset_parameters() của DeformableHead:
+        offset_layer = self.sampling_offsets[-1] if isinstance(self.sampling_offsets, nn.Sequential) else self.sampling_offsets
+        nn.init.constant_(offset_layer.weight, 0.0)
+        num_rings = 4  # Số vòng tròn đồng tâm
+        pts_per_ring = self.num_points // num_rings
+        thetas = torch.arange(pts_per_ring, dtype=torch.float32) * (2.0 * math.pi / pts_per_ring)
+        ring_pts = torch.stack([thetas.cos(), thetas.sin()], -1)  # [pts_per_ring, 2]
+        # Bán kính tăng dần theo cấp số cộng hoặc luỹ thừa 2
+        radii = torch.tensor([1.0, 2.5, 5.0, 10.0], dtype=torch.float32)  # hoặc torch.linspace(1.0, 8.0, num_rings)
+        grid_init = []
+        for r in radii:
+            grid_init.append(ring_pts * r)
+        grid_init = torch.cat(grid_init, dim=0)  # [num_points, 2]
+        with torch.no_grad():
+            offset_layer.bias.copy_(grid_init.view(-1))
+
+        query_layer = self.query_proj[-1] if isinstance(self.query_proj, nn.Sequential) else self.query_proj
+        nn.init.constant_(query_layer.weight, 0.0)
+        nn.init.constant_(query_layer.bias, 0.0)
 
     def _get_reference_grid(
         self, H: int, W: int, device: torch.device, dtype: torch.dtype
@@ -203,6 +262,16 @@ class DeformableHead(nn.Module):
             self._grid_cache_key = cache_key
         return self._cached_grid, self._cached_grid_logits
 
+    def _get_pos_embed(self, H: int, W: int, embed_dim: int, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
+        cache_key = (H, W, embed_dim, device, dtype)
+        if not hasattr(self, "_pos_embed_cache"):
+            self._pos_embed_cache = {}
+        if cache_key not in self._pos_embed_cache:
+            self._pos_embed_cache[cache_key] = build_2d_sincos_position_embedding(
+                H=H, W=W, embed_dim=embed_dim, device=device, dtype=dtype
+            )
+        return self._pos_embed_cache[cache_key]
+
     def forward(
         self,
         feat_map: torch.Tensor,
@@ -210,79 +279,91 @@ class DeformableHead(nn.Module):
     ) -> Tuple[torch.Tensor, torch.Tensor, Dict[str, torch.Tensor]]:
         if feat_deform is None:
             feat_deform = feat_map
+        """
+        feat_map: (B,C,H,W)
+        """
+        B,C,H,W = feat_map.shape
+        
+        feat_map = feat_map + self._get_pos_embed(H, W, C, feat_map.device, feat_map.dtype)
+        feat_map = feat_map.view(B,C, H*W).permute(0, 2, 1) # (B,N,C)
+        q = self.to_q(feat_map)
+        k = self.to_k(feat_map)
+        v = self.to_v(feat_map)
 
-        B, C, H_pred, W_pred = feat_map.shape
-        _, _, H_def, W_def = feat_deform.shape
-        device = feat_map.device
-        Q = H_pred * W_pred
+        # Memory-efficient Scaled Dot-Product Attention
+        v = F.scaled_dot_product_attention(
+            q.unsqueeze(1), k.unsqueeze(1), v.unsqueeze(1), scale=self.scale
+        ).squeeze(1) # (B,N,C)
 
-        # 1. Spatial Queries từ feat_map
-        query_map = self.query_proj(feat_map)                           # [B, dim, H_pred, W_pred]
-        query_tokens = query_map.flatten(2).permute(0, 2, 1)            # [B, Q, dim]
+        B_def, C_def, H_def, W_def= feat_deform.shape
+        feat_deform = feat_deform + self._get_pos_embed(H_def, W_def, C_def, feat_map.device, feat_map.dtype)
 
-        # 2. Reference Grid [0, 1]
-        ref_grid, grid_logits = self._get_reference_grid(
-            H_pred, W_pred, device=device, dtype=query_tokens.dtype
-        )
-        ref_flat = ref_grid.view(1, Q, 2).expand(B, -1, -1)             # [B, Q, 2]
-        anchor_logits = grid_logits.view(1, 2, H_pred, W_pred).expand(B, -1, -1, -1)
-
-        # 3. Chuẩn bị Value Tensor từ feat_deform
-        # [B, H_def, W_def, dim] -> [B, H_def, W_def, num_heads, head_dim]
-        feat_def_spatial = feat_deform.permute(0, 2, 3, 1)
-        value = self.value_proj(feat_def_spatial)
-        value = value.view(B, H_def, W_def, self.num_heads, self.head_dim)
-        value_permuted = value.permute(0, 3, 4, 1, 2).contiguous().view(
-            B * self.num_heads, self.head_dim, H_def, W_def
-        )
-
-        # 4. Offsets & Attention Weights
-        offsets = self.sampling_offsets(query_tokens).view(B, Q, self.num_heads, self.num_points, 2)
-        spatial_scale = torch.tensor([1.0 / W_def, 1.0 / H_def], device=device, dtype=offsets.dtype).view(1, 1, 1, 1, 2)
-        sampling_locations = ref_flat.unsqueeze(2).unsqueeze(3) + offsets * spatial_scale
-
-        # Grid sample đoạn [-1, 1]
+        _, grid_logits = self._get_reference_grid(H, W, device=feat_map.device, dtype=feat_map.dtype)
+        # 2. Dự đoán độ lệch (offset delta) từ đặc trưng v: [B, N, 2]
+        delta_ref = self.query_proj(v).view(B, H * W, 2)
+        # 3. ref = sigmoid(grid_logits + delta): [B, N, 2]
+        ref = (grid_logits.unsqueeze(0) + delta_ref).sigmoid()
+        sampling = self.sampling_offsets(v).view(B, H*W, self.num_points, 2) # (B,N, num_points, 2)
+        spatial_scale = torch.tensor([1.0 / W_def, 1.0 / H_def], device=feat_map.device, dtype=feat_map.dtype)
+        sampling_locations = ref.unsqueeze(-2) + sampling * spatial_scale
         sampling_grid = 2.0 * sampling_locations - 1.0
-        grid_permuted = sampling_grid.permute(0, 2, 1, 3, 4).contiguous().view(
-            B * self.num_heads, Q, self.num_points, 2
-        )
 
-        attn_weights = self.attention_weights(query_tokens).view(B, Q, self.num_heads, self.num_points)
-        attn_weights = F.softmax(attn_weights, dim=-1)
-
-        # Bilinear sampling trên feat_deform
         sampled_feat = F.grid_sample(
-            value_permuted,
-            grid_permuted,
+            feat_deform,
+            sampling_grid,
             mode="bilinear",
             padding_mode="zeros",
             align_corners=False,
-        )  # [B * num_heads, head_dim, Q, num_points]
+        )  # (B, C_def, N, num_points)
 
-        sampled_feat = sampled_feat.view(B, self.num_heads, self.head_dim, Q, self.num_points)
-        sampled_feat = sampled_feat.permute(0, 3, 1, 4, 2)  # [B, Q, num_heads, num_points, head_dim]
+        sampled_feat = self.value_proj(sampled_feat.permute(0, 2, 3, 1)) # (B, N, num_points, D)
 
-        # Tổng hợp đặc trưng deformable
-        out = (sampled_feat * attn_weights.unsqueeze(-1)).sum(dim=3)
-        out = self.output_proj(out.view(B, Q, self.dim))  # [B, Q, dim]
-        out = out.permute(0, 2, 1).view(B, self.dim, H_pred, W_pred)
+        q = self.to_q2(v) # (B,N,D)
+        k = self.to_k2(sampled_feat) # (B, N, num_points, D)
+        v2 = self.to_v2(sampled_feat) # (B, N, num_points, D)
 
-        # Residual enhancement
-        enhanced_feat = feat_map + out  # [B, dim, H_pred, W_pred]
+        dots = torch.einsum('b n d, b n p d -> b n p', q, k)
+        dots = dots * self.scale
+        attn = torch.softmax(dots, dim= -1) 
+        feat = torch.einsum('b n p d, b n p -> b n d', v2, attn)
+        feat =  feat.permute(0, 2, 1).view(B, C, H, W)
 
-        # 5. Dự đoán Heatmap & Box
-        cls_logits = self.cls_head(enhanced_feat)
-        box_deltas = self.box_head(feat_map)
+        cls_logits = self.cls_head(feat)  # (B, num_classes, H, W)
+        obj_logits = self.obj_head(feat)  # (B, 1, H, W)
+        feat = v.permute(0, 2, 1).view(B, C, H, W) + feat
+        box_deltas = self.box_head(feat).permute(0, 2, 3, 1).view(B, H * W, 4)  # (B, N, 4)
+        
 
-        cxcy = (anchor_logits + box_deltas[:, :2]).sigmoid()
-        scale_factor = torch.exp(box_deltas[:, 2:].clamp(min=-4.0, max=4.0))
-        wh = (0.12 * scale_factor).clamp(min=1e-3, max=1.0)
+        dx = box_deltas[..., 0].sigmoid()
+        dy = box_deltas[..., 1].sigmoid()
+        dw = box_deltas[..., 2]
+        dh = box_deltas[..., 3]
 
-        pred_boxes = torch.cat([cxcy, wh], dim=1)  # [B, 4, H_pred, W_pred]
+        cx = (ref[..., 0] + dx)
+        cy = (ref[..., 1] + dy)
+        w = dw.sigmoid()
+        h = dh.sigmoid()
 
+        # Gộp lại thành (B, N, 4)
+        boxes = torch.stack([cx, cy, w, h], dim=-1)
+
+        # Đưa về shape feature map (B, 4, H, W):
+        boxes_map = boxes.permute(0, 2, 1).view(B, 4, H, W)
+
+        ref_map = ref.permute(0, 2, 1).view(B, 2, H, W)
         sampling_info = {
-            "sampling_locations": sampling_locations.view(B, H_pred, W_pred, self.num_heads, self.num_points, 2),
-            "attn_weights": attn_weights.view(B, H_pred, W_pred, self.num_heads, self.num_points),
-            "offsets": offsets.view(B, H_pred, W_pred, self.num_heads, self.num_points, 2),
+            "ref": ref_map,
+            "ref_points": ref,
+            "sampling_locations": sampling_locations.view(B, H, W, self.num_points, 2),
+            "offsets": sampling.view(B, H, W, self.num_points, 2),
+            "obj_logits": obj_logits,
         }
-        return cls_logits, pred_boxes, sampling_info
+        self.last_ref = ref_map
+        self.last_obj_logits = obj_logits
+        return cls_logits, boxes_map, obj_logits, sampling_info
+
+
+
+
+
+

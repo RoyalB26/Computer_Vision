@@ -31,10 +31,10 @@ def convert_to_xyxy(boxes: torch.Tensor, box_format: str = "auto") -> torch.Tens
         y2 = cy + h / 2.0
         return torch.stack([x1, y1, x2, y2], dim=-1)
 
-    # Auto detect: Nếu tọa độ x2 < x1 hoặc w/h có vẻ là size
-    # Kiểm tra phần lớn xem x1 <= x2 và y1 <= y2 không
-    # Thường trong format cxcywh, nếu coi là xyxy thì [2] là w, [3] là h. Nếu [0]+[2]/2 thì hợp lý.
-    # Trong VisDrone/YOLO, cxcywh: box[:, 0] là cx, box[:, 2] là w.
+    # Auto detect: kiểm tra xem tọa độ có đang ở dạng xyxy (x2 >= x1, y2 >= y1 và vượt quá cxcywh thông thường)
+    if (boxes[:, 2] >= boxes[:, 0]).all() and (boxes[:, 3] >= boxes[:, 1]).all():
+        if (boxes[:, 0] + boxes[:, 2] / 2.0 > 1.05).any() or (boxes[:, 1] + boxes[:, 3] / 2.0 > 1.05).any():
+            return boxes
     return convert_to_xyxy(boxes, box_format="cxcywh")
 
 
@@ -120,64 +120,8 @@ class VisDroneMAP(BaseMetric):
                 "labels": t_labels.long(),
             })
 
-    def _compute_ap_for_class_and_threshold(
-        self,
-        class_id: int,
-        iou_thresh: float,
-        detections: List[Tuple[int, float, torch.Tensor]],
-        gt_by_img: Dict[int, torch.Tensor],
-        total_gt: int,
-    ) -> float:
-        """Tính Average Precision (AP) theo chuẩn COCO 101 điểm cho 1 class và 1 ngưỡng IoU."""
-        if total_gt == 0 or len(detections) == 0:
-            return 0.0
-
-        matched_gt: Dict[int, set] = {img_idx: set() for img_idx in gt_by_img}
-        tp = np.zeros(len(detections))
-        fp = np.zeros(len(detections))
-
-        for d_idx, (img_idx, score, pred_box) in enumerate(detections):
-            gt_boxes = gt_by_img.get(img_idx, torch.empty((0, 4)))
-            if len(gt_boxes) == 0:
-                fp[d_idx] = 1.0
-                continue
-
-            # Tính IoU sử dụng torchvision chuẩn xác
-            ious = torchvision.ops.box_iou(pred_box.unsqueeze(0), gt_boxes).squeeze(0)
-            max_iou, max_idx = ious.max(dim=0)
-            max_iou = max_iou.item()
-            max_idx = max_idx.item()
-
-            if max_iou >= iou_thresh:
-                if max_idx not in matched_gt[img_idx]:
-                    tp[d_idx] = 1.0
-                    matched_gt[img_idx].add(max_idx)
-                else:
-                    fp[d_idx] = 1.0  # Duplicate detection (đã có box khác match trước đó)
-            else:
-                fp[d_idx] = 1.0
-
-        # Tính Precision - Recall curve
-        cum_tp = np.cumsum(tp)
-        cum_fp = np.cumsum(fp)
-        recalls = cum_tp / total_gt
-        precisions = cum_tp / np.maximum(cum_tp + cum_fp, 1e-7)
-
-        # Chuẩn COCO 101-point interpolation:
-        recall_thresholds = np.linspace(0.0, 1.0, 101)
-        interpolated_precisions = np.zeros(101)
-        for i, r_thresh in enumerate(recall_thresholds):
-            prec_after_r = precisions[recalls >= r_thresh]
-            if len(prec_after_r) > 0:
-                interpolated_precisions[i] = np.max(prec_after_r)
-            else:
-                interpolated_precisions[i] = 0.0
-
-        ap = float(np.mean(interpolated_precisions))
-        return ap
-
     def compute(self) -> Dict[str, float]:
-        """Tính toán mAP_50, mAP_75 và mAP_50_95."""
+        """Tính toán mAP_50, mAP_75 và mAP_50_95 chuẩn hóa trong khoảng [0, 1]."""
         if len(self.predictions) == 0 or len(self.ground_truths) == 0:
             return {"mAP_50": 0.0, "mAP_75": 0.0, "mAP_50_95": 0.0}
 
@@ -196,67 +140,118 @@ class VisDroneMAP(BaseMetric):
 
         all_eval_thresholds = sorted(set(self.iou_thresholds + [0.50, 0.75]))
         coco_thresholds = [round(x, 2) for x in np.linspace(0.5, 0.95, 10).tolist()]
+        num_thresh = len(all_eval_thresholds)
+        recall_thresholds = np.linspace(0.0, 1.0, 101)
 
         ap_table: Dict[float, List[float]] = {th: [] for th in all_eval_thresholds}
 
-        # Lưu AP chi tiết của từng class ở ngưỡng IoU 0.50
+        # Lưu AP chi tiết của từng class ở ngưỡng IoU 0.50 (thang [0, 1])
         per_class_ap50: Dict[int, float] = {}
 
+        num_imgs = min(len(self.predictions), len(self.ground_truths))
+
         for c in class_list:
-            # Gom Ground Truths của class c
-            gt_by_img: Dict[int, torch.Tensor] = {}
             total_gt = 0
-            for img_idx, gt in enumerate(self.ground_truths):
-                mask = gt["labels"] == c
-                boxes = gt["boxes"][mask]
-                gt_by_img[img_idx] = boxes
-                total_gt += len(boxes)
+            class_scores_list: List[np.ndarray] = []
+            class_tp_list: List[np.ndarray] = []
+            class_fp_list: List[np.ndarray] = []
+
+            # Tính ma trận IoU và matching theo từng ảnh (1 lần box_iou duy nhất/ảnh)
+            for img_idx in range(num_imgs):
+                gt = self.ground_truths[img_idx]
+                gt_mask = gt["labels"] == c
+                gt_boxes = gt["boxes"][gt_mask]
+                num_g = len(gt_boxes)
+                total_gt += num_g
+
+                p = self.predictions[img_idx]
+                p_mask = p["labels"] == c
+                if not p_mask.any():
+                    continue
+
+                p_boxes = p["boxes"][p_mask]
+                p_scores = p["scores"][p_mask]
+
+                # Sắp xếp predictions trong ảnh theo confidence giảm dần
+                order = torch.argsort(p_scores, descending=True)
+                p_boxes = p_boxes[order]
+                p_scores_np = p_scores[order].numpy()
+                num_p = len(p_boxes)
+
+                tp_img = np.zeros((num_thresh, num_p), dtype=np.float64)
+                fp_img = np.ones((num_thresh, num_p), dtype=np.float64)
+
+                if num_g > 0:
+                    iou_mat = torchvision.ops.box_iou(p_boxes, gt_boxes).numpy()  # [num_p, num_g]
+                    for t_idx, thr in enumerate(all_eval_thresholds):
+                        matched_gt = np.zeros(num_g, dtype=bool)
+                        for d_idx in range(num_p):
+                            ious_d = iou_mat[d_idx]
+                            # Chỉ xét các GT chưa được match (chuẩn COCO greedy matching)
+                            unmatched_ious = np.where(~matched_gt, ious_d, -1.0)
+                            best_gt = int(np.argmax(unmatched_ious))
+                            if unmatched_ious[best_gt] >= thr:
+                                tp_img[t_idx, d_idx] = 1.0
+                                fp_img[t_idx, d_idx] = 0.0
+                                matched_gt[best_gt] = True
+
+                class_scores_list.append(p_scores_np)
+                class_tp_list.append(tp_img)
+                class_fp_list.append(fp_img)
 
             if total_gt == 0:
                 continue
 
-            # Gom Detections của class c
-            detections: List[Tuple[int, float, torch.Tensor]] = []
-            for img_idx, p in enumerate(self.predictions):
-                mask = p["labels"] == c
-                boxes = p["boxes"][mask]
-                scores = p["scores"][mask]
-                for box, score in zip(boxes, scores):
-                    detections.append((img_idx, score.item(), box))
+            if len(class_scores_list) == 0:
+                for th in all_eval_thresholds:
+                    ap_table[th].append(0.0)
+                per_class_ap50[c] = 0.0
+                continue
 
-            # Sắp xếp theo confidence giảm dần
-            detections.sort(key=lambda x: x[1], reverse=True)
-            # Chỉ lấy tối đa 1000 detections có score cao nhất cho mỗi class để tăng tốc độ tính mAP
-            detections = detections[:1000]
+            # Gộp toàn bộ detections của class c và sắp xếp theo confidence giảm dần
+            all_scores = np.concatenate(class_scores_list, axis=0)
+            all_tp = np.concatenate(class_tp_list, axis=1)  # [num_thresh, N_det]
+            all_fp = np.concatenate(class_fp_list, axis=1)  # [num_thresh, N_det]
 
-            # Tính AP cho từng ngưỡng IoU
-            for th in all_eval_thresholds:
-                ap = self._compute_ap_for_class_and_threshold(
-                    class_id=c,
-                    iou_thresh=th,
-                    detections=detections,
-                    gt_by_img=gt_by_img,
-                    total_gt=total_gt,
-                )
+            sort_idx = np.argsort(-all_scores, kind="mergesort")
+            all_tp = all_tp[:, sort_idx]
+            all_fp = all_fp[:, sort_idx]
+
+            # Vector hóa tích lũy TP, FP cho tất cả ngưỡng IoU cùng lúc
+            cum_tp = np.cumsum(all_tp, axis=1)
+            cum_fp = np.cumsum(all_fp, axis=1)
+            recalls = cum_tp / float(total_gt)
+            precisions = cum_tp / np.maximum(cum_tp + cum_fp, 1e-7)
+
+            # Tính AP bằng 101-point interpolation chuẩn COCO cho từng ngưỡng IoU
+            for t_idx, th in enumerate(all_eval_thresholds):
+                rec = recalls[t_idx]
+                prec = precisions[t_idx]
+                mprec = np.maximum.accumulate(prec[::-1])[::-1]
+                idx = np.searchsorted(rec, recall_thresholds, side="left")
+                interp_prec = np.zeros(101, dtype=np.float64)
+                valid = idx < len(mprec)
+                interp_prec[valid] = mprec[idx[valid]]
+                ap = float(np.mean(interp_prec))
                 ap_table[th].append(ap)
                 if th == 0.50:
-                    per_class_ap50[c] = round(ap * 100.0, 2)
+                    per_class_ap50[c] = round(ap, 4)
 
-        # In bảng thống kê chi tiết khả năng nhận diện từng class ra terminal
+        # In bảng thống kê chi tiết khả năng nhận diện từng class ra terminal (thang 0 - 1)
         print("\n" + "=" * 62)
-        print(f"{'Class ID':<10} {'Class Name':<28} {'AP@50 (%)':<15}")
+        print(f"{'Class ID':<10} {'Class Name':<28} {'AP@50 (0-1)':<15}")
         print("-" * 62)
         for c in range(self.num_classes):
             c_name = self.class_names[c] if c < len(self.class_names) else f"class_{c}"
             ap_val = per_class_ap50.get(c, 0.0)
-            print(f"{c:<10} {c_name:<28} {ap_val:<15.2f}")
+            print(f"{c:<10} {c_name:<28} {ap_val:<15.4f}")
         print("=" * 62 + "\n")
 
-        # Tính mean AP theo phần trăm (0 - 100%)
+        # Tính mean AP chuẩn hóa trong khoảng [0, 1]
         map_per_thresh: Dict[float, float] = {}
         for th in all_eval_thresholds:
             aps = ap_table[th]
-            map_per_thresh[th] = (float(np.mean(aps)) * 100.0) if len(aps) > 0 else 0.0
+            map_per_thresh[th] = float(np.mean(aps)) if len(aps) > 0 else 0.0
 
         map_50 = map_per_thresh.get(0.50, 0.0)
         map_75 = map_per_thresh.get(0.75, 0.0)
@@ -270,10 +265,9 @@ class VisDroneMAP(BaseMetric):
             "mAP_50_95": round(map_50_95, 4),
         }
 
-        # Lưu per-class AP50 vào results dictionary (ví dụ: 'AP50_car', 'AP50_pedestrian'...)
+        # Lưu per-class AP50 vào results dictionary (thang [0, 1])
         for c in range(self.num_classes):
             c_name = self.class_names[c] if c < len(self.class_names) else f"class_{c}"
-            # Chuẩn hóa tên bỏ khoảng trắng
             clean_name = c_name.replace(" ", "_")
             results[f"AP50_{clean_name}"] = per_class_ap50.get(c, 0.0)
 

@@ -9,10 +9,10 @@ from BaseModel.core.registrar import MODELS
 from BaseModel.model import BaseModel
 
 from .utils import cxcywh_to_xyxy
-from .backbone import MobileNetV3Backbone
-from .neck import MobileNetFPN
+from .backbone import MobileNetV3Backbone, NormalBackbone
+from .neck import MobileNetFPN, MobileNetPANet, PANet
 from .head import MobileNetDetectionHead, DeformableHead
-from .loss import MobileNetDetectionLoss
+from .loss import MobileNetDetectionLoss, compute_multi_ref_loss
 
 @torch.no_grad() # Bỏ nếu bạn cần truyền ngược đạo hàm (backward) qua bước này
 def expand_islands_batch_gpu(x: torch.Tensor, connectivity: int = 8, coast_thickness: int = 1):
@@ -326,32 +326,50 @@ class HandDigitMobileNetV3Detector(BaseModel):
         head: Optional[nn.Module] = None,
         loss_fn: Optional[nn.Module] = None,
         target_size: int = 160,
+        ref_weight: float = 1.0,
+        obj_weight: float = 1.0,
+        obj_pos_weight: float = 5.0,
+        num_ref_per_obj: int = 4,
+        ref_repulsion_weight: float = 0.5,
         **kwargs,
     ):
         super().__init__()
         self.num_classes = num_classes
         self.dim = dim
         self.head_type = head_type
+        self.ref_weight = ref_weight
+        self.obj_weight = obj_weight
+        self.obj_pos_weight = obj_pos_weight
+        self.num_ref_per_obj = num_ref_per_obj
+        self.ref_repulsion_weight = ref_repulsion_weight
 
-        self.downsampler = ConvKernelDownsampleModule(
-            in_channels=3,
-            target_size=target_size,
-            normalize_kernel=False,
-        )
-
-        # 1. MobileNetV3 Backbone
+        # 1. MobileNetV3 / Custom Backbone
         if backbone is not None:
-            self.backbone = backbone
+            if isinstance(backbone, dict):
+                from BaseModel.core.registrar import BACKBONES
+                self.backbone = BACKBONES.build(backbone)
+            elif isinstance(backbone, str):
+                from BaseModel.core.registrar import BACKBONES
+                self.backbone = BACKBONES.build({"type": backbone})
+            else:
+                self.backbone = backbone
             in_channels = getattr(
-                backbone, "out_channels", {'c0': 16, 'c1': 16, 'c3': 24, 'c5': 40, 'c12': 576}
+                self.backbone, "out_channels", {'c0': 16, 'c1': 16, 'c3': 24, 'c5': 40, 'c12': 576}
             )
         else:
             self.backbone = MobileNetV3Backbone(pretrained=True)
             in_channels = self.backbone.out_channels
 
-        # 2. Feature Pyramid Network (FPN)
+        # 2. Feature Pyramid Network (FPN / PANet)
         if neck is not None:
-            self.neck = neck
+            if isinstance(neck, dict):
+                from BaseModel.core.registrar import NECKS
+                self.neck = NECKS.build(neck, default_args={"in_channels": in_channels, "out_dim": dim})
+            elif isinstance(neck, str):
+                from BaseModel.core.registrar import NECKS
+                self.neck = NECKS.build({"type": neck, "in_channels": in_channels, "out_dim": dim})
+            else:
+                self.neck = neck
         else:
             self.neck = MobileNetFPN(in_channels=in_channels, out_dim=dim, return_tuple=True)
 
@@ -366,11 +384,18 @@ class HandDigitMobileNetV3Detector(BaseModel):
             else:
                 self.head = MobileNetDetectionHead(num_classes=num_classes, dim=dim, head_conv=dim)
 
-        # 4. Loss Function (Focal Loss + DIoU Loss)
+        # 4. Loss Function (Focal Loss + DIoU Loss + Ref Loss + Obj Loss)
         if loss_fn is not None:
             self.loss_fn = loss_fn
         else:
-            self.loss_fn = MobileNetDetectionLoss(num_classes=num_classes)
+            self.loss_fn = MobileNetDetectionLoss(
+                num_classes=num_classes,
+                ref_weight=ref_weight,
+                obj_weight=obj_weight,
+                obj_pos_weight=obj_pos_weight,
+                num_ref_per_obj=num_ref_per_obj,
+                ref_repulsion_weight=ref_repulsion_weight,
+            )
 
     def extract_features(
         self, x: torch.Tensor
@@ -381,7 +406,78 @@ class HandDigitMobileNetV3Detector(BaseModel):
         if isinstance(fpn_out, tuple):
             map_pred, feat_deform = fpn_out
             return map_pred, feat_deform
-        return fpn_out, None
+        return feats, None
+
+    def compute_ref_loss(
+        self,
+        ref: torch.Tensor,
+        targets: Optional[List[Dict[str, torch.Tensor]]],
+        device: torch.device,
+    ) -> torch.Tensor:
+        """
+        Tính toán Ref Loss đa điểm:
+        - Cho phép nhiều ref trỏ về cùng 1 object (phân bố tại nhiều vị trí khác nhau trong box).
+        - Có repulsion loss ngăn không cho các ref trùng tọa độ.
+        - Bao quát toàn bộ các object trong ảnh theo hạn ngạch công bằng, không bị dồn cục vào 1 object.
+        """
+        return compute_multi_ref_loss(
+            ref_tensor=ref,
+            targets=targets,
+            device=device,
+            num_classes=self.num_classes,
+            num_ref_per_obj=getattr(self, "num_ref_per_obj", 4),
+            repulsion_weight=getattr(self, "ref_repulsion_weight", 0.5),
+        )
+
+    def compute_obj_loss(
+        self,
+        obj_logits: torch.Tensor,
+        targets: Optional[List[Dict[str, torch.Tensor]]],
+        device: torch.device,
+        pos_weight: float = 5.0,
+    ) -> torch.Tensor:
+        """
+        Tính toán Objectness Loss (BCEWithLogitsLoss với pos_weight).
+
+        Args:
+            obj_logits: Tensor [B, 1, H, W] chứa dự đoán objectness logits.
+            targets: Danh sách target dicts chứa bounding boxes.
+            device: Thiết bị torch.device.
+            pos_weight: Trọng số phạt cho positive target (mặc định 5.0).
+
+        Returns:
+            torch.Tensor: Scalar loss cho objectness.
+        """
+        if obj_logits is None or targets is None:
+            return torch.tensor(0.0, device=device)
+
+        batch_size, _, grid_h, grid_w = obj_logits.shape
+        obj_target = torch.zeros((batch_size, 1, grid_h, grid_w), device=device, dtype=obj_logits.dtype)
+
+        for b in range(batch_size):
+            target_dict = targets[b] if b < len(targets) else None
+            if not target_dict:
+                continue
+
+            gt_boxes = target_dict.get("boxes", torch.empty((0, 4), device=device))
+            if len(gt_boxes) == 0:
+                continue
+
+            gt_boxes = gt_boxes.to(device)
+            is_cxcywh = target_dict.get("_is_cxcywh", False)
+            if is_cxcywh:
+                gt_cx = gt_boxes[:, 0].clamp(0.0, 0.999)
+                gt_cy = gt_boxes[:, 1].clamp(0.0, 0.999)
+            else:
+                gt_cx = (gt_boxes[:, 0] + gt_boxes[:, 2] / 2.0).clamp(0.0, 0.999)
+                gt_cy = (gt_boxes[:, 1] + gt_boxes[:, 3] / 2.0).clamp(0.0, 0.999)
+
+            grid_x = (gt_cx * grid_w).long().clamp(0, grid_w - 1)
+            grid_y = (gt_cy * grid_h).long().clamp(0, grid_h - 1)
+            obj_target[b, 0, grid_y, grid_x] = 1.0
+
+        weight_tensor = torch.tensor([pos_weight], device=device, dtype=obj_logits.dtype)
+        return F.binary_cross_entropy_with_logits(obj_logits, obj_target, pos_weight=weight_tensor)
 
     def forward_train(
         self,
@@ -392,24 +488,59 @@ class HandDigitMobileNetV3Detector(BaseModel):
         map_pred, feat_deform = self.extract_features(inputs)
         head_out = self.head(map_pred, feat_deform)
 
-        if len(head_out) == 3:
-            cls_logits, pred_boxes, sampling_info = head_out
+        if len(head_out) == 4:
+            cls_logits, pred_boxes, obj_logits, sampling_info = head_out
+        elif len(head_out) == 3:
+            cls_logits, pred_boxes, extra = head_out
+            if isinstance(extra, dict):
+                sampling_info = extra
+                obj_logits = extra.get("obj_logits", None)
+            elif isinstance(extra, torch.Tensor) and extra.shape[1] == 1:
+                obj_logits = extra
+                sampling_info = None
+            else:
+                sampling_info = extra
+                obj_logits = None
         else:
             cls_logits, pred_boxes = head_out
+            obj_logits = None
             sampling_info = None
 
-        return self.loss_fn(
+        loss_dict = self.loss_fn(
             cls_logits=cls_logits,
             pred_boxes=pred_boxes,
             targets=targets,
             device=inputs.device,
             sampling_info=sampling_info,
+            obj_logits=obj_logits,
         )
+
+        if "loss_ref" not in loss_dict:
+            ref = None
+            if isinstance(sampling_info, dict) and "ref" in sampling_info:
+                ref = sampling_info["ref"]
+            elif isinstance(sampling_info, torch.Tensor):
+                ref = sampling_info
+            elif hasattr(self.head, "last_ref") and self.head.last_ref is not None:
+                ref = self.head.last_ref
+
+            if ref is not None and targets is not None:
+                ref_loss = self.compute_ref_loss(ref, targets, inputs.device)
+                loss_dict["loss_ref"] = ref_loss
+                loss_dict["loss"] = loss_dict["loss"] + self.ref_weight * ref_loss
+
+        if "loss_obj" not in loss_dict and obj_logits is not None and targets is not None:
+            obj_loss = self.compute_obj_loss(obj_logits, targets, inputs.device, pos_weight=self.obj_pos_weight)
+            loss_dict["loss_obj"] = obj_loss
+            loss_dict["loss"] = loss_dict["loss"] + self.obj_weight * obj_loss
+
+        return loss_dict
 
     def _post_process(
         self,
         cls_logits: torch.Tensor,
         pred_boxes: torch.Tensor,
+        obj_logits: Optional[torch.Tensor] = None,
         conf_threshold: float = 0.10,
         nms_threshold: float = 0.5,
         max_det: int = 100,
@@ -418,6 +549,10 @@ class HandDigitMobileNetV3Detector(BaseModel):
         """Lọc peak cực đại cục bộ 3x3 và batched NMS."""
         batch_size, num_classes, grid_h, grid_w = cls_logits.shape
         cls_scores = cls_logits.sigmoid()
+
+        if obj_logits is not None:
+            obj_scores = obj_logits.sigmoid()
+            cls_scores = cls_scores * obj_scores
 
         # CenterNet Local Peak Max-Pooling (3x3)
         hmax = F.max_pool2d(cls_scores, kernel_size=3, stride=1, padding=1)
@@ -475,9 +610,15 @@ class HandDigitMobileNetV3Detector(BaseModel):
         map_pred, feat_deform = self.extract_features(inputs)
         head_out = self.head(map_pred, feat_deform)
         cls_logits, pred_boxes = head_out[0], head_out[1]
+        obj_logits = None
+        if len(head_out) >= 3 and isinstance(head_out[2], torch.Tensor) and head_out[2].ndim == 4 and head_out[2].shape[1] == 1:
+            obj_logits = head_out[2]
+        elif len(head_out) >= 4 and isinstance(head_out[3], dict) and "obj_logits" in head_out[3]:
+            obj_logits = head_out[3]["obj_logits"]
 
         return self._post_process(
             cls_logits, pred_boxes,
+            obj_logits=obj_logits,
             conf_threshold=conf_threshold,
             nms_threshold=nms_threshold,
             max_det=max_det,
@@ -496,10 +637,22 @@ class HandDigitMobileNetV3Detector(BaseModel):
         map_pred, feat_deform = self.extract_features(inputs)
         head_out = self.head(map_pred, feat_deform)
 
-        if len(head_out) == 3:
-            cls_logits, pred_boxes, sampling_info = head_out
+        if len(head_out) == 4:
+            cls_logits, pred_boxes, obj_logits, sampling_info = head_out
+        elif len(head_out) == 3:
+            cls_logits, pred_boxes, extra = head_out
+            if isinstance(extra, dict):
+                sampling_info = extra
+                obj_logits = extra.get("obj_logits", None)
+            elif isinstance(extra, torch.Tensor) and extra.shape[1] == 1:
+                obj_logits = extra
+                sampling_info = None
+            else:
+                sampling_info = extra
+                obj_logits = None
         else:
             cls_logits, pred_boxes = head_out
+            obj_logits = None
             sampling_info = None
 
         output = {}
@@ -510,7 +663,27 @@ class HandDigitMobileNetV3Detector(BaseModel):
                 targets=targets,
                 device=inputs.device,
                 sampling_info=sampling_info,
+                obj_logits=obj_logits,
             )
+            if "loss_ref" not in loss_dict:
+                ref = None
+                if isinstance(sampling_info, dict) and "ref" in sampling_info:
+                    ref = sampling_info["ref"]
+                elif isinstance(sampling_info, torch.Tensor):
+                    ref = sampling_info
+                elif hasattr(self.head, "last_ref") and self.head.last_ref is not None:
+                    ref = self.head.last_ref
+
+                if ref is not None:
+                    ref_loss = self.compute_ref_loss(ref, targets, inputs.device)
+                    loss_dict["loss_ref"] = ref_loss
+                    loss_dict["loss"] = loss_dict["loss"] + self.ref_weight * ref_loss
+
+            if "loss_obj" not in loss_dict and obj_logits is not None:
+                obj_loss = self.compute_obj_loss(obj_logits, targets, inputs.device, pos_weight=self.obj_pos_weight)
+                loss_dict["loss_obj"] = obj_loss
+                loss_dict["loss"] = loss_dict["loss"] + self.obj_weight * obj_loss
+
             output.update(loss_dict)
 
             # Chuẩn hóa target boxes sang định dạng [cx, cy, w, h] cho MeanAveragePrecision
@@ -528,6 +701,7 @@ class HandDigitMobileNetV3Detector(BaseModel):
 
         preds = self._post_process(
             cls_logits, pred_boxes,
+            obj_logits=obj_logits,
             conf_threshold=conf_threshold,
             nms_threshold=nms_threshold,
             max_det=max_det,
@@ -554,7 +728,16 @@ class HandDigitMobileNetV3Detector(BaseModel):
             map_pred, feat_deform = self.extract_features(inputs)
             head_out = self.head(map_pred, feat_deform)
             cls_logits, pred_boxes = head_out[0], head_out[1]
-            sampling_info = head_out[2] if len(head_out) == 3 else None
+            obj_logits = None
+            if len(head_out) >= 3 and isinstance(head_out[2], torch.Tensor) and head_out[2].ndim == 4 and head_out[2].shape[1] == 1:
+                obj_logits = head_out[2]
+                sampling_info = head_out[3] if len(head_out) >= 4 else None
+            else:
+                sampling_info = head_out[2] if len(head_out) >= 3 else None
+                obj_logits = sampling_info.get("obj_logits", None) if isinstance(sampling_info, dict) else None
+
+            if obj_logits is None and hasattr(self.head, "last_obj_logits"):
+                obj_logits = self.head.last_obj_logits
 
             cls_scores = cls_logits.sigmoid()
 
@@ -571,16 +754,41 @@ class HandDigitMobileNetV3Detector(BaseModel):
                 "MapPred_Energy": round(map_pred.norm(dim=1).mean().item(), 4),
             }
 
+            if obj_logits is not None:
+                obj_scores = obj_logits.sigmoid()
+                results["Obj_Prob_Mean"] = round(obj_scores.mean().item(), 4)
+                results["Obj_Prob_Max"] = round(obj_scores.max().item(), 4)
+                results["Obj_Logits_Mean"] = round(obj_logits.mean().item(), 4)
+
             if sampling_info is not None:
-                all_locs = sampling_info["sampling_locations"]
-                all_offsets = sampling_info["offsets"]
-                offset_norm = torch.norm(all_offsets, p=2, dim=-1).mean()
-                bound_violation = (
-                    F.relu(-all_locs[..., 0]) + F.relu(all_locs[..., 0] - 1.0) +
-                    F.relu(-all_locs[..., 1]) + F.relu(all_locs[..., 1] - 1.0)
-                ).gt(0).float().mean()
-                results["Deform_Offset_Norm"] = round(offset_norm.item(), 4)
-                results["Deform_Out_Bound_Ratio"] = round(bound_violation.item(), 4)
+                if isinstance(sampling_info, dict):
+                    all_locs = sampling_info.get("sampling_locations", None)
+                    all_offsets = sampling_info.get("offsets", None)
+                    ref_tensor = sampling_info.get("ref", None)
+                else:
+                    all_locs = None
+                    all_offsets = None
+                    ref_tensor = sampling_info if isinstance(sampling_info, torch.Tensor) else None
+
+                if ref_tensor is None and hasattr(self.head, "last_ref"):
+                    ref_tensor = self.head.last_ref
+
+                if all_locs is not None and all_offsets is not None:
+                    offset_norm = torch.norm(all_offsets, p=2, dim=-1).mean()
+                    bound_violation = (
+                        F.relu(-all_locs[..., 0]) + F.relu(all_locs[..., 0] - 1.0) +
+                        F.relu(-all_locs[..., 1]) + F.relu(all_locs[..., 1] - 1.0)
+                    ).gt(0).float().mean()
+                    results["Deform_Offset_Norm"] = round(offset_norm.item(), 4)
+                    results["Deform_Out_Bound_Ratio"] = round(bound_violation.item(), 4)
+
+                if ref_tensor is not None:
+                    if ref_tensor.ndim == 4:
+                        results["Ref_X_Mean"] = round(ref_tensor[:, 0].mean().item(), 4)
+                        results["Ref_Y_Mean"] = round(ref_tensor[:, 1].mean().item(), 4)
+                    elif ref_tensor.ndim == 3:
+                        results["Ref_X_Mean"] = round(ref_tensor[..., 0].mean().item(), 4)
+                        results["Ref_Y_Mean"] = round(ref_tensor[..., 1].mean().item(), 4)
 
         if was_training:
             self.train()

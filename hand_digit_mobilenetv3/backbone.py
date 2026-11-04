@@ -1,7 +1,8 @@
 """Backbone MobileNetV3 for pure CNN feature extraction."""
-from typing import Dict, Optional
-import torch
+from typing import Callable, Dict, List, Optional, Tuple, Union
+import torch 
 import torch.nn as nn
+from torch import Tensor
 from torchvision.models import MobileNet_V3_Small_Weights, mobilenet_v3_small
 from torchvision.models.feature_extraction import create_feature_extractor
 
@@ -46,6 +47,307 @@ class MobileNetV3Backbone(nn.Module):
             'c5': 40,
             'c12': 576,
         }
+        self.norm = nn.Sequential(
+            StaticSquaredDeviationNorm(),
+            nn.BatchNorm2d(3),
+            nn.ReLU(),
+        )
 
     def forward(self, x: torch.Tensor) -> Dict[str, torch.Tensor]:
+        x = self.norm(x) 
         return self.extractor(x)
+
+class StaticSquaredDeviationNorm(nn.Module):
+    def __init__(self, per_channel: bool = True):
+        """
+        Norm thuần túy (không học):
+        Tính trực tiếp trên từng sample độc lập, không lưu running stats,
+        kết quả không phụ thuộc vào trạng thái train/eval.
+        
+        Args:
+            per_channel (bool): 
+                - False (mặc định - theo code gốc): tính mean trên toàn bộ sample (C, H, W).
+                - True: tính mean riêng cho từng channel của mỗi sample (H, W).
+        """
+        super().__init__()
+        self.per_channel = per_channel
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if self.per_channel:
+            # Gom các chiều không gian (H, W, ...), giữ lại chiều Batch và Channel
+            # dims = (2, 3, ...) -> mean shape: (B, C, 1, 1, ...)
+            dims = tuple(range(2, x.ndim))
+        else:
+            # Gom tất cả các chiều trừ chiều Batch (dim 0) giống code gốc
+            # dims = (1, 2, 3, ...) -> mean shape: (B, 1, 1, 1, ...)
+            dims = tuple(range(1, x.ndim))
+        
+        # 1. Tính mean nội tại của từng sample
+        mean = x.mean(dim=dims, keepdim=True)
+        
+        # 2. Áp dụng công thức biến đổi thuần túy
+        out = torch.exp(5 * torch.abs(x - mean))
+        
+        return out
+
+
+class Conv2dNormActivation(nn.Sequential):
+    """Convolution + Normalization + Activation block matching torchvision."""
+
+    def __init__(
+        self,
+        in_channels: int,
+        out_channels: int,
+        kernel_size: int = 3,
+        stride: int = 1,
+        padding: Optional[int] = None,
+        groups: int = 1,
+        norm_layer: Optional[Callable[..., nn.Module]] = nn.BatchNorm2d,
+        activation_layer: Optional[Callable[..., nn.Module]] = nn.ReLU,
+        dilation: int = 1,
+        bias: Optional[bool] = None,
+        inplace: Optional[bool] = True,
+    ):
+        if padding is None:
+            padding = (kernel_size - 1) // 2 * dilation
+        if bias is None:
+            bias = norm_layer is None
+
+        layers: List[nn.Module] = [
+            nn.Conv2d(
+                in_channels,
+                out_channels,
+                kernel_size=kernel_size,
+                stride=stride,
+                padding=padding,
+                dilation=dilation,
+                groups=groups,
+                bias=bias,
+            )
+        ]
+
+        if norm_layer is not None:
+            layers.append(norm_layer(out_channels, eps=0.001, momentum=0.01))
+
+        if activation_layer is not None:
+            params = {} if inplace is None else {"inplace": inplace}
+            layers.append(activation_layer(**params))
+
+        super().__init__(*layers)
+
+
+class SqueezeExcitation(nn.Module):
+    """Squeeze-and-Excitation block for MobileNetV3."""
+
+    def __init__(
+        self,
+        input_channels: int,
+        squeeze_channels: int,
+        activation: Callable[..., nn.Module] = nn.ReLU,
+        scale_activation: Callable[..., nn.Module] = nn.Hardsigmoid,
+    ):
+        super().__init__()
+        self.avgpool = nn.AdaptiveAvgPool2d(1)
+        self.fc1 = nn.Conv2d(input_channels, squeeze_channels, 1)
+        self.fc2 = nn.Conv2d(squeeze_channels, input_channels, 1)
+        self.activation = activation()
+        self.scale_activation = scale_activation()
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        scale = self.avgpool(x)
+        scale = self.fc1(scale)
+        scale = self.activation(scale)
+        scale = self.fc2(scale)
+        scale = self.scale_activation(scale)
+        return x * scale
+
+
+class InvertedResidual(nn.Module):
+    """Inverted Residual block (MobileNetV3 style) with configurable activation."""
+
+    def __init__(
+        self,
+        in_channels: int,
+        exp_channels: int,
+        out_channels: int,
+        kernel_size: int,
+        stride: int,
+        use_se: bool,
+        act_layer: Callable[..., nn.Module] = nn.ReLU,
+        se_channels: Optional[int] = None,
+        norm_layer: Optional[Callable[..., nn.Module]] = nn.BatchNorm2d,
+    ):
+        super().__init__()
+        self.use_res_connect = stride == 1 and in_channels == out_channels
+
+        layers: List[nn.Module] = []
+
+        # 1. Expand (pointwise conv)
+        if exp_channels != in_channels:
+            layers.append(
+                Conv2dNormActivation(
+                    in_channels,
+                    exp_channels,
+                    kernel_size=1,
+                    stride=1,
+                    norm_layer=norm_layer,
+                    activation_layer=act_layer,
+                )
+            )
+
+        # 2. Depthwise conv
+        layers.append(
+            Conv2dNormActivation(
+                exp_channels,
+                exp_channels,
+                kernel_size=kernel_size,
+                stride=stride,
+                groups=exp_channels,
+                norm_layer=norm_layer,
+                activation_layer=act_layer,
+            )
+        )
+
+        # 3. Squeeze-and-Excitation
+        if use_se:
+            sq_channels = se_channels if se_channels is not None else exp_channels // 4
+            layers.append(
+                SqueezeExcitation(
+                    input_channels=exp_channels,
+                    squeeze_channels=sq_channels,
+                )
+            )
+
+        # 4. Project (pointwise linear conv without activation)
+        layers.append(
+            Conv2dNormActivation(
+                exp_channels,
+                out_channels,
+                kernel_size=1,
+                stride=1,
+                norm_layer=norm_layer,
+                activation_layer=None,
+            )
+        )
+
+        self.block = nn.Sequential(*layers)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        res = self.block(x)
+        if self.use_res_connect:
+            return x + res
+        return res
+
+
+@BACKBONES.register_module(name=["NormalBackbone", "normalBackbone"])
+class NormalBackbone(nn.Module):
+    """
+    MobileNetV3-Small Feature Extractor sử dụng hàm kích hoạt ReLU thay thế cho Hardswish:
+      - features.0 : Conv2d(3 -> 16, k=3, s=2), ReLU                -> c0  (stride 2, 16 channels)
+      - features.1 : InvertedResidual(16->16, k=3, s=2, SE(8), ReLU) -> c1  (stride 4, 16 channels)
+      - features.2 : InvertedResidual(16->24, k=3, s=2, no SE, ReLU)       (stride 8, 24 channels)
+      - features.3 : InvertedResidual(24->24, k=3, s=1, no SE, ReLU) -> c3  (stride 8, 24 channels)
+      - features.4 : InvertedResidual(24->40, k=5, s=2, SE(24), ReLU)      (stride 16, 40 channels)
+      - features.5 : InvertedResidual(40->40, k=5, s=1, SE(64), ReLU)-> c5  (stride 16, 40 channels)
+      - features.6 : InvertedResidual(40->40, k=5, s=1, SE(64), ReLU)      (stride 16, 40 channels)
+      - features.7 : InvertedResidual(40->48, k=5, s=1, SE(32), ReLU)      (stride 16, 48 channels)
+      - features.8 : InvertedResidual(48->48, k=5, s=1, SE(40), ReLU)      (stride 16, 48 channels)
+      - features.9 : InvertedResidual(48->96, k=5, s=2, SE(72), ReLU)      (stride 32, 96 channels)
+      - features.10: InvertedResidual(96->96, k=5, s=1, SE(144), ReLU)     (stride 32, 96 channels)
+      - features.11: InvertedResidual(96->96, k=5, s=1, SE(144), ReLU)     (stride 32, 96 channels)
+      - features.12: Conv2d(96 -> 576, k=1, s=1), ReLU              -> c12 (stride 32, 576 channels)
+    """
+
+    def __init__(
+        self,
+        pretrained: bool = False,
+        use_norm: bool = True,
+        act_layer: Callable[..., nn.Module] = nn.ReLU,
+        return_nodes: Optional[Dict[Union[int, str], str]] = None,
+        *args,
+        **kwargs,
+    ):
+        super().__init__()
+
+        if return_nodes is None:
+            self.return_nodes = {
+                0: 'c0',   # stride 2
+                1: 'c1',   # stride 4
+                3: 'c3',   # stride 8
+                5: 'c5',   # stride 16
+                12: 'c12', # stride 32
+            }
+        else:
+            self.return_nodes = {
+                int(k.split('.')[-1]) if isinstance(k, str) else k: v
+                for k, v in return_nodes.items()
+            }
+
+        self.out_channels: Dict[str, int] = {
+            'c0': 16,
+            'c1': 16,
+            'c3': 24,
+            'c5': 40,
+            'c12': 576,
+        }
+
+        if use_norm:
+            self.norm = nn.Sequential(
+                StaticSquaredDeviationNorm(per_channel=True),
+                nn.BatchNorm2d(3),
+                nn.ReLU(),
+            )
+        else:
+            self.norm = None
+
+        self.features = nn.Sequential(
+            # 0: Conv 3 -> 16, stride 2 (c0)
+            Conv2dNormActivation(3, 16, kernel_size=3, stride=2, activation_layer=act_layer),
+            # 1: bneck k=3, in=16, exp=16, out=16, SE, RE, stride=2 (c1)
+            InvertedResidual(16, 16, 16, kernel_size=3, stride=2, use_se=True, act_layer=act_layer, se_channels=8),
+            # 2: bneck k=3, in=16, exp=72, out=24, no SE, RE, stride=2
+            InvertedResidual(16, 72, 24, kernel_size=3, stride=2, use_se=False, act_layer=act_layer),
+            # 3: bneck k=3, in=24, exp=88, out=24, no SE, RE, stride=1 (c3)
+            InvertedResidual(24, 88, 24, kernel_size=3, stride=1, use_se=False, act_layer=act_layer),
+            # 4: bneck k=5, in=24, exp=96, out=40, SE, RE, stride=2
+            InvertedResidual(24, 96, 40, kernel_size=5, stride=2, use_se=True, act_layer=act_layer, se_channels=24),
+            # 5: bneck k=5, in=40, exp=240, out=40, SE, RE, stride=1 (c5)
+            InvertedResidual(40, 240, 40, kernel_size=5, stride=1, use_se=True, act_layer=act_layer, se_channels=64),
+            # 6: bneck k=5, in=40, exp=240, out=40, SE, RE, stride=1
+            InvertedResidual(40, 240, 40, kernel_size=5, stride=1, use_se=True, act_layer=act_layer, se_channels=64),
+            # 7: bneck k=5, in=40, exp=120, out=48, SE, RE, stride=1
+            InvertedResidual(40, 120, 48, kernel_size=5, stride=1, use_se=True, act_layer=act_layer, se_channels=32),
+            # 8: bneck k=5, in=48, exp=144, out=48, SE, RE, stride=1
+            InvertedResidual(48, 144, 48, kernel_size=5, stride=1, use_se=True, act_layer=act_layer, se_channels=40),
+            # 9: bneck k=5, in=48, exp=288, out=96, SE, RE, stride=2
+            InvertedResidual(48, 288, 96, kernel_size=5, stride=2, use_se=True, act_layer=act_layer, se_channels=72),
+            # 10: bneck k=5, in=96, exp=576, out=96, SE, RE, stride=1
+            InvertedResidual(96, 576, 96, kernel_size=5, stride=1, use_se=True, act_layer=act_layer, se_channels=144),
+            # 11: bneck k=5, in=96, exp=576, out=96, SE, RE, stride=1
+            InvertedResidual(96, 576, 96, kernel_size=5, stride=1, use_se=True, act_layer=act_layer, se_channels=144),
+            # 12: Conv 96 -> 576, k=1, stride 1 (c12)
+            Conv2dNormActivation(96, 576, kernel_size=1, stride=1, activation_layer=act_layer),
+        )
+
+        self._init_weights()
+
+    def _init_weights(self):
+        for m in self.modules():
+            if isinstance(m, nn.Conv2d):
+                nn.init.kaiming_normal_(m.weight, mode="fan_out")
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
+            elif isinstance(m, (nn.BatchNorm2d, nn.GroupNorm)):
+                nn.init.ones_(m.weight)
+                nn.init.zeros_(m.bias)
+
+    def forward(self, x: torch.Tensor) -> Dict[str, torch.Tensor]:
+        if self.norm is not None:
+            x = self.norm(x)
+
+        feats: Dict[str, torch.Tensor] = {}
+        for idx, layer in enumerate(self.features):
+            x = layer(x)
+            if idx in self.return_nodes:
+                feats[self.return_nodes[idx]] = x
+        return feats

@@ -15,10 +15,12 @@ custom_imports:
 model:
   type: "HandDigitMobileNetV3Detector"
   num_classes: 10
-  dim: 64
-  head_type: "MobileNetDetectionHead"   # Sử dụng DeformableHead
+  dim: 32
+  head_type: "DeformableHead"   # Sử dụng DeformableHead
+  backbone: "NormalBackbone"
+  neck: "PANet"
   num_heads: 4                  # 4 attention heads
-  num_points: 4                 # 4 điểm deformable sampling xung quanh mỗi query
+  num_points: 32                 # 4 điểm deformable sampling xung quanh mỗi query
 
 # 2. Dataset Configuration (LMDB Dataset & Pipeline)
 data:
@@ -98,6 +100,7 @@ hooks:
       - "head.output_proj"
       - "head.cls_head"
       - "head.box_head"
+      - "head.obj_head"
 
   - type: "CheckpointHook"
     interval: 1

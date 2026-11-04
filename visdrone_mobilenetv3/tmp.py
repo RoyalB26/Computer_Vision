@@ -8,97 +8,169 @@ import torch.nn.functional as F
 from typing import Any, Dict, Optional, Union
 import torch
 from scipy.ndimage import distance_transform_edt
-
+from pathlib import Path
+import cv2
+import numpy as np
+from PIL import Image
+import torch
+from torchvision import transforms
 from collections import deque
 
-def find_islands_and_coastlines_gpu(x: torch.Tensor, connectivity: int = 8, coast_thickness: int = 1):
-    """
-    Chạy 100% trên GPU mà không chuyển dữ liệu về CPU.
-    Sử dụng Label Propagation và Multi-step GPU Max-Pooling.
-    
+class UnionFind:
+    def __init__(self, n: int):
+        self.parent = list(range(n))
+
+    def find(self, i: int) -> int:
+        if self.parent[i] == i:
+            return i
+        self.parent[i] = self.find(self.parent[i])
+        return self.parent[i]
+
+    def union(self, i: int, j: int):
+        root_i = self.find(i)
+        root_j = self.find(j)
+        if root_i != root_j:
+            self.parent[root_i] = root_j
+def find_islands_and_coastlines(
+    x: torch.Tensor,
+    connectivity: int = 8,
+    coast_thickness: int = 1,
+    min_box_size: int = 20,
+):
+    """Tìm tất cả các ốc đảo và vùng biển bao quanh, gộp các kết quả giao nhau,
+
+    đồng thời loại bỏ các box có chiều cao (h) hoặc chiều rộng (w) < min_box_size.
+
     Args:
-        x (torch.Tensor): Tensor 2D (H, W) trên CUDA/GPU.
-        connectivity (int): 4 hoặc 8 hướng liên thông.
-        coast_thickness (int): Bán kính pixel vùng biển bao quanh.
+        x (torch.Tensor): Tensor đầu vào kích thước (H, W).
+        connectivity (int): 4 hoặc 8.
+        coast_thickness (int): Độ dày (pixel) của vùng biển bao quanh.
+        min_box_size (int): Kích thước tối thiểu của h và w (mặc định 20).
     """
-    assert x.ndim == 2, "Tensor phải có dạng (H, W)"
-    device = x.device
+    assert x.ndim == 2, "Tensor đầu vào phải có shape (H, W)"
     H, W = x.shape
-    
-    # 1. Mặt đất và gán ID ban đầu cho từng pixel
-    land_mask = x > 0
-    if not land_mask.any():
+    device = x.device
+
+    # 1. Xác định mặt đất và biển
+    land_mask = (x > 0.1).cpu()
+    visited = torch.zeros_like(land_mask, dtype=torch.bool)
+
+    if connectivity == 8:
+        directions = [
+            (-1, 0),
+            (1, 0),
+            (0, -1),
+            (0, 1),
+            (-1, -1),
+            (-1, 1),
+            (1, -1),
+            (1, 1),
+        ]
+    else:
+        directions = [(-1, 0), (1, 0), (0, -1), (0, 1)]
+
+    raw_islands = []
+    k_size = 2 * coast_thickness + 1
+    kernel = torch.ones((1, 1, k_size, k_size), dtype=torch.float32)
+
+    # 2. Tìm từng đảo ban đầu
+    for r in range(H):
+        for c in range(W):
+            if land_mask[r, c] and not visited[r, c]:
+                current_island = torch.zeros((H, W), dtype=torch.bool)
+                queue = deque([(r, c)])
+                visited[r, c] = True
+                current_island[r, c] = True
+
+                while queue:
+                    curr_r, curr_c = queue.popleft()
+                    for dr, dc in directions:
+                        nr, nc = curr_r + dr, curr_c + dc
+                        if 0 <= nr < H and 0 <= nc < W:
+                            if land_mask[nr, nc] and not visited[nr, nc]:
+                                visited[nr, nc] = True
+                                current_island[nr, nc] = True
+                                queue.append((nr, nc))
+
+                # Dilation để tìm vùng biển
+                island_float = current_island.float().unsqueeze(0).unsqueeze(0)
+                dilated = (
+                    F.conv2d(island_float, kernel, padding=coast_thickness) > 0
+                ).squeeze(0, 1)
+                sea_boundary = dilated & (~land_mask)
+
+                combined = current_island | sea_boundary
+                pos = combined.nonzero(as_tuple=False)
+                ymin, ymax = pos[:, 0].min().item(), pos[:, 0].max().item() + 1
+                xmin, xmax = pos[:, 1].min().item(), pos[:, 1].max().item() + 1
+
+                raw_islands.append({
+                    "island_mask": current_island,
+                    "sea_mask": sea_boundary,
+                    "combined": combined,
+                    "bbox": (ymin, ymax, xmin, xmax),
+                })
+
+    n = len(raw_islands)
+    if n == 0:
         return []
 
-    # Mỗi pixel đất ban đầu có 1 ID duy nhất (tọa độ 1D: 1 -> H*W)
-    labels = torch.arange(1, H * W + 1, device=device, dtype=torch.int32).view(H, W)
-    labels = torch.where(land_mask, labels, torch.zeros_like(labels))
-    
-    # 2. GPU Connected Components bằng Label Propagation
-    # Cho các nhãn lớn nhất lan truyền sang hàng xóm cho đến khi hội tụ
-    kernel_size = 3
-    padding = 1
-    # Biến đổi labels về dạng float 4D để dùng MaxPool2d
-    labels_float = labels.float().unsqueeze(0).unsqueeze(0)
-    land_float = land_mask.float().unsqueeze(0).unsqueeze(0)
+    # 3. Gộp các đảo giao nhau bằng Union-Find
+    uf = UnionFind(n)
 
-    prev_labels = None
-    while True:
-        # Lan truyền nhãn theo 4 hoặc 8 hướng
-        if connectivity == 8:
-            propagated = F.max_pool2d(labels_float, kernel_size=kernel_size, stride=1, padding=padding)
-        else:
-            # Liên thông 4 hướng: Max theo chiều ngang và dọc riêng
-            h_pool = F.max_pool2d(labels_float, kernel_size=(1, 3), stride=1, padding=(0, 1))
-            v_pool = F.max_pool2d(labels_float, kernel_size=(3, 1), stride=1, padding=(1, 0))
-            propagated = torch.maximum(h_pool, v_pool)
-            
-        # Chỉ giữ nhãn trên mặt đất
-        labels_float = propagated * land_float
-        
-        # Kiểm tra hội tụ (khi không còn nhãn nào thay đổi)
-        if prev_labels is not None and torch.equal(labels_float, prev_labels):
-            break
-        prev_labels = labels_float.clone()
+    for i in range(n):
+        y1_min, y1_max, x1_min, x1_max = raw_islands[i]["bbox"]
+        for j in range(i + 1, n):
+            y2_min, y2_max, x2_min, x2_max = raw_islands[j]["bbox"]
 
-    unique_labels = torch.unique(labels_float.squeeze())
-    unique_labels = unique_labels[unique_labels > 0]  # Bỏ nền biển (nhãn 0)
+            if not (
+                y1_max > y2_min
+                and y2_max > y1_min
+                and x1_max > x2_min
+                and x2_max > x1_min
+            ):
+                continue
 
-    islands_data = []
+            if (raw_islands[i]["combined"] & raw_islands[j]["combined"]).any():
+                uf.union(i, j)
 
-    # 3. Mở rộng dải biển bằng Fast GPU Max-Pooling
-    # Bước nhảy: dùng lặp pool 3x3 (mỗi lần nở 1 pixel)
-    for label_val in unique_labels:
-        island_mask = (labels_float == label_val)  # Shape (1, 1, H, W)
-        
-        # Dilation lặp N lần trên GPU cực nhanh
-        dilated = island_mask.float()
-        remaining = coast_thickness
-        while remaining > 0:
-            step = min(remaining, 15)  # Nhảy tối đa 15 pixel mỗi kernel để tối ưu CUDA core
-            k = 2 * step + 1
-            dilated = F.max_pool2d(dilated, kernel_size=k, stride=1, padding=step)
-            remaining -= step
-            
-        dilated = dilated.squeeze(0).squeeze(0) > 0
-        island_2d = island_mask.squeeze(0).squeeze(0)
-        
-        # Biển bao quanh = Vùng giãn nở VÀ Là biển gốc
-        sea_boundary = dilated & (~land_mask)
-        
-        # Bounding box
-        combined = island_2d | sea_boundary
+    # 4. Gom nhóm và lọc kích thước h, w >= min_box_size
+    groups = {}
+    for idx in range(n):
+        root = uf.find(idx)
+        groups.setdefault(root, []).append(idx)
+
+    merged_results = []
+    for member_indices in groups.values():
+        merged_island = torch.zeros((H, W), dtype=torch.bool)
+        merged_sea = torch.zeros((H, W), dtype=torch.bool)
+
+        for idx in member_indices:
+            merged_island |= raw_islands[idx]["island_mask"]
+            merged_sea |= raw_islands[idx]["sea_mask"]
+
+        merged_sea = merged_sea & (~merged_island)
+
+        # Tính toán bounding box
+        combined = merged_island | merged_sea
         pos = combined.nonzero(as_tuple=False)
         ymin, ymax = pos[:, 0].min().item(), pos[:, 0].max().item() + 1
         xmin, xmax = pos[:, 1].min().item(), pos[:, 1].max().item() + 1
-        
-        islands_data.append({
-            'island_mask': island_2d,
-            'sea_mask': sea_boundary,
-            'bbox': (ymin, ymax, xmin, xmax)
+
+        box_h = ymax - ymin
+        box_w = xmax - xmin
+
+        # Lọc bỏ nếu h < 20 hoặc w < 20
+        if box_h < min_box_size or box_w < min_box_size:
+            continue
+
+        merged_results.append({
+            "island_mask": merged_island.to(device),
+            "sea_mask": merged_sea.to(device),
+            "bbox": (ymin, ymax, xmin, xmax),
         })
 
-    return islands_data
+    return merged_results
 
 class LocalStaticSquaredDeviationNorm(nn.Module):
 
@@ -395,6 +467,96 @@ def diffuse_islands_into_sea(x: torch.Tensor, coast_thickness: int = 1):
     
     return out
 
+from scipy.ndimage import binary_dilation, label
+import torch
+import numpy as np
+def find_islands_and_coastlines_optimized(
+    x: torch.Tensor,
+    connectivity: int = 8,
+    coast_thickness: int = 1,
+    min_box_size: int = 20,
+):
+    """Tìm tất cả các ốc đảo và vùng biển bao quanh, tự động gộp các cụm giao nhau
+
+    và lọc bỏ box có h < min_box_size hoặc w < min_box_size.
+
+    Độ phức tạp: O(H * W) - Không phụ thuộc số lượng đảo M^2.
+    """
+    assert x.ndim == 2, "Tensor đầu vào phải có shape (H, W)"
+    H, W = x.shape
+    device = x.device
+
+    # 1. Chuyển sang NumPy bool array để xử lý bằng SciPy C-engine
+    land = (x > 0.1).cpu().numpy()
+
+    # Cấu trúc liên thông (4 hoặc 8 hướng)
+    if connectivity == 4:
+        struct = np.array([[0, 1, 0], [1, 1, 1], [0, 1, 0]], dtype=bool)
+    else:
+        struct = np.ones((3, 3), dtype=bool)
+
+    # 2. DILATION TOÀN CỤC:
+    # Bất kỳ 2 đảo nào cách nhau <= 2 * coast_thickness sẽ tự động chạm vào nhau
+    # kernel hình vuông kích thước (2*coast_thickness + 1) tương đương iterations=coast_thickness với struct 8-hướng
+    dilated_land = binary_dilation(
+        land, structure=np.ones((3, 3), dtype=bool), iterations=coast_thickness
+    )
+
+    # 3. LABELING (Connected Components) trên vùng đã giãn nở:
+    # Mỗi cụm liên thông ở đây đại diện cho 1 nhóm đảo đã được gộp hoàn chỉnh!
+    # labeled_clusters, num_clusters = label(dilated_land, structure=struct)
+
+    labeled_clusters= dilated_land
+    num_clusters = len(dilated_land)
+    if num_clusters == 0:
+        return []
+
+    # 4. Tìm Bounding Box cho từng cụm bằng vectorization (O(H * W))
+    # Dùng np.where một lần duy nhất thay vì quét lặp
+    results = []
+
+    # Lấy tọa độ các pixel thuộc các cụm
+    cluster_ids = labeled_clusters[labeled_clusters > 0]
+    r_coords, c_coords = np.nonzero(labeled_clusters)
+
+    # Gom tọa độ min/max nhanh bằng cách sort theo label hoặc bincount
+    # Với số lượng cluster thông thường, duyệt trực tiếp slices từ find_objects là nhanh nhất:
+    from scipy.ndimage import find_objects
+
+    slices = find_objects(labeled_clusters)
+
+    for i, sl in enumerate(slices, start=1):
+        if sl is None:
+            continue
+
+        r_slice, c_slice = sl
+        ymin, ymax = r_slice.start, r_slice.stop
+        xmin, xmax = c_slice.start, c_slice.stop
+
+        box_h = ymax - ymin
+        box_w = xmax - xmin
+
+        # Lọc bỏ nếu h < min_box_size hoặc w < min_box_size
+        if box_h < min_box_size or box_w < min_box_size:
+            continue
+
+        # Cụm hiện tại
+        cluster_mask = labeled_clusters == i
+
+        # Đất liền thuộc cụm này
+        island_mask_np = cluster_mask & land
+
+        # Vùng biển = (vùng giãn nở của cụm) VÀ (không phải đất liền)
+        sea_mask_np = cluster_mask & (~land)
+
+        results.append({
+            "island_mask": torch.from_numpy(island_mask_np).to(device),
+            "sea_mask": torch.from_numpy(sea_mask_np).to(device),
+            "bbox": (ymin, ymax, xmin, xmax),
+        })
+
+    return results
+
 class ConvKernelDownsampleModule(nn.Module):
     """Module GPU thực hiện giảm kích thước ảnh bằng chuỗi n lớp Conv2d:
 
@@ -428,7 +590,8 @@ class ConvKernelDownsampleModule(nn.Module):
         # Đăng ký weight làm buffer (không tính gradient, tự động chuyển theo model sang GPU/CPU)
         self.register_buffer("conv_weight", weight)
 
-        self.norm = LocalStaticSquaredDeviationNorm(kernel_size= 151,per_channel= False)
+        # self.norm = LocalStaticSquaredDeviationNorm(kernel_size= 301, per_channel= False)
+        self.norm = StaticSquaredDeviationNorm(per_channel= False)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # x: [B, C, H, W]
@@ -446,7 +609,7 @@ class ConvKernelDownsampleModule(nn.Module):
         x = F.layer_norm(x, normalized_shape= [H,W])
         x = F.relu(x)
         # a = get_min_nonzero_bbox(x[0,0,150:300,400:550])
-        x= diffuse_islands_into_sea(x, coast_thickness= 15)
+        # x= expand_islands_batch_gpu(x, coast_thickness= 5)
             # Hiển thị minh họa: 2 = Đảo, 1 = Vùng biển bao quanh, 0 = Biển xa
             # visual = torch.zeros_like(sea_map, dtype=torch.float32)
             # visual[island['sea_mask']] = 1
@@ -454,9 +617,32 @@ class ConvKernelDownsampleModule(nn.Module):
             
             # print("Vùng quan sát đã crop:")
             # print(visual[ymin:ymax, xmin:xmax])
+        sea_map= x[0,0]
+
         plot_first_batch(x)
+        exit(0)
+        results= find_islands_and_coastlines_optimized(sea_map)
+        print(f"Số lượng ốc đảo tìm thấy: {len(results)}\n")
+    
+        for idx, island in enumerate(results):
+            ymin, ymax, xmin, xmax = island['bbox']
+            print(f"--- Ốc đảo {idx + 1} ---")
+            print(f"Bounding Box (H, W): [{ymin}:{ymax}, {xmin}:{xmax}]")
+            
+            # Hiển thị minh họa: 2 = Đảo, 1 = Vùng biển bao quanh, 0 = Biển xa
+            # visual = torch.zeros_like(sea_map, dtype=torch.int)
+            # visual[island['sea_mask']] = 1
+            # visual[island['island_mask']] = 2
+            
+            print("Vùng quan sát đã crop:")
+            # print(sea_map[ymin:ymax, xmin:xmax])
+            m = x[:,:,ymin:ymax, xmin:xmax]
+            # m = 1 - m
+            plot_first_batch(m)
+            print()
+        exit(0)
+        
         # print(x[:,:,150:300,400:550])
-        # exit(0)
         # Thực hiện các bước conv với kernel=3, stride=2, padding=1 hoàn toàn trên GPU
         cnt= 1
         target_h, target_w = self.target_size
@@ -470,10 +656,10 @@ class ConvKernelDownsampleModule(nn.Module):
                 groups=self.in_channels,
             )
             b,c,h,w= x.shape
-            if cnt % 2 == 0:
-                x = F.layer_norm(x, normalized_shape= [h,w])
-            x = F.relu(x)
-            cnt+= 1
+            # if cnt % 2 == 0:
+            #     x = F.layer_norm(x, normalized_shape= [h,w])
+            # x = F.relu(x)
+            # cnt+= 1
         # Căn chỉnh về đúng target_size mong muốn nếu còn chênh lệch
         
         if (x.shape[2], x.shape[3]) != (target_h, target_w):
@@ -486,10 +672,10 @@ class ConvKernelDownsampleModule(nn.Module):
         x = F.layer_norm(x, normalized_shape= [target_h,target_w])
 
         x = F.relu(x)
-        x = x * 100
-        x = 1 - x
+        x = x / torch.amax(x, dim=(2, 3), keepdim=True).clamp(min=1e-8)
         # print(x[:,:,89:178, 133:183])
         plot_first_batch(x)
+        
         # print(x[0,0])
         
         # print(x[0,0])
@@ -498,40 +684,56 @@ class ConvKernelDownsampleModule(nn.Module):
         # exit(0)
         return x
 
-def load_image_to_bchw_tensor(image_path: str | Path) -> torch.Tensor:
-    """Đọc ảnh từ đường dẫn và chuyển đổi sang PyTorch Tensor dạng [B, C, H, W].
+def load_image_with_clahe_to_bchw(
+    image_path: str | Path,
+    clip_limit: float = 2.0,
+    tile_grid_size: tuple[int, int] = (8, 8),
+    target_size: tuple[int, int] | None = None,
+    device: str | torch.device = "cpu",
+) -> torch.Tensor:
+    """Đọc ảnh, cân bằng histogram độ tương phản cục bộ (CLAHE) trên kênh L (LAB)
 
-    Args:
-        image_path (str | Path): Đường dẫn tới file ảnh.
-
-    Returns:
-        torch.Tensor: Tensor có shape (1, C, H, W), kiểu float32, dải giá trị
-        [0.0, 1.0].
+    và xuất ra BCHW Tensor.
     """
-    # 1. Đọc ảnh và chuyển sang RGB (đảm bảo C=3)
-    img = Image.open(image_path).convert("RGB")
-    img = img.resize((64, 64), Image.Resampling.BILINEAR)
-    # 2. Chuyển ảnh PIL (H, W, C) [0, 255] thành Tensor (C, H, W) [0.0, 1.0]
-    transform = transforms.ToTensor()
-    tensor_chw = transform(img)
+    path = Path(image_path)
+    if not path.is_file():
+        raise FileNotFoundError(f"Không tìm thấy file: {path.resolve()}")
 
-    # 3. Thêm chiều batch B=1 ở đầu -> [1, C, H, W]
-    tensor_bchw = tensor_chw.unsqueeze(0)
+    # Đọc bằng PIL để giữ chuẩn RGB
+    with Image.open(path) as raw_img:
+        img_rgb = np.array(raw_img.convert("RGB"))
 
-    return tensor_bchw
+    # Áp dụng CLAHE trên không gian màu LAB (tránh làm lệch màu)
+    lab = cv2.cvtColor(img_rgb, cv2.COLOR_RGB2LAB)
+    l, a, b = cv2.split(lab)
+
+    clahe = cv2.createCLAHE(clipLimit=clip_limit, tileGridSize=tile_grid_size)
+    l_equalized = clahe.apply(l)
+
+    lab_equalized = cv2.merge((l_equalized, a, b))
+    rgb_equalized = cv2.cvtColor(lab_equalized, cv2.COLOR_LAB2RGB)
+
+    img = Image.fromarray(rgb_equalized)
+
+    if target_size is not None:
+        img = img.resize(target_size, Image.Resampling.BILINEAR)
+
+    tensor_chw = transforms.ToTensor()(img)
+    return tensor_chw.unsqueeze(0).to(device=device, dtype=torch.float32)
 
 
 # --- Ví dụ sử dụng ---
-tensor = load_image_to_bchw_tensor(r"D:\apps\Datasets\COCO\dataset\images\000000016567.jpg")
+tensor = load_image_with_clahe_to_bchw(r"D:\apps\Datasets\VisDrone\dataset\images\0000239_05475_d_0000015.jpg")
+
 downsampler = ConvKernelDownsampleModule(
     in_channels=3,
     target_size=64,
     normalize_kernel=False,
 )
-# tensor = downsampler(tensor)
+tensor = downsampler(tensor)
 print(tensor.shape)  # torch.Size([1, 3, H, W])
 print(tensor.dtype)  # torch.float32
-plot_first_batch(tensor)
+# plot_first_batch(tensor)
 # sea_map = torch.zeros((10, 10))
 
 # # Đảo 1
