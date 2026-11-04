@@ -41,10 +41,6 @@ data:
           tile_grid_size: [8, 8]
           p: 1.0
         - type: "ToTensor"
-        - type: "StaticSquaredDeviationNorm"
-          per_channel: true
-          factor: 5.0
-          p: 1
     batch_size: 8
     shuffle: true
     num_workers: 4
@@ -66,10 +62,6 @@ data:
           tile_grid_size: [8, 8]
           p: 1.0
         - type: "ToTensor"
-        - type: "StaticSquaredDeviationNorm"
-          per_channel: true
-          factor: 5.0
-          p: 1
     batch_size: 8
     shuffle: false
     num_workers: 2
