@@ -54,7 +54,6 @@ class MobileNetV3Backbone(nn.Module):
         )
 
     def forward(self, x: torch.Tensor) -> Dict[str, torch.Tensor]:
-        x = self.norm(x) 
         return self.extractor(x)
 
 class StaticSquaredDeviationNorm(nn.Module):

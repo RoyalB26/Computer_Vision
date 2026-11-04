@@ -314,7 +314,7 @@ class VisdroneDetector(BaseModel):
     def predict(
         self,
         inputs: torch.Tensor,
-        conf_threshold: float = 0.25,
+        conf_threshold: float = 0.001,
         nms_threshold: float = 0.5,
         max_det: int = 100,
         **kwargs,

@@ -124,14 +124,29 @@ class CLAHE:
         tile_grid_size: Union[tuple, list] = (8, 8),
         p: float = 1.0,
     ):
-        import cv2
         self.clip_limit = float(clip_limit)
         self.tile_grid_size = tuple(tile_grid_size)
         self.p = float(p)
-        self.clahe = cv2.createCLAHE(
-            clipLimit=self.clip_limit,
-            tileGridSize=self.tile_grid_size,
-        )
+        self._clahe = None
+
+    @property
+    def clahe(self):
+        if self._clahe is None:
+            import cv2
+            self._clahe = cv2.createCLAHE(
+                clipLimit=self.clip_limit,
+                tileGridSize=self.tile_grid_size,
+            )
+        return self._clahe
+
+    def __getstate__(self):
+        state = self.__dict__.copy()
+        state["_clahe"] = None
+        return state
+
+    def __setstate__(self, state):
+        self.__dict__.update(state)
+        self._clahe = None
 
     def _apply_clahe_lab(self, img_rgb_u8: np.ndarray) -> np.ndarray:
         import cv2
