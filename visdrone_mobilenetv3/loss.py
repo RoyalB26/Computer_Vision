@@ -212,7 +212,11 @@ class MobileNetDetectionLoss(nn.Module):
         self.alpha = alpha
         self.num_ref_per_obj = num_ref_per_obj
         self.ref_repulsion_weight = ref_repulsion_weight
-        self.scale_ranges = scale_ranges or {"c3": (0.0, 0.25), "c5": (0.03, 1.0)}
+        self.scale_ranges = scale_ranges or {
+            "c3": (0.0, 0.20),
+            "c5": (0.03, 0.40),
+            "c12": (0.10, 1.0),
+        }
 
         # 3x3 Gaussian Kernel
         self.register_buffer(

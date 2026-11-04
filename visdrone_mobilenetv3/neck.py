@@ -63,7 +63,7 @@ class MobileNetFPN(nn.Module):
         in_channels: Dict[str, int],
         out_dim: int = 64,
         return_tuple: bool = True,
-        predict_levels: Tuple[str, ...] = ("c3", "c5"),
+        predict_levels: Tuple[str, ...] = ("c3", "c5", "c12"),
     ):
         super().__init__()
         self.out_dim = out_dim
@@ -80,6 +80,7 @@ class MobileNetFPN(nn.Module):
         # Smooth Convolutions
         self.smooth_pred = build_conv_bn_relu(out_dim, out_dim, kernel_size=3, padding=1)
         self.smooth_pred_c5 = build_conv_bn_relu(out_dim, out_dim, kernel_size=3, padding=1)
+        self.smooth_pred_c12 = build_conv_bn_relu(out_dim, out_dim, kernel_size=3, padding=1)
         self.smooth_deform = build_depthwise_separable_conv(out_dim, out_dim, kernel_size=3, padding=1)
 
     def forward(
@@ -100,14 +101,20 @@ class MobileNetFPN(nn.Module):
 
         map_pred_c3 = self.smooth_pred(p3)        # [B, out_dim, H//8, W//8] (Stride 8)
         map_pred_c5 = self.smooth_pred_c5(p4)     # [B, out_dim, H//16, W//16] (Stride 16)
+        map_pred_c12 = self.smooth_pred_c12(p5)   # [B, out_dim, H//32, W//32] (Stride 32)
         feat_deform = self.smooth_deform(p1)      # [B, out_dim, H//2, W//2] (Stride 2)
 
-        if "c5" in self.predict_levels and "c3" in self.predict_levels:
-            map_pred = {"c3": map_pred_c3, "c5": map_pred_c5}
-        elif "c5" in self.predict_levels:
-            map_pred = map_pred_c5
+        all_maps = {
+            "c3": map_pred_c3,
+            "c5": map_pred_c5,
+            "c12": map_pred_c12,
+        }
+        if len(self.predict_levels) > 1:
+            map_pred = {k: all_maps[k] for k in self.predict_levels if k in all_maps}
+        elif len(self.predict_levels) == 1:
+            map_pred = all_maps.get(self.predict_levels[0], map_pred_c3)
         else:
-            map_pred = map_pred_c3
+            map_pred = all_maps
 
         if self.return_tuple:
             return map_pred, feat_deform
@@ -146,7 +153,7 @@ class MobileNetPANet(nn.Module):
         out_dim: int = 64,
         return_tuple: bool = True,
         fusion_type: str = "concat",  # "concat" hoặc "add"
-        predict_levels: Tuple[str, ...] = ("c3", "c5"),
+        predict_levels: Tuple[str, ...] = ("c3", "c5", "c12"),
     ):
         super().__init__()
         self.out_dim = out_dim
@@ -238,14 +245,20 @@ class MobileNetPANet(nn.Module):
 
         map_pred_c3 = n3      # [B, out_dim, H//8, W//8] (Feature map Stride 8)
         map_pred_c5 = n4      # [B, out_dim, H//16, W//16] (Feature map Stride 16)
+        map_pred_c12 = n5     # [B, out_dim, H//32, W//32] (Feature map Stride 32)
         feat_deform = n1      # [B, out_dim, H//2, W//2] (Feature map độ phân giải cao Stride 2)
 
-        if "c5" in self.predict_levels and "c3" in self.predict_levels:
-            map_pred = {"c3": map_pred_c3, "c5": map_pred_c5}
-        elif "c5" in self.predict_levels:
-            map_pred = map_pred_c5
+        all_maps = {
+            "c3": map_pred_c3,
+            "c5": map_pred_c5,
+            "c12": map_pred_c12,
+        }
+        if len(self.predict_levels) > 1:
+            map_pred = {k: all_maps[k] for k in self.predict_levels if k in all_maps}
+        elif len(self.predict_levels) == 1:
+            map_pred = all_maps.get(self.predict_levels[0], map_pred_c3)
         else:
-            map_pred = map_pred_c3
+            map_pred = all_maps
 
         if self.return_tuple:
             return map_pred, feat_deform
