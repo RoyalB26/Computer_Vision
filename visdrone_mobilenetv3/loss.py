@@ -19,9 +19,9 @@ def compute_multi_ref_loss(
     repulsion_weight: float = 0.5,
 ) -> torch.Tensor:
     """
-    Tính toán Ref Loss đa điểm:
+    Tính toán Ref Loss đa điểm (Vector hóa 100% trên GPU - không đồng bộ CPU):
     1. Nhiều ref point có thể trỏ về cùng 1 object (mỗi object nhận K điểm mục tiêu phân tán trong box).
-    2. Các ref point trỏ về cùng 1 object phải có vị trí khác nhau (phạt repulsion nếu quá gần nhau).
+    2. Các ref point trỏ về cùng 1 object phải có vị trí khác nhau (scatter mask + phạt repulsion nếu quá gần nhau).
     3. Bao quát công bằng mọi object trong ảnh (mỗi object đều có quota K điểm, không bị dồn hết vào 1 object).
 
     Args:
@@ -46,136 +46,123 @@ def compute_multi_ref_loss(
     else:
         return torch.tensor(0.0, device=device)
 
-    total_pull_loss = torch.tensor(0.0, device=device)
-    total_rep_loss = torch.tensor(0.0, device=device)
-    total_matched_pts = 0
+    # 1. Gom toàn bộ GT boxes trong batch thành 1 tensor duy nhất (tránh boolean indexing lặp nhiều lần gây GPU-CPU sync)
+    boxes_list = []
+    labels_list = []
+    batch_idx_list = []
+
+    for b in range(batch_size):
+        target_dict = targets[b] if b < len(targets) else None
+        if not target_dict:
+            continue
+        gt_boxes = target_dict.get("boxes", None)
+        if gt_boxes is None or gt_boxes.shape[0] == 0:
+            continue
+
+        gt_boxes = gt_boxes.to(device)
+        if not target_dict.get("_is_cxcywh", False):
+            gt_boxes = torch.stack([
+                gt_boxes[:, 0] + gt_boxes[:, 2] / 2.0,
+                gt_boxes[:, 1] + gt_boxes[:, 3] / 2.0,
+                gt_boxes[:, 2],
+                gt_boxes[:, 3],
+            ], dim=-1)
+
+        boxes_list.append(gt_boxes)
+        gt_labels = target_dict.get("labels", None)
+        if gt_labels is not None:
+            labels_list.append(gt_labels.to(device))
+        batch_idx_list.append(torch.full((gt_boxes.shape[0],), b, device=device, dtype=torch.long))
+
+    if not boxes_list:
+        return ref_tensor.sum() * 0.0
+
+    all_boxes = torch.cat(boxes_list, dim=0)
+    batch_idx = torch.cat(batch_idx_list, dim=0)
+    total_m = all_boxes.shape[0]
+    if total_m == 0:
+        return ref_tensor.sum() * 0.0
+
+    dtype = ref_flat.dtype
+    if len(labels_list) == len(boxes_list):
+        all_labels = torch.cat(labels_list, dim=0)
+        valid_f = ((all_labels >= 0) & (all_labels < num_classes)).to(dtype)  # [Total_M], tránh boolean indexing gây GPU-CPU sync
+    else:
+        valid_f = torch.ones(total_m, device=device, dtype=dtype)
 
     # Phân bố các điểm mục tiêu bên trong bounding box
     if num_ref_per_obj == 1:
-        rel_offsets = torch.tensor([[0.0, 0.0]], device=device)
+        rel_offsets = torch.tensor([[0.0, 0.0]], device=device, dtype=dtype)
     elif num_ref_per_obj == 4:
-        # 4 góc phần tư bên trong box
         rel_offsets = torch.tensor([
             [-0.25, -0.25],
             [0.25, -0.25],
             [-0.25, 0.25],
             [0.25, 0.25],
-        ], device=device)
+        ], device=device, dtype=dtype)
     elif num_ref_per_obj == 5:
-        # Tâm + 4 góc phần tư
         rel_offsets = torch.tensor([
             [0.0, 0.0],
             [-0.25, -0.25],
             [0.25, -0.25],
             [-0.25, 0.25],
             [0.25, 0.25],
-        ], device=device)
+        ], device=device, dtype=dtype)
     else:
-        thetas = torch.arange(num_ref_per_obj, device=device, dtype=torch.float32) * (2.0 * math.pi / num_ref_per_obj)
+        thetas = torch.arange(num_ref_per_obj, device=device, dtype=dtype) * (2.0 * math.pi / num_ref_per_obj)
         rel_offsets = torch.stack([thetas.cos() * 0.25, thetas.sin() * 0.25], dim=-1)
 
-    for b in range(batch_size):
-        target_dict = targets[b] if b < len(targets) else None
-        if not target_dict:
-            continue
+    cx = all_boxes[:, 0].clamp(0.0, 0.999)
+    cy = all_boxes[:, 1].clamp(0.0, 0.999)
+    w = all_boxes[:, 2].clamp(0.001, 1.0)
+    h = all_boxes[:, 3].clamp(0.001, 1.0)
 
-        gt_boxes = target_dict.get("boxes", torch.empty((0, 4), device=device))
-        gt_labels = target_dict.get("labels", torch.empty((0,), device=device, dtype=torch.long))
+    centers = torch.stack([cx, cy], dim=-1)  # [Total_M, 2]
+    wh = torch.stack([w, h], dim=-1)        # [Total_M, 2]
 
-        if len(gt_boxes) == 0:
-            continue
+    # Tạo K điểm mục tiêu khác nhau cho mỗi object: [Total_M, K, 2]
+    target_points = (centers.unsqueeze(1) + rel_offsets.unsqueeze(0) * wh.unsqueeze(1)).clamp(0.0, 1.0)
 
-        gt_boxes = gt_boxes.to(device)
-        gt_labels = gt_labels.to(device)
+    # Lấy tập ref tương ứng của từng ảnh cho mỗi object: [Total_M, N, 2]
+    obj_refs = ref_flat[batch_idx]
 
-        is_cxcywh = target_dict.get("_is_cxcywh", False)
-        if is_cxcywh:
-            cx = gt_boxes[:, 0].clamp(0.0, 0.999)
-            cy = gt_boxes[:, 1].clamp(0.0, 0.999)
-            w = gt_boxes[:, 2].clamp(0.001, 1.0)
-            h = gt_boxes[:, 3].clamp(0.001, 1.0)
-        else:
-            cx = (gt_boxes[:, 0] + gt_boxes[:, 2] / 2.0).clamp(0.0, 0.999)
-            cy = (gt_boxes[:, 1] + gt_boxes[:, 3] / 2.0).clamp(0.0, 0.999)
-            w = gt_boxes[:, 2].clamp(0.001, 1.0)
-            h = gt_boxes[:, 3].clamp(0.001, 1.0)
+    # 2. Matching 100% trên GPU trong no_grad (không dùng scipy/CPU, không dùng cdist p=1 chậm)
+    with torch.no_grad():
+        cost = (target_points.unsqueeze(2) - obj_refs.unsqueeze(1)).abs().sum(dim=-1)  # [Total_M, K, N]
+        chosen_indices = []
+        for k in range(num_ref_per_obj):
+            idx_k = cost[:, k, :].argmin(dim=-1)  # [Total_M]
+            chosen_indices.append(idx_k)
+            if k + 1 < num_ref_per_obj:
+                cost.scatter_(2, idx_k.view(-1, 1, 1).expand(-1, num_ref_per_obj, 1), float("inf"))
+        min_c = torch.stack(chosen_indices, dim=1)  # [Total_M, K]
 
-        valid_mask = (gt_labels >= 0) & (gt_labels < num_classes)
-        cx = cx[valid_mask]
-        cy = cy[valid_mask]
-        w = w[valid_mask]
-        h = h[valid_mask]
+    matched_refs = torch.gather(obj_refs, 1, min_c.unsqueeze(-1).expand(-1, -1, 2))  # [Total_M, K, 2]
 
-        num_gt = len(cx)
-        if num_gt == 0:
-            continue
+    # 3. Pull loss: Kéo các điểm ref về các vị trí đa dạng của object
+    pull_per_obj = F.smooth_l1_loss(matched_refs, target_points, beta=0.01, reduction="none").sum(dim=(1, 2))
+    total_pull_loss = (pull_per_obj * valid_f).sum()
 
-        centers = torch.stack([cx, cy], dim=-1)
-        wh = torch.stack([w, h], dim=-1)
-
-        # Tạo K điểm mục tiêu khác nhau cho mỗi object: [num_gt, num_ref_per_obj, 2]
-        target_points = (centers.unsqueeze(1) + rel_offsets.unsqueeze(0) * wh.unsqueeze(1)).clamp(0.0, 1.0)
-        targets_flat = target_points.view(-1, 2)
-        obj_ids = torch.arange(num_gt, device=device).unsqueeze(1).expand(num_gt, num_ref_per_obj).reshape(-1)
+    # 4. Diversity / Repulsion loss: Vector hóa toàn bộ cặp điểm cho tất cả object cùng lúc
+    if num_ref_per_obj > 1:
+        triu_i, triu_j = torch.triu_indices(num_ref_per_obj, num_ref_per_obj, offset=1, device=device)
+        pair_dists = torch.norm(matched_refs[:, triu_i] - matched_refs[:, triu_j], p=2, dim=-1)  # [Total_M, num_pairs]
         obj_scale = torch.sqrt(w * h)
-
-        b_refs = ref_flat[b]  # [N, 2]
-        cost_matrix = torch.cdist(targets_flat, b_refs, p=1)
-        cost_np = cost_matrix.detach().cpu().numpy()
-
-        try:
-            from scipy.optimize import linear_sum_assignment
-            r_ind, c_ind = linear_sum_assignment(cost_np)
-        except Exception:
-            r_ind, c_ind = [], []
-            cost_copy = cost_matrix.detach().clone()
-            for _ in range(len(targets_flat)):
-                min_idx = torch.argmin(cost_copy.view(-1))
-                r = (min_idx // cost_copy.shape[1]).item()
-                c = (min_idx % cost_copy.shape[1]).item()
-                r_ind.append(r)
-                c_ind.append(c)
-                cost_copy[r, :] = float("inf")
-                cost_copy[:, c] = float("inf")
-
-        matched_refs = b_refs[c_ind]
-        matched_targets = targets_flat[r_ind]
-        matched_obj_ids = obj_ids[r_ind]
-
-        # 1. Pull loss: Kéo các điểm ref về các vị trí đa dạng của object
-        pull_loss = F.smooth_l1_loss(matched_refs, matched_targets, beta=0.01, reduction="sum")
-        total_pull_loss += pull_loss
-        total_matched_pts += len(matched_refs)
-
-        # 2. Diversity / Repulsion loss: Ngăn ngừa các điểm ref của cùng 1 object trùng tọa độ nhau
-        if num_ref_per_obj > 1:
-            rep_loss_b = torch.tensor(0.0, device=device)
-            for m in range(num_gt):
-                mask_m = (matched_obj_ids == m)
-                refs_m = matched_refs[mask_m]
-                n_m = len(refs_m)
-                if n_m > 1:
-                    dists = torch.cdist(refs_m, refs_m, p=2)
-                    margin_m = torch.clamp(0.25 * obj_scale[m], min=0.02, max=0.15)
-                    triu_i, triu_j = torch.triu_indices(n_m, n_m, offset=1)
-                    pair_dists = dists[triu_i, triu_j]
-                    rep_penalties = F.relu(margin_m - pair_dists)
-                    rep_loss_b += rep_penalties.sum()
-            total_rep_loss += rep_loss_b
-
-    if torch.distributed.is_available() and torch.distributed.is_initialized():
-        pts_tensor = torch.tensor([total_matched_pts], dtype=torch.float32, device=device)
-        torch.distributed.all_reduce(pts_tensor, op=torch.distributed.ReduceOp.SUM)
-        world_size = torch.distributed.get_world_size()
-        norm_pts = max(float(pts_tensor.item()) / float(world_size), 1.0)
+        margins = torch.clamp(0.25 * obj_scale, min=0.02, max=0.15).unsqueeze(1)  # [Total_M, 1]
+        rep_per_obj = F.relu(margins - pair_dists).sum(dim=-1)
+        total_rep_loss = (rep_per_obj * valid_f).sum()
     else:
-        norm_pts = max(float(total_matched_pts), 1.0)
+        total_rep_loss = torch.tensor(0.0, device=device)
 
-    final_loss = (total_pull_loss + repulsion_weight * total_rep_loss) / norm_pts
-    return final_loss if total_matched_pts > 0 else (ref_tensor.sum() * 0.0)
+    norm_pts = (valid_f.sum() * num_ref_per_obj).clamp(min=1.0)
+    if torch.distributed.is_available() and torch.distributed.is_initialized():
+        torch.distributed.all_reduce(norm_pts, op=torch.distributed.ReduceOp.SUM)
+        norm_pts = (norm_pts / float(torch.distributed.get_world_size())).clamp(min=1.0)
+
+    return (total_pull_loss + repulsion_weight * total_rep_loss) / norm_pts
 
 
-@LOSSES.register_module(name="VMobileNetDetectionLoss")
+@LOSSES.register_module(name="MobileNetDetectionLoss")
 class MobileNetDetectionLoss(nn.Module):
     """
     Hàm mất mát gồm:
