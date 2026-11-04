@@ -58,7 +58,8 @@ class BaseTrainer:
         accumulate: int = 1,
     ):
         self.use_tqdm = use_tqdm
-        self.use_accelerate = use_accelerate
+        world_size_env = int(os.environ.get("WORLD_SIZE", "1"))
+        self.use_accelerate = use_accelerate or (world_size_env > 1)
         self.log_interval = log_interval
         self.accumulate = max(1, int(accumulate))
         self.accelerator = None
@@ -71,7 +72,10 @@ class BaseTrainer:
                     "Accelerate is not installed. To use --accelerate, please install it via:\n"
                     "  pip install accelerate"
                 )
-            ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=True)
+            ddp_kwargs = DistributedDataParallelKwargs(
+                find_unused_parameters=True,
+                gradient_as_bucket_view=False,
+            )
             self.accelerator = Accelerator(
                 split_batches=False,
                 kwargs_handlers=[ddp_kwargs],
@@ -82,7 +86,8 @@ class BaseTrainer:
             )
 
             self.val_loader = self.accelerator.prepare(val_loader) if val_loader is not None else None
-            self.lr_scheduler = self.accelerator.prepare(lr_scheduler) if lr_scheduler is not None else None
+            # Giữ nguyên lr_scheduler cho epoch-based stepping (tránh bị Accelerate nhân số bước với số GPU)
+            self.lr_scheduler = lr_scheduler
 
             if not self.accelerator.is_main_process:
                 self.logger = None
@@ -122,8 +127,24 @@ class BaseTrainer:
         else:
             self.scaler = None
 
-        os.makedirs(self.work_dir, exist_ok=True)
+        if self.is_main_process:
+            os.makedirs(self.work_dir, exist_ok=True)
         self._register_default_hooks()
+
+    @property
+    def is_main_process(self) -> bool:
+        """Check if current process is the main rank (Rank 0)."""
+        if self.use_accelerate and self.accelerator is not None:
+            return self.accelerator.is_main_process
+        if torch.distributed.is_available() and torch.distributed.is_initialized():
+            return torch.distributed.get_rank() == 0
+        return True
+
+    def unwrap_model(self) -> nn.Module:
+        """Unwrap model from DDP / Accelerate / DataParallel wrapper."""
+        if self.use_accelerate and self.accelerator is not None:
+            return self.accelerator.unwrap_model(self.model)
+        return getattr(self.model, "module", self.model)
 
     def _register_default_hooks(self) -> None:
         """Register essential hooks by default."""
@@ -171,7 +192,7 @@ class BaseTrainer:
         """The Master Template Method orchestrating the full training process."""
         if self.logger:
             num_train = len(self.train_loader.dataset) if hasattr(self.train_loader, "dataset") else len(self.train_loader)
-            num_val = len(self.val_loader.dataset) if (self.val_loader and hasattr(self.val_loader, "dataset")) else (len(self.val_loader) if self.val_loader else 0)
+            num_val = len(self.val_loader.dataset) if (val_loader := self.val_loader) and hasattr(val_loader, "dataset") else (len(self.val_loader) if self.val_loader else 0)
             self.logger.info(
                 f"Starting training on device: {self.device} | Total Epochs: {self.max_epochs} | "
                 f"Num Train Data: {num_train:,} | Num Val Data: {num_val:,}"
@@ -213,7 +234,8 @@ class BaseTrainer:
             self.train_loader.batch_sampler.sampler.set_epoch(self.epoch)
 
         loader = self.train_loader
-        if self.use_tqdm:
+        show_pbar = self.use_tqdm and self.is_main_process
+        if show_pbar:
             from tqdm import tqdm
             loader = tqdm(
                 self.train_loader,
@@ -229,7 +251,7 @@ class BaseTrainer:
             is_last_batch = (batch_idx + 1 == len(self.train_loader))
             outputs = self.train_step(batch, batch_idx, is_last_batch=is_last_batch)
 
-            if self.use_tqdm:
+            if show_pbar:
                 total_loss = outputs.get("loss", 0.0)
                 loss_val = total_loss.item() if hasattr(total_loss, "item") else float(total_loss)
                 loader.set_postfix({"loss": f"{loss_val:.4f}"})
@@ -259,7 +281,7 @@ class BaseTrainer:
     def train_step(self, batch: Any, batch_idx: int, is_last_batch: bool = False) -> Dict[str, Any]:
         """Single training step: forward, loss calculation, backward, and optimizer update.
 
-        Supports gradient accumulation via `self.accumulate`.
+        Supports gradient accumulation via `self.accumulate` and Multi-GPU DDP.
         """
         # Only zero gradients at the start of an accumulation window
         if batch_idx % self.accumulate == 0:
@@ -280,8 +302,15 @@ class BaseTrainer:
             else:
                 inputs, targets = batch, None
 
-            # Model Forward
-            if hasattr(self.model, "forward_train") and callable(self.model.forward_train):
+            # Model Forward (hỗ trợ cả Single-GPU và Multi-GPU DDP / DataParallel)
+            raw_model = self.unwrap_model()
+            if self.model is not raw_model:
+                # Khi bọc bởi DDP / DataParallel: bắt buộc gọi qua self.model(...) để kích hoạt DDP reducer hooks
+                if hasattr(raw_model, "forward_train"):
+                    outputs = self.model(inputs, targets)
+                else:
+                    outputs = self.model(inputs)
+            elif hasattr(self.model, "forward_train") and callable(self.model.forward_train):
                 outputs = self.model.forward_train(inputs, targets)
             else:
                 outputs = self.model(inputs)
@@ -359,7 +388,8 @@ class BaseTrainer:
         val_samples = 0
 
         loader = self.val_loader
-        if self.use_tqdm:
+        show_pbar = self.use_tqdm and self.is_main_process
+        if show_pbar:
             from tqdm import tqdm
             loader = tqdm(
                 self.val_loader,
@@ -385,11 +415,23 @@ class BaseTrainer:
 
                 self.call_hook("after_val_iter", batch_idx=batch_idx, outputs=outputs)
 
+        # Đồng bộ val_losses và val_samples qua các GPU trong chế độ Multi-GPU
+        if torch.distributed.is_available() and torch.distributed.is_initialized():
+            samples_t = torch.tensor([val_samples], dtype=torch.float64, device=self.device)
+            torch.distributed.all_reduce(samples_t, op=torch.distributed.ReduceOp.SUM)
+            total_val_samples = int(samples_t.item())
+            for k in list(val_losses.keys()):
+                loss_t = torch.tensor([val_losses[k]], dtype=torch.float64, device=self.device)
+                torch.distributed.all_reduce(loss_t, op=torch.distributed.ReduceOp.SUM)
+                val_losses[k] = loss_t.item()
+        else:
+            total_val_samples = val_samples
+
         # Average losses
         metrics_summary = {}
-        if val_samples > 0:
+        if total_val_samples > 0:
             for k, v in val_losses.items():
-                metrics_summary[k] = v / val_samples
+                metrics_summary[k] = v / total_val_samples
 
         # Compute evaluation metrics
         for name, metric in self.metrics.items():
@@ -418,11 +460,12 @@ class BaseTrainer:
             else:
                 inputs, targets = batch, None
 
-            if hasattr(self.model, "forward_val") and callable(self.model.forward_val):
-                outputs = self.model.forward_val(inputs, targets)
+            raw_model = self.unwrap_model()
+            if hasattr(raw_model, "forward_val") and callable(raw_model.forward_val):
+                outputs = raw_model.forward_val(inputs, targets)
             else:
                 preds = self.model(inputs)
-                outputs = {"preds": preds}
+                outputs = preds if isinstance(preds, dict) and "preds" in preds else {"preds": preds}
 
             # If model didn't calculate loss internally, compute it via trainer.loss_fn
             if "loss" not in outputs and self.loss_fn is not None and targets is not None:
@@ -439,9 +482,11 @@ class BaseTrainer:
         return outputs
 
     def save_checkpoint(self, path: str, meta: Optional[Dict[str, Any]] = None) -> None:
-        """Save training state checkpoint."""
-        # Unwrap model if Accelerate is used
-        raw_model = self.accelerator.unwrap_model(self.model) if self.use_accelerate else self.model
+        """Save training state checkpoint (only on main process in Multi-GPU)."""
+        if not self.is_main_process:
+            return
+
+        raw_model = self.unwrap_model()
 
         checkpoint = {
             "epoch": self.epoch,
@@ -470,7 +515,13 @@ class BaseTrainer:
             raise FileNotFoundError(f"Checkpoint not found at '{checkpoint_path}'")
 
         checkpoint = torch.load(checkpoint_path, map_location=self.device)
-        self.model.load_state_dict(checkpoint["state_dict"])
+        raw_state_dict = checkpoint.get("state_dict", checkpoint)
+        clean_state_dict = {
+            (k[7:] if k.startswith("module.") else k): v
+            for k, v in raw_state_dict.items()
+        }
+        raw_model = self.unwrap_model()
+        raw_model.load_state_dict(clean_state_dict)
 
         if "optimizer" in checkpoint and self.optimizer is not None:
             self.optimizer.load_state_dict(checkpoint["optimizer"])
@@ -502,8 +553,9 @@ class BaseTrainer:
             for k, v in raw_state_dict.items()
         }
 
-        # 2. So khớp với state_dict của mô hình hiện tại
-        model_dict = self.model.state_dict()
+        # 2. So khớp với state_dict của mô hình hiện tại (unwrapped)
+        raw_model = self.unwrap_model()
+        model_dict = raw_model.state_dict()
         matched_dict = {}
         skipped_mismatch = []
         skipped_missing = []
@@ -519,7 +571,7 @@ class BaseTrainer:
 
         # 3. Nạp trọng số trùng khớp
         model_dict.update(matched_dict)
-        self.model.load_state_dict(model_dict)
+        raw_model.load_state_dict(model_dict)
 
         # 4. Ghi log tường minh
         if self.logger:

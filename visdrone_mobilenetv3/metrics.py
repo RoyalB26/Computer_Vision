@@ -1,8 +1,9 @@
 """Evaluation Metrics for Object Detection: Mean Average Precision (mAP 50, 75, 50:95).
 
-Hỗ trợ tự động nhận diện cả 2 định dạng Box:
+Hỗ trợ tự động nhận diện cả 3 định dạng Box:
   1. cxcywh: [cx, cy, w, h] (normalized [0, 1] hoặc pixel)
-  2. xyxy:   [x1, y1, x2, y2]
+  2. xywh:   [x1, y1, w, h]
+  3. xyxy:   [x1, y1, x2, y2]
 """
 from typing import Any, Dict, List, Optional, Tuple, Union
 import numpy as np
@@ -22,6 +23,10 @@ def convert_to_xyxy(boxes: torch.Tensor, box_format: str = "auto") -> torch.Tens
 
     if box_format == "xyxy":
         return boxes
+
+    if box_format == "xywh":
+        x1, y1, w, h = boxes[:, 0], boxes[:, 1], boxes[:, 2], boxes[:, 3]
+        return torch.stack([x1, y1, x1 + w, y1 + h], dim=-1)
 
     if box_format == "cxcywh":
         cx, cy, w, h = boxes[:, 0], boxes[:, 1], boxes[:, 2], boxes[:, 3]
@@ -108,7 +113,9 @@ class VisDroneMAP(BaseMetric):
 
             # Chuẩn hóa về định dạng xyxy
             p_boxes_xyxy = convert_to_xyxy(p_boxes, self.box_format)
-            t_boxes_xyxy = convert_to_xyxy(t_boxes, self.box_format)
+            # Ground truth từ VisdroneDataset mặc định là [x1, y1, w, h] trừ khi đã chuyển sang cxcywh
+            t_format = "cxcywh" if t.get("_is_cxcywh", False) else ("xywh" if self.box_format == "cxcywh" else self.box_format)
+            t_boxes_xyxy = convert_to_xyxy(t_boxes, t_format)
 
             self.predictions.append({
                 "boxes": p_boxes_xyxy,
@@ -122,12 +129,28 @@ class VisDroneMAP(BaseMetric):
 
     def compute(self) -> Dict[str, float]:
         """Tính toán mAP_50, mAP_75 và mAP_50_95 chuẩn hóa trong khoảng [0, 1]."""
-        if len(self.predictions) == 0 or len(self.ground_truths) == 0:
+        # Đồng bộ hóa predictions và ground_truths từ tất cả các GPU khi chạy Multi-GPU (DDP)
+        is_dist = torch.distributed.is_available() and torch.distributed.is_initialized()
+        is_main = (not is_dist) or (torch.distributed.get_rank() == 0)
+
+        if is_dist and torch.distributed.get_world_size() > 1:
+            world_size = torch.distributed.get_world_size()
+            gathered_preds: List[Any] = [None for _ in range(world_size)]
+            gathered_gts: List[Any] = [None for _ in range(world_size)]
+            torch.distributed.all_gather_object(gathered_preds, self.predictions)
+            torch.distributed.all_gather_object(gathered_gts, self.ground_truths)
+            all_predictions = [item for sublist in gathered_preds if sublist for item in sublist]
+            all_ground_truths = [item for sublist in gathered_gts if sublist for item in sublist]
+        else:
+            all_predictions = self.predictions
+            all_ground_truths = self.ground_truths
+
+        if len(all_predictions) == 0 or len(all_ground_truths) == 0:
             return {"mAP_50": 0.0, "mAP_75": 0.0, "mAP_50_95": 0.0}
 
         # Xác định các class có xuất hiện trong ground truth
         all_gt_classes = set()
-        for gt in self.ground_truths:
+        for gt in all_ground_truths:
             all_gt_classes.update(gt["labels"].tolist())
 
         if self.num_classes is not None:
@@ -148,7 +171,7 @@ class VisDroneMAP(BaseMetric):
         # Lưu AP chi tiết của từng class ở ngưỡng IoU 0.50 (thang [0, 1])
         per_class_ap50: Dict[int, float] = {}
 
-        num_imgs = min(len(self.predictions), len(self.ground_truths))
+        num_imgs = min(len(all_predictions), len(all_ground_truths))
 
         for c in class_list:
             total_gt = 0
@@ -158,13 +181,13 @@ class VisDroneMAP(BaseMetric):
 
             # Tính ma trận IoU và matching theo từng ảnh (1 lần box_iou duy nhất/ảnh)
             for img_idx in range(num_imgs):
-                gt = self.ground_truths[img_idx]
+                gt = all_ground_truths[img_idx]
                 gt_mask = gt["labels"] == c
                 gt_boxes = gt["boxes"][gt_mask]
                 num_g = len(gt_boxes)
                 total_gt += num_g
 
-                p = self.predictions[img_idx]
+                p = all_predictions[img_idx]
                 p_mask = p["labels"] == c
                 if not p_mask.any():
                     continue
@@ -237,15 +260,16 @@ class VisDroneMAP(BaseMetric):
                 if th == 0.50:
                     per_class_ap50[c] = round(ap, 4)
 
-        # In bảng thống kê chi tiết khả năng nhận diện từng class ra terminal (thang 0 - 1)
-        print("\n" + "=" * 62)
-        print(f"{'Class ID':<10} {'Class Name':<28} {'AP@50 (0-1)':<15}")
-        print("-" * 62)
-        for c in range(self.num_classes):
-            c_name = self.class_names[c] if c < len(self.class_names) else f"class_{c}"
-            ap_val = per_class_ap50.get(c, 0.0)
-            print(f"{c:<10} {c_name:<28} {ap_val:<15.4f}")
-        print("=" * 62 + "\n")
+        # In bảng thống kê chi tiết khả năng nhận diện từng class ra terminal (chỉ trên main process)
+        if is_main:
+            print("\n" + "=" * 62)
+            print(f"{'Class ID':<10} {'Class Name':<28} {'AP@50 (0-1)':<15}")
+            print("-" * 62)
+            for c in range(self.num_classes):
+                c_name = self.class_names[c] if c < len(self.class_names) else f"class_{c}"
+                ap_val = per_class_ap50.get(c, 0.0)
+                print(f"{c:<10} {c_name:<28} {ap_val:<15.4f}")
+            print("=" * 62 + "\n")
 
         # Tính mean AP chuẩn hóa trong khoảng [0, 1]
         map_per_thresh: Dict[float, float] = {}

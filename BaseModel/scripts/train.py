@@ -46,26 +46,34 @@ def main():
     device = get_device(device_name)
     seed = args.seed if args.seed is not None else getattr(cfg, "seed", 42)
 
-    os.makedirs(work_dir, exist_ok=True)
+    is_main_process = int(os.environ.get("RANK", os.environ.get("LOCAL_RANK", "0"))) == 0
 
-    # Dump the final configuration to work_dir for record and reproducibility
-    cfg.dump(os.path.join(work_dir, "config_archived.yaml"))
+    if is_main_process:
+        os.makedirs(work_dir, exist_ok=True)
+        # Dump the final configuration to work_dir for record and reproducibility
+        cfg.dump(os.path.join(work_dir, "config_archived.yaml"))
 
-    # 3. Setup Logger
-    logger = get_logger(name="BaseModel.Train", log_file=os.path.join(work_dir, "train.log"))
-    logger.info(f"Loaded config from: {args.config}")
-    logger.info(f"Output directory: {work_dir}")
-    logger.info("=" * 60)
-    logger.info(f"EXPERIMENT CONFIGURATION:\n{cfg}")
-    logger.info("=" * 60)
+    # 3. Setup Logger (only main process writes to console and train.log)
+    logger = None
+    if is_main_process:
+        logger = get_logger(name="BaseModel.Train", log_file=os.path.join(work_dir, "train.log"))
+        logger.info(f"Loaded config from: {args.config}")
+        logger.info(f"Output directory: {work_dir}")
+        logger.info("=" * 60)
+        logger.info(f"EXPERIMENT CONFIGURATION:\n{cfg}")
+        logger.info("=" * 60)
+
+    def log_info(msg: str) -> None:
+        if logger is not None:
+            logger.info(msg)
 
     # 4. Set Seed
     deterministic = getattr(cfg, "deterministic", False)
     set_random_seed(seed=seed, deterministic=deterministic)
-    logger.info(f"Set random seed to {seed} (deterministic={deterministic})")
+    log_info(f"Set random seed to {seed} (deterministic={deterministic})")
 
     # 5. Build Model
-    logger.info("Building model...")
+    log_info("Building model...")
     model = build_model(cfg.model)
     if hasattr(model, "init_weights") and getattr(cfg, "init_weights", True):
         model.init_weights()
@@ -75,15 +83,15 @@ def main():
     trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     frozen_params = total_params - trainable_params
 
-    logger.info("=" * 60)
-    logger.info("MODEL PARAMETERS:")
-    logger.info(f"Total Parameters     : {total_params:,} ({total_params / 1e6:.2f} M)")
-    logger.info(f"Trainable Parameters : {trainable_params:,} ({trainable_params / 1e6:.2f} M)")
-    logger.info(f"Frozen Parameters    : {frozen_params:,} ({frozen_params / 1e6:.2f} M)")
-    logger.info("=" * 60)
+    log_info("=" * 60)
+    log_info("MODEL PARAMETERS:")
+    log_info(f"Total Parameters     : {total_params:,} ({total_params / 1e6:.2f} M)")
+    log_info(f"Trainable Parameters : {trainable_params:,} ({trainable_params / 1e6:.2f} M)")
+    log_info(f"Frozen Parameters    : {frozen_params:,} ({frozen_params / 1e6:.2f} M)")
+    log_info("=" * 60)
 
     # 6. Build Dataloaders
-    logger.info("Building dataloaders...")
+    log_info("Building dataloaders...")
     data_cfg = cfg.data
     train_loader = build_dataloader(
         dataset=data_cfg.train.dataset,
@@ -111,35 +119,35 @@ def main():
     num_train_data = len(train_loader.dataset) if hasattr(train_loader, "dataset") else len(train_loader)
     num_val_data = len(val_loader.dataset) if (val_loader and hasattr(val_loader, "dataset")) else (len(val_loader) if val_loader else 0)
 
-    logger.info("=" * 60)
-    logger.info("DATASET STATISTICS:")
-    logger.info(f"Num Train Data       : {num_train_data:,} samples ({len(train_loader)} batches)")
+    log_info("=" * 60)
+    log_info("DATASET STATISTICS:")
+    log_info(f"Num Train Data       : {num_train_data:,} samples ({len(train_loader)} batches)")
     if val_loader:
-        logger.info(f"Num Val Data         : {num_val_data:,} samples ({len(val_loader)} batches)")
+        log_info(f"Num Val Data         : {num_val_data:,} samples ({len(val_loader)} batches)")
     else:
-        logger.info("Num Val Data         : 0 samples (No validation set configured)")
-    logger.info("=" * 60)
+        log_info("Num Val Data         : 0 samples (No validation set configured)")
+    log_info("=" * 60)
 
     # 7. Build Optimizer
-    logger.info("Building optimizer...")
+    log_info("Building optimizer...")
     optimizer = build_from_cfg(cfg.optimizer, OPTIMIZERS, default_args={"params": model.parameters()})
 
     # 8. Build Learning Rate Scheduler (optional)
     lr_scheduler = None
     if "lr_scheduler" in cfg:
-        logger.info("Building learning rate scheduler...")
+        log_info("Building learning rate scheduler...")
         lr_scheduler = build_from_cfg(cfg.lr_scheduler, SCHEDULERS, default_args={"optimizer": optimizer})
 
     # 9. Build Loss Function (optional, if computed separately outside the model)
     loss_fn = None
     if "loss" in cfg:
-        logger.info("Building loss function...")
+        log_info("Building loss function...")
         loss_fn = build_loss(cfg.loss)
 
     # 10. Build Evaluation Metrics (optional)
     metrics: Dict[str, Any] = {}
     if "metrics" in cfg:
-        logger.info("Building evaluation metrics...")
+        log_info("Building evaluation metrics...")
         for name, metric_cfg in cfg.metrics.items():
             metrics[name] = build_metric(metric_cfg)
 
@@ -179,12 +187,12 @@ def main():
 
     # 12. Register TensorBoard & WandB hooks if requested
     use_tensorboard = args.tensorboard or getattr(cfg, "tensorboard", False)
-    if use_tensorboard:
+    if use_tensorboard and trainer.is_main_process:
         from BaseModel.core.hooks import TensorboardHook
         trainer.register_hook(TensorboardHook())
 
     use_wandb = args.wandb or getattr(cfg, "wandb", False)
-    if use_wandb:
+    if use_wandb and trainer.is_main_process:
         from BaseModel.core.hooks import WandbHook
         project_name = getattr(cfg, "project_name", "BaseModel_CV")
         trainer.register_hook(WandbHook(project=project_name, config=cfg.to_dict()))
@@ -201,7 +209,7 @@ def main():
             hook_inst = build_from_cfg(hook_cfg, HOOKS)
             trainer.register_hook(hook_inst)
 
-    # 13. Resume from checkpoint if specified
+    # 14. Resume from checkpoint if specified
     resume_path = args.resume or getattr(cfg, "resume_from", None)
     finetune_path = getattr(args, "finetune", None) or getattr(cfg, "finetune_from", None)
     if resume_path:
@@ -209,14 +217,13 @@ def main():
     elif finetune_path:
         trainer.finetune(finetune_path)
 
-    # 14. Start Training or Eval Only
+    # 15. Start Training or Eval Only
     if args.eval_only:
-        logger.info("Executing evaluation only...")
+        log_info("Executing evaluation only...")
         val_metrics = trainer.val_epoch()
-        logger.info(f"Final Evaluation Metrics: {val_metrics}")
+        log_info(f"Final Evaluation Metrics: {val_metrics}")
     else:
         trainer.train()
-
 
 
 if __name__ == "__main__":

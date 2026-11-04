@@ -39,6 +39,9 @@ class CheckpointHook(BaseHook):
         self.saved_ckpts = []
 
     def after_epoch(self, trainer: "BaseTrainer") -> None:
+        if not getattr(trainer, "is_main_process", True):
+            return
+
         epoch = trainer.epoch
 
         # Save periodic checkpoint
@@ -59,6 +62,8 @@ class CheckpointHook(BaseHook):
         trainer.save_checkpoint(last_ckpt_path)
 
     def after_val(self, trainer: "BaseTrainer", val_metrics: Dict[str, float]) -> None:
+        if not getattr(trainer, "is_main_process", True):
+            return
         if self.save_best is None or self.save_best not in val_metrics:
             return
 

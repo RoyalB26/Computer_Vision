@@ -28,10 +28,12 @@ class BaseModel(nn.Module, ABC):
         self,
         inputs: Any,
         targets: Optional[Any] = None,
-        mode: str = "train",
+        mode: Optional[str] = None,
         **kwargs,
     ) -> Union[Dict[str, Any], torch.Tensor, Any]:
         """Unified entry point for forward passes across different execution modes."""
+        if mode is None:
+            mode = "train" if self.training else "val"
         if mode == "train":
             return self.forward_train(inputs, targets, **kwargs)
         elif mode == "val":
