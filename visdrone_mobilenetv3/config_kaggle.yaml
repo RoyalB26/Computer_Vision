@@ -1,0 +1,133 @@
+# Configuration for MobileNetV3 Hand Digit Object Detection with DeformableHead (Focal Loss + DIoU Loss)
+
+work_dir: "./work_dirs/visdrone_mobilenetv3"
+device: "cuda"  
+seed: 42
+
+custom_imports:
+  - "visdrone_mobilenetv3"
+  - "visdrone_mobilenetv3.model"
+  - "visdrone_mobilenetv3.metrics"
+  - "visdrone_mobilenetv3.dataset"
+  - "visdrone_mobilenetv3.transform"
+
+# 1. Model Configuration: Pure MobileNetV3 + FPN + DeformableHead
+model:
+  type: "VisdroneDetector"
+  num_classes: 10
+  dim: 32
+  head_type: "DeformableHead"   # Sử dụng DeformableHead
+  backbone: "MobileNetV3Backbone"
+  neck: "PANet"
+  num_heads: 4                  # 4 attention heads
+  num_points: 64                 # 64 điểm deformable sampling xung quanh mỗi query
+
+# 2. Dataset Configuration (LMDB Dataset & Pipeline)
+data:
+  train:
+    dataset:
+      type: "CustomLMDBDataset"
+      data_root: "/content/visdron.lmdb"
+      split: "train"
+      split_ratio: 0.8
+      num_classes: 10
+      task: "detection"
+      seed: 42
+      pipeline:
+        - type: "Resize"
+          size: [960, 960]
+        - type: "CLAHE"
+          clip_limit: 2.0
+          tile_grid_size: [8, 8]
+          p: 1.0
+        - type: "ToTensor"
+        - type: "StaticSquaredDeviationNorm"
+          per_channel: true
+          factor: 5.0
+          p: 1
+    batch_size: 8
+    shuffle: true
+    num_workers: 4
+
+  val:
+    dataset:
+      type: "CustomLMDBDataset"
+      data_root: "/content/visdron.lmdb"
+      split: "val"
+      split_ratio: 0.8
+      num_classes: 10
+      task: "detection"
+      seed: 42
+      pipeline:
+        - type: "Resize"
+          size: [960, 960]
+        - type: "CLAHE"
+          clip_limit: 2.0
+          tile_grid_size: [8, 8]
+          p: 1.0
+        - type: "ToTensor"
+        - type: "StaticSquaredDeviationNorm"
+          per_channel: true
+          factor: 5.0
+          p: 1
+    batch_size: 8
+    shuffle: false
+    num_workers: 2
+
+# 3. Optimizer Configuration
+optimizer:
+  type: "AdamW"
+  lr: 0.001
+  weight_decay: 0.0001
+
+# 4. Learning Rate Scheduler Configuration
+lr_scheduler:
+  type: "CosineAnnealingLR"
+  T_max: 100
+  eta_min: 0.00001
+
+# 5. Metrics Configuration: mAP Evaluation (mAP_50, mAP_75, mAP_50:95)
+metrics:
+  mAP:
+    type: "VisDroneMAP"
+    num_classes: 10
+    box_format: "cxcywh"
+
+
+# 6. Lifecycle Hooks & Tracking
+hooks:
+  - type: "ExcelTracker"
+    filename: "training_metrics.xlsx"
+    track_gradients: true
+    grad_interval: 1
+    track_detection: true
+    detection_interval: 5
+    auto_save: true
+    resume: true
+    submodules:
+      - "backbone"
+      - "neck"
+      - "head"
+      - "head.query_proj"
+      - "head.value_proj"
+      - "head.sampling_offsets"
+      - "head.attention_weights"
+      - "head.output_proj"
+      - "head.cls_head"
+      - "head.box_head"
+      - "head.obj_head"
+
+  - type: "CheckpointHook"
+    interval: 1
+    save_best: "mAP_50"
+    mode: "max"
+    max_keep_ckpts: 5
+    filename_tmpl: "epoch_{}.pth"
+
+# 7. Training Engine Configuration
+train_cfg:
+  max_epochs: 100
+  val_interval: 5
+  log_interval: 2500
+  grad_clip: 1.0
+  use_amp: false
