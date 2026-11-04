@@ -376,6 +376,10 @@ class YOLOv11SmallBackbone(nn.Module):
         # 11 tầng đầu tiên cấu thành toàn bộ Backbone của YOLOv11
         self.stages = nn.ModuleList(list(yolo_model.model.model[:11]))
 
+        # Mở khóa toàn bộ tham số (unfreeze) để cho phép huấn luyện (trainable)
+        for param in self.stages.parameters():
+            param.requires_grad = True
+
         if not pretrained:
             self._init_weights()
 
