@@ -861,7 +861,7 @@ if __name__ == "__main__":
     ).to(device)
 
     # # 1. Xử lý ảnh mẫu nếu file tồn tại
-    sample_img_path = r"D:\apps\Datasets\VisDrone\dataset\images\9999982_00000_d_0000074.jpg"
+    sample_img_path = r"D:\apps\Datasets\VisDrone\dataset\images\9999938_00000_d_0000278.jpg"
     if Path(sample_img_path).exists():
         tensor = load_image_with_clahe_to_bchw(sample_img_path, device=device)
         tensor = downsampler(tensor)

@@ -382,7 +382,7 @@ class VisdroneDetector(BaseModel):
         self,
         inputs: torch.Tensor,
         targets: Optional[List[Dict[str, torch.Tensor]]] = None,
-        conf_threshold: float = 0.25,
+        conf_threshold: float = 0.01,
         nms_threshold: float = 0.5,
         max_det: int = 300,
         **kwargs,
@@ -439,6 +439,19 @@ class VisdroneDetector(BaseModel):
                 loss_dict["loss"] = loss_dict["loss"] + self.obj_weight * obj_loss
 
             output.update(loss_dict)
+
+            # Chuẩn hóa target boxes sang định dạng [cx, cy, w, h] cho MeanAveragePrecision
+            for t in targets:
+                if "boxes" in t and len(t["boxes"]) > 0:
+                    if not t.get("_is_cxcywh", False):
+                        b = t["boxes"]
+                        t["boxes"] = torch.stack([
+                            b[:, 0] + b[:, 2] / 2.0,
+                            b[:, 1] + b[:, 3] / 2.0,
+                            b[:, 2],
+                            b[:, 3]
+                        ], dim=-1)
+                        t["_is_cxcywh"] = True
 
         preds = self._post_process(
             cls_logits=cls_logits,
