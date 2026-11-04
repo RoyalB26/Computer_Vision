@@ -8,6 +8,13 @@ import torch
 
 from BaseModel.core.registrar import TRANSFORMS
 
+# Tắt đa luồng nội bộ của OpenCV để tránh deadlock khi PyTorch DataLoader fork nhiều workers trên Linux
+cv2.setNumThreads(0)
+try:
+    cv2.ocl.setUseOpenCL(False)
+except Exception:
+    pass
+
 
 @TRANSFORMS.register_module(name=["CLAHE", "CLAHE_LAB"], force=True)
 class CLAHE:

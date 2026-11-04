@@ -85,20 +85,20 @@ def parse_csv(csv_path: str, delimiter: str = ",") -> List[Dict[str, str]]:
 # LMDB Helper Functions for users building custom LMDB-backed datasets
 # =========================================================================
 
-# Process-level cache to prevent opening the same LMDB environment twice in the same process
-_LMDB_ENV_CACHE: Dict[str, Any] = {}
+# Process-level cache keyed by (pid, abs_path) so forked DataLoader workers never share parent's LMDB env
+_LMDB_ENV_CACHE: Dict[Tuple[int, str], Any] = {}
 
 
 def open_lmdb(
     db_path: str,
     readonly: bool = True,
-    max_readers: int = 128,
+    max_readers: int = 256,
 ):
     """Safely open an LMDB environment and return (env, txn).
 
-    Caches the environment per process so that multiple datasets (e.g. train and val)
-    sharing the same LMDB database file in the same process do not encounter:
-    `lmdb.Error: The environment is already open in this process.`
+    Caches the environment per process PID so that:
+    1. Multiple datasets in the same process do not encounter `lmdb.Error: The environment is already open`.
+    2. Forked DataLoader worker processes on Linux each open their own independent LMDB environment.
 
     Args:
         db_path: Directory containing LMDB database files (`data.mdb`).
@@ -111,8 +111,9 @@ def open_lmdb(
         raise ImportError("The 'lmdb' package is required. Install it via: pip install lmdb")
 
     abs_path = os.path.abspath(db_path)
-    if abs_path not in _LMDB_ENV_CACHE:
-        _LMDB_ENV_CACHE[abs_path] = lmdb.open(
+    cache_key = (os.getpid(), abs_path)
+    if cache_key not in _LMDB_ENV_CACHE:
+        _LMDB_ENV_CACHE[cache_key] = lmdb.open(
             abs_path,
             max_readers=max_readers,
             readonly=readonly,
@@ -121,7 +122,7 @@ def open_lmdb(
             meminit=False,
         )
 
-    env = _LMDB_ENV_CACHE[abs_path]
+    env = _LMDB_ENV_CACHE[cache_key]
     txn = env.begin(write=not readonly)
     return env, txn
 

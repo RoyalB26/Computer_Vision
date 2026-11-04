@@ -29,6 +29,8 @@ class TensorboardHook(BaseHook):
         self.writer = None
 
     def before_train(self, trainer: "BaseTrainer") -> None:
+        if not getattr(trainer, "is_main_process", True):
+            return
         from torch.utils.tensorboard import SummaryWriter
 
         tb_dir = self.log_dir or os.path.join(trainer.work_dir, "tf_logs")

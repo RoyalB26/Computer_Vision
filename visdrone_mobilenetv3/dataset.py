@@ -1,4 +1,5 @@
 import io
+import os
 import pickle
 import random
 import torch
@@ -24,12 +25,13 @@ class CustomLMDBDataset(BaseDataset):
         self.seed = seed
         self.env = None
         self.txn = None
+        self._pid = None
         super().__init__(data_root=data_root, pipeline=pipeline, test_mode=test_mode)
 
     def load_annotations(self):
         # 1. Đọc tổng số mẫu trong file LMDB
         env, txn = open_lmdb(self.data_root, readonly=True)
-        total =  int(txn.get(b"__len__").decode("ascii"))
+        total = int(txn.get(b"__len__").decode("ascii"))
         # 2. Tạo danh sách index và xáo trộn đồng nhất bằng seed
         indices = list(range(total))
         rng = random.Random(self.seed)
@@ -46,8 +48,10 @@ class CustomLMDBDataset(BaseDataset):
         return [{"lmdb_idx": idx} for idx in selected_indices]
 
     def _init_db(self):
-        if self.env is None:
+        curr_pid = os.getpid()
+        if self.env is None or self.txn is None or self._pid != curr_pid:
             self.env, self.txn = open_lmdb(self.data_root, readonly=True)
+            self._pid = curr_pid
 
     def get_data_info(self, idx: int):
         self._init_db()
@@ -75,5 +79,5 @@ class CustomLMDBDataset(BaseDataset):
 
     def __getstate__(self):
         state = self.__dict__.copy()
-        state["env"], state["txn"] = None, None
+        state["env"], state["txn"], state["_pid"] = None, None, None
         return state

@@ -20,7 +20,7 @@ def compute_multi_ref_loss(
     scale_range: Optional[Tuple[float, float]] = None,
 ) -> torch.Tensor:
     """
-    Tính toán Ref Loss đa điểm (Vector hóa 100% trên GPU - không đồng bộ CPU):
+    Tính toán Ref Loss đa điểm (Vector hóa 100% trên GPU - không đồng bộ CPU, không dùng all_reduce gây deadlock):
     1. Nhiều ref point có thể trỏ về cùng 1 object (mỗi object nhận K điểm mục tiêu phân tán trong box).
     2. Các ref point trỏ về cùng 1 object phải có vị trí khác nhau (scatter mask + phạt repulsion nếu quá gần nhau).
     3. Bao quát công bằng mọi object trong ảnh (mỗi object đều có quota K điểm, không bị dồn hết vào 1 object).
@@ -37,7 +37,7 @@ def compute_multi_ref_loss(
         torch.Tensor: Scalar loss cho reference points.
     """
     if targets is None or ref_tensor is None:
-        return torch.tensor(0.0, device=device)
+        return ref_tensor.sum() * 0.0 if ref_tensor is not None else torch.tensor(0.0, device=device)
 
     batch_size = ref_tensor.shape[0]
     if ref_tensor.ndim == 4:
@@ -45,7 +45,7 @@ def compute_multi_ref_loss(
     elif ref_tensor.ndim == 3:
         ref_flat = ref_tensor
     else:
-        return torch.tensor(0.0, device=device)
+        return ref_tensor.sum() * 0.0
 
     # 1. Gom toàn bộ GT boxes trong batch thành 1 tensor duy nhất (tránh boolean indexing lặp nhiều lần gây GPU-CPU sync)
     boxes_list = []
@@ -167,14 +167,12 @@ def compute_multi_ref_loss(
         rep_per_obj = F.relu(margins - pair_dists).sum(dim=-1)
         total_rep_loss = (rep_per_obj * valid_f).sum()
     else:
-        total_rep_loss = torch.tensor(0.0, device=device)
+        total_rep_loss = ref_tensor.sum() * 0.0
 
+    # Chuẩn hóa cục bộ trên từng GPU (DDP sẽ tự động trung bình hóa gradient giữa các GPU khi backward,
+    # tuyệt đối không gọi all_reduce ở đây vì nếu 1 GPU có 0 object ở tầng c12 sẽ gây lệch pha all_reduce -> deadlock)
     norm_pts = (valid_f.sum() * num_ref_per_obj).clamp(min=1.0)
-    if torch.distributed.is_available() and torch.distributed.is_initialized():
-        torch.distributed.all_reduce(norm_pts, op=torch.distributed.ReduceOp.SUM)
-        norm_pts = (norm_pts / float(torch.distributed.get_world_size())).clamp(min=1.0)
-
-    return (total_pull_loss + repulsion_weight * total_rep_loss) / norm_pts
+    return (total_pull_loss + repulsion_weight * total_rep_loss) / norm_pts + (ref_tensor.sum() * 0.0)
 
 
 @LOSSES.register_module(name="MobileNetDetectionLoss")
@@ -243,8 +241,14 @@ class MobileNetDetectionLoss(nn.Module):
         if obj_logits is None and sampling_info is not None and "obj_logits" in sampling_info:
             obj_logits = sampling_info["obj_logits"]
 
-        total_box_loss = torch.tensor(0.0, device=device)
-        total_deform_in_box = torch.tensor(0.0, device=device)
+        # Khởi tạo 0.0 gắn với đồ thị tính toán của pred_boxes / sampling_info để DDP không bao giờ báo thiếu grad
+        total_box_loss = pred_boxes.sum() * 0.0
+        total_deform_in_box = cls_logits.sum() * 0.0
+        if sampling_info is not None:
+            if "sampling_locations" in sampling_info:
+                total_deform_in_box = total_deform_in_box + sampling_info["sampling_locations"].sum() * 0.0
+            if "attn_weights" in sampling_info:
+                total_deform_in_box = total_deform_in_box + sampling_info["attn_weights"].sum() * 0.0
         num_pos_total = 0
 
         # Khởi tạo center mask cho toàn bộ batch [B, num_classes, H, W]
@@ -318,7 +322,7 @@ class MobileNetDetectionLoss(nn.Module):
                         box_loss = torchvision.ops.distance_box_iou_loss(
                             p_xyxy, gt_xyxy, reduction="sum"
                         )
-                        total_box_loss += box_loss
+                        total_box_loss = total_box_loss + box_loss
 
                         # Ràng buộc Deformable In-Box Alignment (nếu có sampling_info)
                         if sampling_info is not None and "sampling_locations" in sampling_info and "attn_weights" in sampling_info:
@@ -339,7 +343,7 @@ class MobileNetDetectionLoss(nn.Module):
                             dy = F.relu(y1 - py) + F.relu(py - y2)
                             in_box_dist = dx + dy
                             weighted_dist = (in_box_dist * pos_w).sum(dim=(-2, -1))
-                            total_deform_in_box += weighted_dist.sum()
+                            total_deform_in_box = total_deform_in_box + weighted_dist.sum()
 
         # 1. Vectorized Gaussian Heatmap Target Generation
         k = self.gaussian_k.to(device=device, dtype=cls_logits.dtype)
@@ -387,6 +391,8 @@ class MobileNetDetectionLoss(nn.Module):
                 repulsion_weight=self.ref_repulsion_weight,
                 scale_range=scale_range,
             )
+        elif ref_tensor is not None:
+            total_ref_loss = ref_tensor.sum() * 0.0
         else:
             total_ref_loss = torch.tensor(0.0, device=device)
 
@@ -470,22 +476,14 @@ class MobileNetDetectionLoss(nn.Module):
 
         num_levels = max(len(results), 1)
         total_num_pos = sum(res["num_pos"] for res in results.values())
-
-        # Đồng bộ số lượng positive targets qua các GPU
-        if torch.distributed.is_available() and torch.distributed.is_initialized():
-            num_pos_tensor = torch.tensor([total_num_pos], dtype=torch.float32, device=device)
-            torch.distributed.all_reduce(num_pos_tensor, op=torch.distributed.ReduceOp.SUM)
-            world_size = torch.distributed.get_world_size()
-            norm_pos = max(float(num_pos_tensor.item()) / float(world_size), 1.0)
-        else:
-            norm_pos = max(float(total_num_pos), 1.0)
+        norm_pos = max(float(total_num_pos), 1.0)
 
         total_cls_loss = sum(res["cls_loss_unnorm"] for res in results.values()) / norm_pos
-        total_box_loss = sum(res["box_loss_unnorm"] for res in results.values()) / norm_pos if total_num_pos > 0 else torch.tensor(0.0, device=device)
+        total_box_loss = sum(res["box_loss_unnorm"] for res in results.values()) / norm_pos
         total_obj_loss = sum(res["obj_loss"] for res in results.values()) / num_levels
         total_ref_loss = sum(res["ref_loss"] for res in results.values()) / num_levels
 
-        total_deform_in_box = sum(res["total_deform_in_box_unnorm"] for res in results.values()) / norm_pos if total_num_pos > 0 else torch.tensor(0.0, device=device)
+        total_deform_in_box = sum(res["total_deform_in_box_unnorm"] for res in results.values()) / norm_pos
         total_deform_bound = sum(res["total_deform_bound"] for res in results.values()) / num_levels
         total_deform_reg = sum(res["total_deform_reg"] for res in results.values()) / num_levels
         loss_deform = 1.0 * total_deform_in_box + 0.2 * total_deform_bound + 0.01 * total_deform_reg
@@ -523,6 +521,6 @@ class MobileNetDetectionLoss(nn.Module):
         if num_levels > 1:
             for k, res in results.items():
                 out[f"loss_cls_{k}"] = (res["cls_loss_unnorm"] / norm_pos).detach()
-                out[f"loss_box_{k}"] = (res["box_loss_unnorm"] / norm_pos).detach() if total_num_pos > 0 else torch.tensor(0.0, device=device)
+                out[f"loss_box_{k}"] = (res["box_loss_unnorm"] / norm_pos).detach()
 
         return out
