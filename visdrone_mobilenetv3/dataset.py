@@ -6,6 +6,7 @@ import torch
 from PIL import Image
 from BaseModel.core import DATASETS
 from BaseModel.dataset import BaseDataset, open_lmdb
+from BaseModel.dataset.helpers import close_lmdb
 
 
 @DATASETS.register_module()
@@ -29,9 +30,13 @@ class CustomLMDBDataset(BaseDataset):
         super().__init__(data_root=data_root, pipeline=pipeline, test_mode=test_mode)
 
     def load_annotations(self):
-        # 1. Đọc tổng số mẫu trong file LMDB
+        # 1. Đọc tổng số mẫu trong file LMDB rồi đóng ngay env ở tiến trình chính
+        # để khi DataLoader fork() các worker trên Linux không bị lỗi "environment is already open"
         env, txn = open_lmdb(self.data_root, readonly=True)
         total = int(txn.get(b"__len__").decode("ascii"))
+        txn.abort()
+        close_lmdb(self.data_root)
+
         # 2. Tạo danh sách index và xáo trộn đồng nhất bằng seed
         indices = list(range(total))
         rng = random.Random(self.seed)

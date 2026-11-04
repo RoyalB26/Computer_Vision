@@ -7,6 +7,7 @@ from .builder import build_collate_fn, build_dataloader, build_dataset
 from .collate import DetectionCollate, PadCollate, SmartCollate
 from .helpers import (
     IMG_EXTENSIONS,
+    close_lmdb,
     create_lmdb,
     find_images,
     load_image,

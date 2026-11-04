@@ -85,8 +85,34 @@ def parse_csv(csv_path: str, delimiter: str = ",") -> List[Dict[str, str]]:
 # LMDB Helper Functions for users building custom LMDB-backed datasets
 # =========================================================================
 
-# Process-level cache keyed by (pid, abs_path) so forked DataLoader workers never share parent's LMDB env
-_LMDB_ENV_CACHE: Dict[Tuple[int, str], Any] = {}
+# Process-level cache to prevent opening the same LMDB environment twice in the same process
+_LMDB_ENV_CACHE: Dict[str, Tuple[int, Any]] = {}
+
+
+def close_lmdb(db_path: Optional[str] = None) -> None:
+    """Close cached LMDB environment(s) in the current process.
+
+    Closing the LMDB environment in the main process after reading metadata (like `__len__`)
+    ensures that forked DataLoader workers do not inherit an open C-level `MDB_env` handle.
+    """
+    if db_path is not None:
+        abs_path = os.path.abspath(db_path)
+        entry = _LMDB_ENV_CACHE.pop(abs_path, None)
+        if entry is not None:
+            _, env = entry
+            try:
+                env.close()
+            except Exception:
+                pass
+    else:
+        for abs_path in list(_LMDB_ENV_CACHE.keys()):
+            entry = _LMDB_ENV_CACHE.pop(abs_path, None)
+            if entry is not None:
+                _, env = entry
+                try:
+                    env.close()
+                except Exception:
+                    pass
 
 
 def open_lmdb(
@@ -96,9 +122,9 @@ def open_lmdb(
 ):
     """Safely open an LMDB environment and return (env, txn).
 
-    Caches the environment per process PID so that:
-    1. Multiple datasets in the same process do not encounter `lmdb.Error: The environment is already open`.
-    2. Forked DataLoader worker processes on Linux each open their own independent LMDB environment.
+    Caches the environment per process so that multiple datasets (e.g. train and val)
+    in the same process do not encounter `lmdb.Error: The environment is already open`,
+    while closing any stale environment inherited across `fork()` before re-opening.
 
     Args:
         db_path: Directory containing LMDB database files (`data.mdb`).
@@ -111,9 +137,20 @@ def open_lmdb(
         raise ImportError("The 'lmdb' package is required. Install it via: pip install lmdb")
 
     abs_path = os.path.abspath(db_path)
-    cache_key = (os.getpid(), abs_path)
-    if cache_key not in _LMDB_ENV_CACHE:
-        _LMDB_ENV_CACHE[cache_key] = lmdb.open(
+    curr_pid = os.getpid()
+
+    if abs_path in _LMDB_ENV_CACHE:
+        cached_pid, cached_env = _LMDB_ENV_CACHE[abs_path]
+        if cached_pid != curr_pid:
+            # Inherited across fork(): close C handle first so liblmdb allows opening a fresh env
+            try:
+                cached_env.close()
+            except Exception:
+                pass
+            _LMDB_ENV_CACHE.pop(abs_path, None)
+
+    if abs_path not in _LMDB_ENV_CACHE:
+        env = lmdb.open(
             abs_path,
             max_readers=max_readers,
             readonly=readonly,
@@ -121,8 +158,9 @@ def open_lmdb(
             readahead=False,
             meminit=False,
         )
+        _LMDB_ENV_CACHE[abs_path] = (curr_pid, env)
 
-    env = _LMDB_ENV_CACHE[cache_key]
+    _, env = _LMDB_ENV_CACHE[abs_path]
     txn = env.begin(write=not readonly)
     return env, txn
 
