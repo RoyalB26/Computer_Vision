@@ -21,7 +21,7 @@ model:
   backbone: "MobileNetV3Backbone"
   neck: "PANet"
   num_heads: 4                  # 4 attention heads
-  num_points: 64                 # 4 điểm deformable sampling xung quanh mỗi query
+  num_points: 64                 # 64 điểm deformable sampling xung quanh mỗi query
 
 # 2. Dataset Configuration (LMDB Dataset & Pipeline)
 data:
@@ -36,7 +36,11 @@ data:
       seed: 42
       pipeline:
         - type: "Resize"
-          size: [960,960]
+          size: [960, 960]
+        - type: "CLAHE"
+          clip_limit: 2.0
+          tile_grid_size: [8, 8]
+          p: 1.0
         - type: "ToTensor"
     batch_size: 16
     shuffle: true
@@ -53,7 +57,11 @@ data:
       seed: 42
       pipeline:
         - type: "Resize"
-          size: [960,960]
+          size: [960, 960]
+        - type: "CLAHE"
+          clip_limit: 2.0
+          tile_grid_size: [8, 8]
+          p: 1.0
         - type: "ToTensor"
     batch_size: 16
     shuffle: false
