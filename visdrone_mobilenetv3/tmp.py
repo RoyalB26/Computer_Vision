@@ -591,7 +591,7 @@ class ConvKernelDownsampleModule(nn.Module):
         self.register_buffer("conv_weight", weight)
 
         # self.norm = LocalStaticSquaredDeviationNorm(kernel_size= 301, per_channel= False)
-        self.norm = StaticSquaredDeviationNorm(per_channel= False)
+        self.norm = StaticSquaredDeviationNorm(per_channel= True)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # x: [B, C, H, W]
@@ -617,30 +617,30 @@ class ConvKernelDownsampleModule(nn.Module):
             
             # print("Vùng quan sát đã crop:")
             # print(visual[ymin:ymax, xmin:xmax])
-        sea_map= x[0,0]
+        # sea_map= x[0,0]
 
         plot_first_batch(x)
         exit(0)
-        results= find_islands_and_coastlines_optimized(sea_map)
-        print(f"Số lượng ốc đảo tìm thấy: {len(results)}\n")
+        # results= find_islands_and_coastlines_optimized(sea_map)
+        # print(f"Số lượng ốc đảo tìm thấy: {len(results)}\n")
     
-        for idx, island in enumerate(results):
-            ymin, ymax, xmin, xmax = island['bbox']
-            print(f"--- Ốc đảo {idx + 1} ---")
-            print(f"Bounding Box (H, W): [{ymin}:{ymax}, {xmin}:{xmax}]")
+        # for idx, island in enumerate(results):
+        #     ymin, ymax, xmin, xmax = island['bbox']
+        #     print(f"--- Ốc đảo {idx + 1} ---")
+        #     print(f"Bounding Box (H, W): [{ymin}:{ymax}, {xmin}:{xmax}]")
             
-            # Hiển thị minh họa: 2 = Đảo, 1 = Vùng biển bao quanh, 0 = Biển xa
-            # visual = torch.zeros_like(sea_map, dtype=torch.int)
-            # visual[island['sea_mask']] = 1
-            # visual[island['island_mask']] = 2
+        #     # Hiển thị minh họa: 2 = Đảo, 1 = Vùng biển bao quanh, 0 = Biển xa
+        #     # visual = torch.zeros_like(sea_map, dtype=torch.int)
+        #     # visual[island['sea_mask']] = 1
+        #     # visual[island['island_mask']] = 2
             
-            print("Vùng quan sát đã crop:")
-            # print(sea_map[ymin:ymax, xmin:xmax])
-            m = x[:,:,ymin:ymax, xmin:xmax]
-            # m = 1 - m
-            plot_first_batch(m)
-            print()
-        exit(0)
+        #     print("Vùng quan sát đã crop:")
+        #     # print(sea_map[ymin:ymax, xmin:xmax])
+        #     m = x[:,:,ymin:ymax, xmin:xmax]
+        #     # m = 1 - m
+        #     plot_first_batch(m)
+        #     print()
+        # exit(0)
         
         # print(x[:,:,150:300,400:550])
         # Thực hiện các bước conv với kernel=3, stride=2, padding=1 hoàn toàn trên GPU
@@ -673,15 +673,7 @@ class ConvKernelDownsampleModule(nn.Module):
 
         x = F.relu(x)
         x = x / torch.amax(x, dim=(2, 3), keepdim=True).clamp(min=1e-8)
-        # print(x[:,:,89:178, 133:183])
-        plot_first_batch(x)
-        
-        # print(x[0,0])
-        
-        # print(x[0,0])
-        # # print(x[0, 0, coord[0]:coord[0]+28, coord[1]:coord[1]+28])
-        
-        # exit(0)
+        # plot_first_batch(x)
         return x
 
 def load_image_with_clahe_to_bchw(
@@ -722,23 +714,172 @@ def load_image_with_clahe_to_bchw(
     return tensor_chw.unsqueeze(0).to(device=device, dtype=torch.float32)
 
 
+def process_frame(
+    frame_bgr: np.ndarray,
+    downsampler: nn.Module,
+    clip_limit: float = 2.0,
+    tile_grid_size: tuple[int, int] = (8, 8),
+    target_size: tuple[int, int] | None = None,
+    device: str | torch.device = "cpu",
+) -> np.ndarray:
+    """Xử lý từng frame hình ảnh/video qua CLAHE và ConvKernelDownsampleModule.
+
+    Trả về frame BGR để hiển thị hoặc ghi video.
+    """
+    img_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+
+    # 1. Cân bằng histogram CLAHE trên kênh L
+    lab = cv2.cvtColor(img_rgb, cv2.COLOR_RGB2LAB)
+    l, a, b = cv2.split(lab)
+    clahe = cv2.createCLAHE(clipLimit=clip_limit, tileGridSize=tile_grid_size)
+    l_equalized = clahe.apply(l)
+    lab_equalized = cv2.merge((l_equalized, a, b))
+    rgb_equalized = cv2.cvtColor(lab_equalized, cv2.COLOR_LAB2RGB)
+
+    # 2. Resize nếu có chỉ định target_size
+    if target_size is not None:
+        rgb_equalized = cv2.resize(rgb_equalized, target_size, interpolation=cv2.INTER_LINEAR)
+
+    # 3. Chuẩn hóa về [0, 1] và chuyển sang PyTorch Tensor [1, C, H, W]
+    tensor_chw = torch.from_numpy(rgb_equalized).permute(2, 0, 1).float() / 255.0
+    tensor_bchw = tensor_chw.unsqueeze(0).to(device=device, dtype=torch.float32)
+
+    # 4. Đưa qua downsampler module
+    with torch.no_grad():
+        out_tensor = downsampler(tensor_bchw)
+
+    # 5. Chuyển tensor kết quả trở lại dạng NumPy image (BGR) để hiển thị / lưu video
+    out_img = out_tensor[0].detach().cpu().permute(1, 2, 0).numpy()
+    if out_img.min() < 0 or out_img.max() > 1:
+        out_img = (out_img - out_img.min()) / (out_img.max() - out_img.min() + 1e-8)
+    out_img = (out_img * 255.0).clip(0, 255).astype(np.uint8)
+
+    # Chuyển RGB sang BGR cho OpenCV
+    out_bgr = cv2.cvtColor(out_img, cv2.COLOR_RGB2BGR)
+    return out_bgr
+
+
+def process_video(
+    video_source: Union[str, int, Path],
+    downsampler: nn.Module,
+    output_path: Optional[Union[str, Path]] = None,
+    clip_limit: float = 2.0,
+    tile_grid_size: tuple[int, int] = (8, 8),
+    target_size: Optional[tuple[int, int]] = None,
+    device: str | torch.device = "cpu",
+    show: bool = True,
+):
+    """Xử lý luồng video (từ file video hoặc webcam) qua downsampler module.
+
+    Args:
+        video_source: Đường dẫn tới file video (.mp4, .avi, ...) hoặc webcam index (0, 1).
+        downsampler: Module torch xử lý frame (e.g. ConvKernelDownsampleModule).
+        output_path: Đường dẫn file video xuất kết quả (tùy chọn).
+        clip_limit: Tham số clipLimit cho CLAHE.
+        tile_grid_size: Kích thước grid cho CLAHE.
+        target_size: Kích thước resize frame (w, h) trước khi xử lý (tùy chọn).
+        device: Thiết bị chạy ('cpu' hoặc 'cuda').
+        show: Cho phép hiển thị trực tiếp bằng cv2.imshow hay không.
+    """
+    cap = cv2.VideoCapture(str(video_source) if isinstance(video_source, Path) else video_source)
+    if not cap.isOpened():
+        raise RuntimeError(f"Không thể mở video source: {video_source}")
+
+    fps = cap.get(cv2.CAP_PROP_FPS)
+    if fps <= 0 or np.isnan(fps):
+        fps = 25.0
+
+    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    print(f"[INFO] Bắt đầu xử lý video: {video_source}")
+    print(f"[INFO] FPS: {fps:.2f}, Tổng số frame: {total_frames if total_frames > 0 else 'N/A'}")
+
+    writer = None
+    frame_idx = 0
+
+    try:
+        while True:
+            ret, frame = cap.read()
+            if not ret:
+                break
+
+            processed_frame = process_frame(
+                frame_bgr=frame,
+                downsampler=downsampler,
+                clip_limit=clip_limit,
+                tile_grid_size=tile_grid_size,
+                target_size=target_size,
+                device=device,
+            )
+
+            # Khởi tạo VideoWriter nếu cần lưu file
+            if output_path is not None and writer is None:
+                out_h, out_w = processed_frame.shape[:2]
+                fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+                writer = cv2.VideoWriter(str(output_path), fourcc, fps, (out_w, out_h))
+
+            if writer is not None:
+                writer.write(processed_frame)
+
+            frame_idx += 1
+            if frame_idx % 30 == 0:
+                print(f"[INFO] Đã xử lý {frame_idx} frames...")
+
+            if show:
+                try:
+                    cv2.imshow("Video Processing - Result", processed_frame)
+                    key = cv2.waitKey(1) & 0xFF
+                    if key in (27, ord("q")):
+                        print("[INFO] Người dùng dừng xử lý video.")
+                        break
+                except cv2.error as e:
+                    print(f"[WARN] OpenCV GUI không khả dụng ({e}). Tắt hiển thị `show=False`.")
+                    show = False
+
+    finally:
+        cap.release()
+        if writer is not None:
+            writer.release()
+            print(f"[INFO] Video kết quả đã được lưu tại: {output_path}")
+        if show:
+            try:
+                cv2.destroyAllWindows()
+            except cv2.error:
+                pass
+
+    print(f"[INFO] Hoàn thành xử lý {frame_idx} frames.")
+
+
 # --- Ví dụ sử dụng ---
-tensor = load_image_with_clahe_to_bchw(r"D:\apps\Datasets\VisDrone\dataset\images\0000239_05475_d_0000015.jpg")
+if __name__ == "__main__":
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    print(f"Sử dụng thiết bị: {device}")
 
-downsampler = ConvKernelDownsampleModule(
-    in_channels=3,
-    target_size=64,
-    normalize_kernel=False,
-)
-tensor = downsampler(tensor)
-print(tensor.shape)  # torch.Size([1, 3, H, W])
-print(tensor.dtype)  # torch.float32
-# plot_first_batch(tensor)
-# sea_map = torch.zeros((10, 10))
+    downsampler = ConvKernelDownsampleModule(
+        in_channels=3,
+        target_size=(64, 64),
+        normalize_kernel=False,
+    ).to(device)
 
-# # Đảo 1
-# sea_map[2:4, 2:4] = 5.0
+    # # 1. Xử lý ảnh mẫu nếu file tồn tại
+    sample_img_path = r"D:\apps\Datasets\VisDrone\dataset\images\0000277_00001_d_0000539.jpg"
+    if Path(sample_img_path).exists():
+        tensor = load_image_with_clahe_to_bchw(sample_img_path, device=device)
+        tensor = downsampler(tensor)
+        print("Tensor shape sau khi xử lý ảnh:", tensor.shape)
+        print("Tensor dtype:", tensor.dtype)
+    else:
+        print(f"[INFO] File ảnh mẫu không tồn tại: {sample_img_path}")
 
-# # Đảo 2
-# sea_map[7:9, 6:9] = 9.0
+    # 2. Xử lý video (file video hoặc webcam):
+    # Ví dụ với webcam:
+    # process_video(video_source=0, downsampler=downsampler, device=device, show=True)
+    #
+    # Ví dụ với file video:
+    # process_video(
+    #     video_source=r"D:\apps\Datasets\TACO\ap_Town02\variant_scenario\t5\187\187.mp4",
+    #     downsampler=downsampler,
+    #     output_path="output_processed.mp4",
+    #     device=device,
+    #     show=True,
+    # )
 

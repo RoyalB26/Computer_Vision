@@ -122,7 +122,7 @@ class VisdroneDetector(BaseModel):
 
     def compute_ref_loss(
         self,
-        ref: torch.Tensor,
+        ref: Union[torch.Tensor, Dict[str, torch.Tensor]],
         targets: Optional[List[Dict[str, torch.Tensor]]],
         device: torch.device,
     ) -> torch.Tensor:
@@ -132,6 +132,21 @@ class VisdroneDetector(BaseModel):
         - Có repulsion loss ngăn không cho các ref trùng tọa độ.
         - Bao quát toàn bộ các object trong ảnh theo hạn ngạch công bằng, không bị dồn cục vào 1 object.
         """
+        if isinstance(ref, dict):
+            losses = [
+                compute_multi_ref_loss(
+                    ref_tensor=v,
+                    targets=targets,
+                    device=device,
+                    num_classes=self.num_classes,
+                    num_ref_per_obj=getattr(self, "num_ref_per_obj", 4),
+                    repulsion_weight=getattr(self, "ref_repulsion_weight", 0.5),
+                    scale_range=getattr(self.loss_fn, "scale_ranges", {}).get(k, None),
+                )
+                for k, v in ref.items()
+            ]
+            return sum(losses) / max(len(losses), 1)
+
         return compute_multi_ref_loss(
             ref_tensor=ref,
             targets=targets,
@@ -143,7 +158,7 @@ class VisdroneDetector(BaseModel):
 
     def compute_obj_loss(
         self,
-        obj_logits: torch.Tensor,
+        obj_logits: Union[torch.Tensor, Dict[str, torch.Tensor]],
         targets: Optional[List[Dict[str, torch.Tensor]]],
         device: torch.device,
         pos_weight: float = 5.0,
@@ -152,7 +167,7 @@ class VisdroneDetector(BaseModel):
         Tính toán Objectness Loss (BCEWithLogitsLoss với pos_weight).
 
         Args:
-            obj_logits: Tensor [B, 1, H, W] chứa dự đoán objectness logits.
+            obj_logits: Tensor [B, 1, H, W] hoặc Dict chứa dự đoán objectness logits.
             targets: Danh sách target dicts chứa bounding boxes.
             device: Thiết bị torch.device.
             pos_weight: Trọng số phạt cho positive target (mặc định 5.0).
@@ -162,6 +177,13 @@ class VisdroneDetector(BaseModel):
         """
         if obj_logits is None or targets is None:
             return torch.tensor(0.0, device=device)
+
+        if isinstance(obj_logits, dict):
+            losses = [
+                self.compute_obj_loss(v, targets, device, pos_weight)
+                for v in obj_logits.values()
+            ]
+            return sum(losses) / max(len(losses), 1)
 
         batch_size, _, grid_h, grid_w = obj_logits.shape
         obj_target = torch.zeros((batch_size, 1, grid_h, grid_w), device=device, dtype=obj_logits.dtype)
@@ -250,58 +272,78 @@ class VisdroneDetector(BaseModel):
 
     def _post_process(
         self,
-        cls_logits: torch.Tensor,
-        pred_boxes: torch.Tensor,
-        obj_logits: Optional[torch.Tensor] = None,
+        cls_logits: Union[torch.Tensor, Dict[str, torch.Tensor]],
+        pred_boxes: Union[torch.Tensor, Dict[str, torch.Tensor]],
+        obj_logits: Optional[Union[torch.Tensor, Dict[str, torch.Tensor]]] = None,
         conf_threshold: float = 0.10,
         nms_threshold: float = 0.5,
         max_det: int = 100,
         max_candidates: int = 1000,
     ) -> List[Dict[str, torch.Tensor]]:
-        """Lọc peak cực đại cục bộ 3x3 và batched NMS."""
-        batch_size, num_classes, grid_h, grid_w = cls_logits.shape
-        cls_scores = cls_logits.sigmoid()
+        """Lọc peak cực đại cục bộ 3x3 và batched NMS cho multi-scale predictions (c3, c5)."""
+        if isinstance(cls_logits, torch.Tensor):
+            cls_dict = {"single": cls_logits}
+            boxes_dict = {"single": pred_boxes}
+            obj_dict = {"single": obj_logits} if obj_logits is not None else {}
+        else:
+            cls_dict = cls_logits
+            boxes_dict = pred_boxes
+            obj_dict = obj_logits if isinstance(obj_logits, dict) else {}
 
-        if obj_logits is not None:
-            obj_scores = obj_logits.sigmoid()
-            cls_scores = cls_scores * obj_scores
+        first_tensor = next(iter(cls_dict.values()))
+        batch_size = first_tensor.shape[0]
+        device = first_tensor.device
 
-        # CenterNet Local Peak Max-Pooling (3x3)
-        hmax = F.max_pool2d(cls_scores, kernel_size=3, stride=1, padding=1)
-        cls_scores = cls_scores * (cls_scores == hmax).float()
+        batch_candidates = [[] for _ in range(batch_size)]
 
-        device = cls_logits.device
+        for k in cls_dict.keys():
+            lvl_cls = cls_dict[k]
+            lvl_boxes = boxes_dict[k]
+            lvl_obj = obj_dict.get(k, None)
+
+            lvl_scores = lvl_cls.sigmoid()
+            if lvl_obj is not None:
+                lvl_scores = lvl_scores * lvl_obj.sigmoid()
+
+            # CenterNet Local Peak Max-Pooling (3x3) per level
+            hmax = F.max_pool2d(lvl_scores, kernel_size=3, stride=1, padding=1)
+            lvl_scores = lvl_scores * (lvl_scores == hmax).float()
+
+            for b in range(batch_size):
+                b_scores_map = lvl_scores[b]  # [C, H_k, W_k]
+                c_idx, y_idx, x_idx = torch.where(b_scores_map >= conf_threshold)
+
+                if len(c_idx) > 0:
+                    b_scores = b_scores_map[c_idx, y_idx, x_idx]
+                    b_labels = c_idx
+                    sample_boxes = lvl_boxes[b, :, y_idx, x_idx].permute(1, 0)
+                    batch_candidates[b].append((sample_boxes, b_scores, b_labels))
+
         results = []
-
         for b in range(batch_size):
-            b_scores_map = cls_scores[b]  # [C, H, W]
-            c_idx, y_idx, x_idx = torch.where(b_scores_map >= conf_threshold)
+            if len(batch_candidates[b]) > 0:
+                all_boxes = torch.cat([c[0] for c in batch_candidates[b]], dim=0)
+                all_scores = torch.cat([c[1] for c in batch_candidates[b]], dim=0)
+                all_labels = torch.cat([c[2] for c in batch_candidates[b]], dim=0)
 
-            if len(c_idx) > 0:
-                b_scores = b_scores_map[c_idx, y_idx, x_idx]
-                b_labels = c_idx
+                if len(all_scores) > max_candidates:
+                    topk_idx = torch.topk(all_scores, max_candidates).indices
+                    all_boxes = all_boxes[topk_idx]
+                    all_scores = all_scores[topk_idx]
+                    all_labels = all_labels[topk_idx]
 
-                if len(b_scores) > max_candidates:
-                    topk_idx = torch.topk(b_scores, max_candidates).indices
-                    b_scores = b_scores[topk_idx]
-                    b_labels = b_labels[topk_idx]
-                    y_idx = y_idx[topk_idx]
-                    x_idx = x_idx[topk_idx]
-
-                sample_boxes = pred_boxes[b, :, y_idx, x_idx].permute(1, 0)
-
-                if nms_threshold is not None and len(sample_boxes) > 0:
-                    xyxy = cxcywh_to_xyxy(sample_boxes)
-                    keep = torchvision.ops.batched_nms(xyxy, b_scores, b_labels, nms_threshold)
+                if nms_threshold is not None and len(all_boxes) > 0:
+                    xyxy = cxcywh_to_xyxy(all_boxes)
+                    keep = torchvision.ops.batched_nms(xyxy, all_scores, all_labels, nms_threshold)
                     keep = keep[:max_det]
-                    sample_boxes = sample_boxes[keep]
-                    b_scores = b_scores[keep]
-                    b_labels = b_labels[keep]
+                    all_boxes = all_boxes[keep]
+                    all_scores = all_scores[keep]
+                    all_labels = all_labels[keep]
 
                 results.append({
-                    "boxes": sample_boxes,
-                    "scores": b_scores,
-                    "labels": b_labels,
+                    "boxes": all_boxes,
+                    "scores": all_scores,
+                    "labels": all_labels,
                 })
             else:
                 results.append({
@@ -323,7 +365,7 @@ class VisdroneDetector(BaseModel):
         head_out = self.head(map_pred, feat_deform)
         cls_logits, pred_boxes = head_out[0], head_out[1]
         obj_logits = None
-        if len(head_out) >= 3 and isinstance(head_out[2], torch.Tensor) and head_out[2].ndim == 4 and head_out[2].shape[1] == 1:
+        if len(head_out) >= 3 and head_out[2] is not None:
             obj_logits = head_out[2]
         elif len(head_out) >= 4 and isinstance(head_out[3], dict) and "obj_logits" in head_out[3]:
             obj_logits = head_out[3]["obj_logits"]
@@ -398,21 +440,9 @@ class VisdroneDetector(BaseModel):
 
             output.update(loss_dict)
 
-            # Chuẩn hóa target boxes sang định dạng [cx, cy, w, h] cho MeanAveragePrecision
-            for t in targets:
-                if "boxes" in t and len(t["boxes"]) > 0:
-                    if not t.get("_is_cxcywh", False):
-                        b = t["boxes"]
-                        t["boxes"] = torch.stack([
-                            b[:, 0] + b[:, 2] / 2.0,
-                            b[:, 1] + b[:, 3] / 2.0,
-                            b[:, 2],
-                            b[:, 3]
-                        ], dim=-1)
-                        t["_is_cxcywh"] = True
-
         preds = self._post_process(
-            cls_logits, pred_boxes,
+            cls_logits=cls_logits,
+            pred_boxes=pred_boxes,
             obj_logits=obj_logits,
             conf_threshold=conf_threshold,
             nms_threshold=nms_threshold,
@@ -440,50 +470,62 @@ class VisdroneDetector(BaseModel):
             map_pred, feat_deform = self.extract_features(inputs)
             head_out = self.head(map_pred, feat_deform)
             cls_logits, pred_boxes = head_out[0], head_out[1]
-            obj_logits = None
-            if len(head_out) >= 3 and isinstance(head_out[2], torch.Tensor) and head_out[2].ndim == 4 and head_out[2].shape[1] == 1:
-                obj_logits = head_out[2]
-                sampling_info = head_out[3] if len(head_out) >= 4 else None
+            obj_logits = head_out[2] if len(head_out) >= 3 else None
+            sampling_info = head_out[3] if len(head_out) >= 4 else None
+
+            # Nếu là multi-scale dict, lấy tầng chính 'c3' (hoặc phần tử đầu tiên)
+            if isinstance(cls_logits, dict):
+                k0 = "c3" if "c3" in cls_logits else next(iter(cls_logits.keys()))
+                cls_t = cls_logits[k0]
+                box_t = pred_boxes[k0]
+                map_t = map_pred[k0] if isinstance(map_pred, dict) else map_pred
+                obj_t = obj_logits[k0] if isinstance(obj_logits, dict) and k0 in obj_logits else None
+                s_info_t = sampling_info[k0] if isinstance(sampling_info, dict) and k0 in sampling_info else None
             else:
-                sampling_info = head_out[2] if len(head_out) >= 3 else None
-                obj_logits = sampling_info.get("obj_logits", None) if isinstance(sampling_info, dict) else None
+                cls_t = cls_logits
+                box_t = pred_boxes
+                map_t = map_pred
+                obj_t = obj_logits
+                s_info_t = sampling_info
 
-            if obj_logits is None and hasattr(self.head, "last_obj_logits"):
-                obj_logits = self.head.last_obj_logits
+            if obj_t is None and hasattr(self.head, "last_obj_logits"):
+                last_obj = self.head.last_obj_logits
+                obj_t = last_obj.get("c3", None) if isinstance(last_obj, dict) else last_obj
 
-            cls_scores = cls_logits.sigmoid()
+            cls_scores = cls_t.sigmoid()
 
             results = {
-                "Cls_Logits_Mean": round(cls_logits.mean().item(), 4),
-                "Cls_Logits_Max": round(cls_logits.max().item(), 4),
-                "Cls_Logits_Min": round(cls_logits.min().item(), 4),
+                "Cls_Logits_Mean": round(cls_t.mean().item(), 4),
+                "Cls_Logits_Max": round(cls_t.max().item(), 4),
+                "Cls_Logits_Min": round(cls_t.min().item(), 4),
                 "Cls_Prob_Mean": round(cls_scores.mean().item(), 4),
                 "Cls_Prob_Max": round(cls_scores.max().item(), 4),
-                "Box_CX_Mean": round(pred_boxes[:, 0].mean().item(), 4),
-                "Box_CY_Mean": round(pred_boxes[:, 1].mean().item(), 4),
-                "Box_W_Mean": round(pred_boxes[:, 2].mean().item(), 4),
-                "Box_H_Mean": round(pred_boxes[:, 3].mean().item(), 4),
-                "MapPred_Energy": round(map_pred.norm(dim=1).mean().item(), 4),
+                "Box_CX_Mean": round(box_t[:, 0].mean().item(), 4),
+                "Box_CY_Mean": round(box_t[:, 1].mean().item(), 4),
+                "Box_W_Mean": round(box_t[:, 2].mean().item(), 4),
+                "Box_H_Mean": round(box_t[:, 3].mean().item(), 4),
+                "MapPred_Energy": round(map_t.norm(dim=1).mean().item(), 4),
             }
 
-            if obj_logits is not None:
-                obj_scores = obj_logits.sigmoid()
+            if obj_t is not None:
+                obj_scores = obj_t.sigmoid()
                 results["Obj_Prob_Mean"] = round(obj_scores.mean().item(), 4)
                 results["Obj_Prob_Max"] = round(obj_scores.max().item(), 4)
-                results["Obj_Logits_Mean"] = round(obj_logits.mean().item(), 4)
+                results["Obj_Logits_Mean"] = round(obj_t.mean().item(), 4)
 
-            if sampling_info is not None:
-                if isinstance(sampling_info, dict):
-                    all_locs = sampling_info.get("sampling_locations", None)
-                    all_offsets = sampling_info.get("offsets", None)
-                    ref_tensor = sampling_info.get("ref", None)
+            if s_info_t is not None:
+                if isinstance(s_info_t, dict):
+                    all_locs = s_info_t.get("sampling_locations", None)
+                    all_offsets = s_info_t.get("offsets", None)
+                    ref_tensor = s_info_t.get("ref", None)
                 else:
                     all_locs = None
                     all_offsets = None
-                    ref_tensor = sampling_info if isinstance(sampling_info, torch.Tensor) else None
+                    ref_tensor = s_info_t if isinstance(s_info_t, torch.Tensor) else None
 
                 if ref_tensor is None and hasattr(self.head, "last_ref"):
-                    ref_tensor = self.head.last_ref
+                    last_ref = self.head.last_ref
+                    ref_tensor = last_ref.get("c3", None) if isinstance(last_ref, dict) else last_ref
 
                 if all_locs is not None and all_offsets is not None:
                     offset_norm = torch.norm(all_offsets, p=2, dim=-1).mean()

@@ -43,6 +43,7 @@ def build_depthwise_separable_conv(
     )
 
 
+@NECKS.register_module(name=["MobileNetFPN", "FPN"], force=True)
 class MobileNetFPN(nn.Module):
     """
     FPN tổng hợp đặc trưng đa tầng từ MobileNetV3:
@@ -62,10 +63,12 @@ class MobileNetFPN(nn.Module):
         in_channels: Dict[str, int],
         out_dim: int = 64,
         return_tuple: bool = True,
+        predict_levels: Tuple[str, ...] = ("c3", "c5"),
     ):
         super().__init__()
         self.out_dim = out_dim
         self.return_tuple = return_tuple
+        self.predict_levels = tuple(predict_levels)
 
         # Lateral 1x1 convolutions
         self.lat_c12 = nn.Conv2d(in_channels.get('c12', 576), out_dim, kernel_size=1)
@@ -76,11 +79,12 @@ class MobileNetFPN(nn.Module):
 
         # Smooth Convolutions
         self.smooth_pred = build_conv_bn_relu(out_dim, out_dim, kernel_size=3, padding=1)
+        self.smooth_pred_c5 = build_conv_bn_relu(out_dim, out_dim, kernel_size=3, padding=1)
         self.smooth_deform = build_depthwise_separable_conv(out_dim, out_dim, kernel_size=3, padding=1)
 
     def forward(
         self, features: Dict[str, torch.Tensor]
-    ) -> Union[Tuple[torch.Tensor, torch.Tensor], torch.Tensor]:
+    ) -> Union[Tuple[Union[torch.Tensor, Dict[str, torch.Tensor]], torch.Tensor], Union[torch.Tensor, Dict[str, torch.Tensor]]]:
         c12 = features['c12']
         c5 = features['c5']
         c3 = features['c3']
@@ -94,8 +98,16 @@ class MobileNetFPN(nn.Module):
         p2 = self.lat_c1(c1) + F.interpolate(p3, size=c1.shape[-2:], mode="nearest")
         p1 = self.lat_c0(c0) + F.interpolate(p2, size=c0.shape[-2:], mode="nearest")
 
-        map_pred = self.smooth_pred(p3)      # [B, out_dim, H//8, W//8] (Stride 8)
-        feat_deform = self.smooth_deform(p1) # [B, out_dim, H//2, W//2] (Stride 2)
+        map_pred_c3 = self.smooth_pred(p3)        # [B, out_dim, H//8, W//8] (Stride 8)
+        map_pred_c5 = self.smooth_pred_c5(p4)     # [B, out_dim, H//16, W//16] (Stride 16)
+        feat_deform = self.smooth_deform(p1)      # [B, out_dim, H//2, W//2] (Stride 2)
+
+        if "c5" in self.predict_levels and "c3" in self.predict_levels:
+            map_pred = {"c3": map_pred_c3, "c5": map_pred_c5}
+        elif "c5" in self.predict_levels:
+            map_pred = map_pred_c5
+        else:
+            map_pred = map_pred_c3
 
         if self.return_tuple:
             return map_pred, feat_deform
@@ -134,11 +146,13 @@ class MobileNetPANet(nn.Module):
         out_dim: int = 64,
         return_tuple: bool = True,
         fusion_type: str = "concat",  # "concat" hoặc "add"
+        predict_levels: Tuple[str, ...] = ("c3", "c5"),
     ):
         super().__init__()
         self.out_dim = out_dim
         self.return_tuple = return_tuple
         self.fusion_type = fusion_type.lower()
+        self.predict_levels = tuple(predict_levels)
 
         # 1. Lateral 1x1 convolutions cho nhánh Top-Down
         self.lat_c12 = nn.Conv2d(in_channels.get('c12', 576), out_dim, kernel_size=1)
@@ -222,8 +236,16 @@ class MobileNetPANet(nn.Module):
                 'n5': n5,
             }
 
-        map_pred = n3      # [B, out_dim, H//8, W//8] (Feature map chính Stride 8)
-        feat_deform = n1   # [B, out_dim, H//2, W//2] (Feature map độ phân giải cao Stride 2)
+        map_pred_c3 = n3      # [B, out_dim, H//8, W//8] (Feature map Stride 8)
+        map_pred_c5 = n4      # [B, out_dim, H//16, W//16] (Feature map Stride 16)
+        feat_deform = n1      # [B, out_dim, H//2, W//2] (Feature map độ phân giải cao Stride 2)
+
+        if "c5" in self.predict_levels and "c3" in self.predict_levels:
+            map_pred = {"c3": map_pred_c3, "c5": map_pred_c5}
+        elif "c5" in self.predict_levels:
+            map_pred = map_pred_c5
+        else:
+            map_pred = map_pred_c3
 
         if self.return_tuple:
             return map_pred, feat_deform
