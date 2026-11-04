@@ -160,15 +160,15 @@ class DeformableHead(nn.Module):
         self.num_points = num_points
         self.head_dim = dim // num_heads
 
-        self.to_q= nn.Linear(dim, dim)
-        self.to_k= nn.Linear(dim, dim)
-        self.to_v= nn.Linear(dim, dim)
-        self.scale= 1 / math.sqrt(dim)
+        # self.to_q= nn.Linear(dim, dim)
+        # self.to_k= nn.Linear(dim, dim)
+        # self.to_v= nn.Linear(dim, dim)
+        # self.scale= 1 / math.sqrt(dim)
 
         self.to_q2= nn.Linear(dim, dim)
         self.to_k2= nn.Linear(dim, dim)
         self.to_v2= nn.Linear(dim, dim)
-        self.scale2= 1 / math.sqrt(dim)
+        self.scale= 1 / math.sqrt(dim)
 
         self.query_proj = nn.Sequential(
             nn.Linear(dim, dim),
@@ -285,24 +285,16 @@ class DeformableHead(nn.Module):
         
         feat_map = feat_map + self._get_pos_embed(H, W, C, feat_map.device, feat_map.dtype)
         feat_map = feat_map.view(B,C, H*W).permute(0, 2, 1) # (B,N,C)
-        q = self.to_q(feat_map)
-        k = self.to_k(feat_map)
-        v = self.to_v(feat_map)
-
-        # Memory-efficient Scaled Dot-Product Attention
-        v = F.scaled_dot_product_attention(
-            q.unsqueeze(1), k.unsqueeze(1), v.unsqueeze(1), scale=self.scale
-        ).squeeze(1) # (B,N,C)
 
         B_def, C_def, H_def, W_def= feat_deform.shape
         feat_deform = feat_deform + self._get_pos_embed(H_def, W_def, C_def, feat_map.device, feat_map.dtype)
 
         _, grid_logits = self._get_reference_grid(H, W, device=feat_map.device, dtype=feat_map.dtype)
         # 2. Dự đoán độ lệch (offset delta) từ đặc trưng v: [B, N, 2]
-        delta_ref = self.query_proj(v).view(B, H * W, 2)
+        delta_ref = self.query_proj(feat_map).view(B, H * W, 2)
         # 3. ref = sigmoid(grid_logits + delta): [B, N, 2]
         ref = (grid_logits.unsqueeze(0) + delta_ref).sigmoid()
-        sampling = self.sampling_offsets(v).view(B, H*W, self.num_points, 2) # (B,N, num_points, 2)
+        sampling = self.sampling_offsets(feat_map).view(B, H*W, self.num_points, 2) # (B,N, num_points, 2)
         spatial_scale = torch.tensor([1.0 / W_def, 1.0 / H_def], device=feat_map.device, dtype=feat_map.dtype)
         sampling_locations = ref.unsqueeze(-2) + sampling * spatial_scale
         sampling_grid = 2.0 * sampling_locations - 1.0
@@ -317,7 +309,7 @@ class DeformableHead(nn.Module):
 
         sampled_feat = self.value_proj(sampled_feat.permute(0, 2, 3, 1)) # (B, N, num_points, D)
 
-        q = self.to_q2(v) # (B,N,D)
+        q = self.to_q2(feat_map) # (B,N,D)
         k = self.to_k2(sampled_feat) # (B, N, num_points, D)
         v2 = self.to_v2(sampled_feat) # (B, N, num_points, D)
 
@@ -329,7 +321,7 @@ class DeformableHead(nn.Module):
 
         cls_logits = self.cls_head(feat)  # (B, num_classes, H, W)
         obj_logits = self.obj_head(feat)  # (B, 1, H, W)
-        feat = v.permute(0, 2, 1).view(B, C, H, W) + feat
+        feat = feat_map.permute(0, 2, 1).view(B, C, H, W) + feat
         box_deltas = self.box_head(feat).permute(0, 2, 3, 1).view(B, H * W, 4)  # (B, N, 4)
         
 

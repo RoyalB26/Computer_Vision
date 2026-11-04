@@ -482,3 +482,59 @@ class BaseTrainer:
 
         if self.logger:
             self.logger.info(f"Resumed successfully from '{checkpoint_path}' at epoch {self.epoch}")
+
+    def finetune(self, checkpoint_path: str) -> None:
+        """Finetune from a checkpoint by loading only matching layers (same name and shape).
+
+        Automatically skips layers with architectural modifications or shape mismatches,
+        allowing seamless transfer learning and finetuning when model components change.
+        Optimizer and epoch are not restored to allow fresh optimization.
+        """
+        if not os.path.isfile(checkpoint_path):
+            raise FileNotFoundError(f"Checkpoint not found at '{checkpoint_path}'")
+
+        checkpoint = torch.load(checkpoint_path, map_location=self.device)
+        raw_state_dict = checkpoint.get("state_dict", checkpoint)
+
+        # 1. Chuẩn hóa tên (bỏ prefix 'module.' nếu lưu từ DDP/DataParallel)
+        pretrained_dict = {
+            (k[7:] if k.startswith("module.") else k): v
+            for k, v in raw_state_dict.items()
+        }
+
+        # 2. So khớp với state_dict của mô hình hiện tại
+        model_dict = self.model.state_dict()
+        matched_dict = {}
+        skipped_mismatch = []
+        skipped_missing = []
+
+        for k, v in pretrained_dict.items():
+            if k in model_dict:
+                if model_dict[k].shape == v.shape:
+                    matched_dict[k] = v
+                else:
+                    skipped_mismatch.append((k, v.shape, model_dict[k].shape))
+            else:
+                skipped_missing.append(k)
+
+        # 3. Nạp trọng số trùng khớp
+        model_dict.update(matched_dict)
+        self.model.load_state_dict(model_dict)
+
+        # 4. Ghi log tường minh
+        if self.logger:
+            self.logger.info(
+                f"[Finetune] Successfully loaded {len(matched_dict)} matching layers from '{checkpoint_path}'."
+            )
+            if skipped_mismatch:
+                msg = f"[Finetune] Skipped {len(skipped_mismatch)} layer(s) due to architecture/shape mismatch:\n"
+                for name, old_shape, new_shape in skipped_mismatch:
+                    msg += f"  - {name}: checkpoint {tuple(old_shape)} -> model {tuple(new_shape)}\n"
+                self.logger.warning(msg.strip())
+            if skipped_missing:
+                self.logger.info(
+                    f"[Finetune] Ignored {len(skipped_missing)} checkpoint layer(s) not present in current model."
+                )
+            self.logger.info(
+                "[Finetune] Model initialized for finetuning. Training will start from epoch 0 with fresh optimizer."
+            )

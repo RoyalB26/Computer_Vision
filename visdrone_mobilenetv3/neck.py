@@ -21,6 +21,28 @@ def build_conv_bn_relu(
     )
 
 
+def build_depthwise_separable_conv(
+    in_c: int,
+    out_c: int,
+    kernel_size: int = 3,
+    stride: int = 1,
+    padding: int = 1,
+) -> nn.Sequential:
+    """Depthwise Separable Convolution: Depthwise Conv3x3 + Pointwise Conv1x1."""
+    return nn.Sequential(
+        # Depthwise
+        nn.Conv2d(
+            in_c, in_c, kernel_size=kernel_size, stride=stride, padding=padding, groups=in_c, bias=False
+        ),
+        nn.BatchNorm2d(in_c),
+        nn.ReLU(inplace=True),
+        # Pointwise
+        nn.Conv2d(in_c, out_c, kernel_size=1, bias=False),
+        nn.BatchNorm2d(out_c),
+        nn.ReLU(inplace=True),
+    )
+
+
 class MobileNetFPN(nn.Module):
     """
     FPN tổng hợp đặc trưng đa tầng từ MobileNetV3:
@@ -54,7 +76,7 @@ class MobileNetFPN(nn.Module):
 
         # Smooth Convolutions
         self.smooth_pred = build_conv_bn_relu(out_dim, out_dim, kernel_size=3, padding=1)
-        self.smooth_deform = build_conv_bn_relu(out_dim, out_dim, kernel_size=3, padding=1)
+        self.smooth_deform = build_depthwise_separable_conv(out_dim, out_dim, kernel_size=3, padding=1)
 
     def forward(
         self, features: Dict[str, torch.Tensor]

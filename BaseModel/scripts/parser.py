@@ -26,6 +26,12 @@ def parse_args(description: str = "Computer Vision Pipeline") -> argparse.Namesp
         help="Path to checkpoint file (.pth) to resume training from.",
     )
     parser.add_argument(
+        "--finetune",
+        type=str,
+        default=None,
+        help="Path to checkpoint file (.pth) to finetune from (loads only matching layer names and shapes, skipping modified architectures).",
+    )
+    parser.add_argument(
         "--device",
         type=str,
         default=None,

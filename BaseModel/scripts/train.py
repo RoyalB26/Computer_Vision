@@ -203,8 +203,11 @@ def main():
 
     # 13. Resume from checkpoint if specified
     resume_path = args.resume or getattr(cfg, "resume_from", None)
+    finetune_path = getattr(args, "finetune", None) or getattr(cfg, "finetune_from", None)
     if resume_path:
         trainer.resume(resume_path)
+    elif finetune_path:
+        trainer.finetune(finetune_path)
 
     # 14. Start Training or Eval Only
     if args.eval_only:
