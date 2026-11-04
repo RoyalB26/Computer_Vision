@@ -21,7 +21,7 @@ model:
   backbone: "MobileNetV3Backbone"
   neck: "PANet"
   num_heads: 4                  # 4 attention heads
-  num_points: 32                 # 4 điểm deformable sampling xung quanh mỗi query
+  num_points: 64                 # 4 điểm deformable sampling xung quanh mỗi query
 
 # 2. Dataset Configuration (LMDB Dataset & Pipeline)
 data:
