@@ -30,7 +30,6 @@ class CustomLMDBDataset(BaseDataset):
         # 1. Đọc tổng số mẫu trong file LMDB
         env, txn = open_lmdb(self.data_root, readonly=True)
         total =  int(txn.get(b"__len__").decode("ascii"))
-        total = 100
         # 2. Tạo danh sách index và xáo trộn đồng nhất bằng seed
         indices = list(range(total))
         rng = random.Random(self.seed)
