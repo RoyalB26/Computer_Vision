@@ -9,7 +9,7 @@ from BaseModel.core.registrar import MODELS
 from BaseModel.model import BaseModel
 
 from .utils import cxcywh_to_xyxy
-from .backbone import MobileNetV3Backbone, NormalBackbone
+from .backbone import MobileNetV3Backbone, NormalBackbone, YOLOv11SmallBackbone
 from .neck import MobileNetFPN, MobileNetPANet, PANet
 from .head import MobileNetDetectionHead, DeformableHead
 from .loss import MobileNetDetectionLoss, compute_multi_ref_loss

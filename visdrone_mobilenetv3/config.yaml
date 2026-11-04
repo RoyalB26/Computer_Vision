@@ -18,7 +18,7 @@ model:
   num_classes: 10
   dim: 32
   head_type: "DeformableHead"   # Sử dụng DeformableHead
-  backbone: "MobileNetV3Backbone"
+  backbone: "YOLOv11SmallBackbone"
   neck: "PANet"
   num_heads: 4                  # 4 attention heads
   num_points: 64                 # 4 điểm deformable sampling xung quanh mỗi query
