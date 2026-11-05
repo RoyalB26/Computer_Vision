@@ -4,6 +4,7 @@ work_dir: "./work_dirs/visdrone_mobilenetv3"
 device: "cuda"  
 seed: 42
 tqdm: true
+
 custom_imports:
   - "visdrone_mobilenetv3"
   - "visdrone_mobilenetv3.model"
@@ -16,11 +17,11 @@ model:
   type: "VisdroneDetector"
   num_classes: 10
   dim: 32
-  head_type: "DeformableHead"   # Sử dụng DeformableHead
+  head_type: "DeformableDetectionHead"   # Sử dụng DeformableHead
   backbone: "MobileNetV3Backbone"
   neck: "PANet"
   num_heads: 4                  # 4 attention heads
-  num_points: 64                 # 64 điểm deformable sampling xung quanh mỗi query
+  num_points: 64                 # 4 điểm deformable sampling xung quanh mỗi query
 
 # 2. Dataset Configuration (LMDB Dataset & Pipeline)
 data:
@@ -36,14 +37,12 @@ data:
       pipeline:
         - type: "Resize"
           size: [960, 960]
-        - type: "CLAHE"
-          clip_limit: 2.0
-          tile_grid_size: [8, 8]
-          p: 1.0
         - type: "ToTensor"
-    batch_size: 8
+    batch_size: 16
     shuffle: true
-    num_workers: 4
+    num_workers: 3
+    collate_fn:
+      type: "DetectionCollate"
 
   val:
     dataset:
@@ -57,14 +56,12 @@ data:
       pipeline:
         - type: "Resize"
           size: [960, 960]
-        - type: "CLAHE"
-          clip_limit: 2.0
-          tile_grid_size: [8, 8]
-          p: 1.0
         - type: "ToTensor"
-    batch_size: 8
+    batch_size: 16
     shuffle: false
-    num_workers: 2
+    num_workers: 0
+    collate_fn:
+      type: "DetectionCollate"
 
 # 3. Optimizer Configuration
 optimizer:

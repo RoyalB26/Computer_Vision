@@ -1,12 +1,10 @@
 import io
-import os
 import pickle
 import random
 import torch
 from PIL import Image
 from BaseModel.core import DATASETS
-from BaseModel.dataset import BaseDataset, open_lmdb
-from BaseModel.dataset.helpers import close_lmdb
+from BaseModel.dataset import BaseDataset, open_lmdb, close_lmdb
 
 
 @DATASETS.register_module()
@@ -26,15 +24,12 @@ class CustomLMDBDataset(BaseDataset):
         self.seed = seed
         self.env = None
         self.txn = None
-        self._pid = None
         super().__init__(data_root=data_root, pipeline=pipeline, test_mode=test_mode)
 
     def load_annotations(self):
-        # 1. Đọc tổng số mẫu trong file LMDB rồi đóng ngay env ở tiến trình chính
-        # để khi DataLoader fork() các worker trên Linux không bị lỗi "environment is already open"
+        # 1. Đọc tổng số mẫu trong file LMDB
         env, txn = open_lmdb(self.data_root, readonly=True)
         total = int(txn.get(b"__len__").decode("ascii"))
-        txn.abort()
         close_lmdb(self.data_root)
 
         # 2. Tạo danh sách index và xáo trộn đồng nhất bằng seed
@@ -53,10 +48,8 @@ class CustomLMDBDataset(BaseDataset):
         return [{"lmdb_idx": idx} for idx in selected_indices]
 
     def _init_db(self):
-        curr_pid = os.getpid()
-        if self.env is None or self.txn is None or self._pid != curr_pid:
+        if self.env is None:
             self.env, self.txn = open_lmdb(self.data_root, readonly=True)
-            self._pid = curr_pid
 
     def get_data_info(self, idx: int):
         self._init_db()
@@ -81,8 +74,3 @@ class CustomLMDBDataset(BaseDataset):
             ),
         }
         return {"image": image, "target": target}
-
-    def __getstate__(self):
-        state = self.__dict__.copy()
-        state["env"], state["txn"], state["_pid"] = None, None, None
-        return state

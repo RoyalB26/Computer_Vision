@@ -86,45 +86,19 @@ def parse_csv(csv_path: str, delimiter: str = ",") -> List[Dict[str, str]]:
 # =========================================================================
 
 # Process-level cache to prevent opening the same LMDB environment twice in the same process
-_LMDB_ENV_CACHE: Dict[str, Tuple[int, Any]] = {}
-
-
-def close_lmdb(db_path: Optional[str] = None) -> None:
-    """Close cached LMDB environment(s) in the current process.
-
-    Closing the LMDB environment in the main process after reading metadata (like `__len__`)
-    ensures that forked DataLoader workers do not inherit an open C-level `MDB_env` handle.
-    """
-    if db_path is not None:
-        abs_path = os.path.abspath(db_path)
-        entry = _LMDB_ENV_CACHE.pop(abs_path, None)
-        if entry is not None:
-            _, env = entry
-            try:
-                env.close()
-            except Exception:
-                pass
-    else:
-        for abs_path in list(_LMDB_ENV_CACHE.keys()):
-            entry = _LMDB_ENV_CACHE.pop(abs_path, None)
-            if entry is not None:
-                _, env = entry
-                try:
-                    env.close()
-                except Exception:
-                    pass
+_LMDB_ENV_CACHE: Dict[Tuple[int, str], Any] = {}
 
 
 def open_lmdb(
     db_path: str,
     readonly: bool = True,
-    max_readers: int = 256,
+    max_readers: int = 128,
 ):
     """Safely open an LMDB environment and return (env, txn).
 
-    Caches the environment per process so that multiple datasets (e.g. train and val)
-    in the same process do not encounter `lmdb.Error: The environment is already open`,
-    while closing any stale environment inherited across `fork()` before re-opening.
+    Caches the environment per (process_id, path) so that multiple datasets (e.g. train and val)
+    or multiple worker processes do not conflict:
+    `lmdb.Error: The environment is already open in this process.`
 
     Args:
         db_path: Directory containing LMDB database files (`data.mdb`).
@@ -137,20 +111,11 @@ def open_lmdb(
         raise ImportError("The 'lmdb' package is required. Install it via: pip install lmdb")
 
     abs_path = os.path.abspath(db_path)
-    curr_pid = os.getpid()
+    pid = os.getpid()
+    cache_key = (pid, abs_path)
 
-    if abs_path in _LMDB_ENV_CACHE:
-        cached_pid, cached_env = _LMDB_ENV_CACHE[abs_path]
-        if cached_pid != curr_pid:
-            # Inherited across fork(): close C handle first so liblmdb allows opening a fresh env
-            try:
-                cached_env.close()
-            except Exception:
-                pass
-            _LMDB_ENV_CACHE.pop(abs_path, None)
-
-    if abs_path not in _LMDB_ENV_CACHE:
-        env = lmdb.open(
+    if cache_key not in _LMDB_ENV_CACHE:
+        _LMDB_ENV_CACHE[cache_key] = lmdb.open(
             abs_path,
             max_readers=max_readers,
             readonly=readonly,
@@ -158,11 +123,26 @@ def open_lmdb(
             readahead=False,
             meminit=False,
         )
-        _LMDB_ENV_CACHE[abs_path] = (curr_pid, env)
 
-    _, env = _LMDB_ENV_CACHE[abs_path]
+    env = _LMDB_ENV_CACHE[cache_key]
     txn = env.begin(write=not readonly)
     return env, txn
+
+
+def close_lmdb(db_path: Optional[str] = None) -> None:
+    """Close cached LMDB environment(s) for the current process."""
+    pid = os.getpid()
+    keys_to_del = []
+    for (k_pid, k_path), env in list(_LMDB_ENV_CACHE.items()):
+        if k_pid == pid:
+            if db_path is None or os.path.abspath(db_path) == k_path:
+                try:
+                    env.close()
+                except Exception:
+                    pass
+                keys_to_del.append((k_pid, k_path))
+    for k in keys_to_del:
+        _LMDB_ENV_CACHE.pop(k, None)
 
 
 def read_lmdb_bytes(txn: Any, key: Union[str, bytes]) -> Optional[bytes]:

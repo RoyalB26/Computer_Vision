@@ -305,6 +305,7 @@ class ExcelTracker(BaseHook):
         """Reset temporary accumulators at the beginning of each epoch."""
         if not getattr(trainer, "is_main_process", True):
             return
+
         self._epoch_losses.clear()
         self._epoch_loss_count = 0
         self._epoch_grad_norms.clear()
@@ -316,7 +317,7 @@ class ExcelTracker(BaseHook):
 
     def _sample_detection_from_batch(self, trainer: "BaseTrainer", data_batch: Any) -> None:
         """Sample detection component decomposition metrics from the model."""
-        if not self.track_detection or not getattr(trainer, "is_main_process", True):
+        if not self.track_detection:
             return
         underlying = getattr(trainer.model, "module", trainer.model)
         if hasattr(underlying, "analyze_detection_components"):
@@ -342,6 +343,7 @@ class ExcelTracker(BaseHook):
         """Sample detection component influence at configured intervals during training."""
         if not getattr(trainer, "is_main_process", True):
             return
+
         if self.track_detection and ((batch_idx + 1) % self.detection_interval == 0 or batch_idx == 0):
             self._sample_detection_from_batch(trainer, data_batch)
 
@@ -349,6 +351,7 @@ class ExcelTracker(BaseHook):
         """Sample detection component influence during validation if no train batches were sampled."""
         if not getattr(trainer, "is_main_process", True):
             return
+
         if self.track_detection and (self._epoch_detection_count == 0 or (batch_idx + 1) % self.detection_interval == 0):
             self._sample_detection_from_batch(trainer, data_batch)
 
@@ -356,6 +359,7 @@ class ExcelTracker(BaseHook):
         """Accumulate train batch losses and sample gradient norms."""
         if not getattr(trainer, "is_main_process", True):
             return
+
         # 1. Accumulate losses
         for k, v in outputs.items():
             if "loss" in k.lower():
@@ -374,12 +378,14 @@ class ExcelTracker(BaseHook):
         """Record validation metrics for the current epoch."""
         if not getattr(trainer, "is_main_process", True):
             return
+
         self._last_val_metrics = val_metrics.copy() if val_metrics else {}
 
     def after_epoch(self, trainer: "BaseTrainer") -> None:
         """Compile epoch data and update Excel workbook."""
         if not getattr(trainer, "is_main_process", True):
             return
+
         epoch_idx = trainer.epoch + 1
 
         # ---------------------------------------------------------
@@ -485,6 +491,7 @@ class ExcelTracker(BaseHook):
         """Final save upon training completion."""
         if not getattr(trainer, "is_main_process", True):
             return
+
         self.save()
 
     # =========================================================================

@@ -38,6 +38,7 @@ __all__ = [
     "find_images",
     "parse_csv",
     "open_lmdb",
+    "close_lmdb",
     "read_lmdb_bytes",
     "create_lmdb",
     "IMG_EXTENSIONS",

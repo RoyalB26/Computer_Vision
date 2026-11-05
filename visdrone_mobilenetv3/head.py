@@ -1,5 +1,5 @@
 """Detection Heads: Standard Pure CNN Head and Deformable Attention Detection Head."""
-from typing import Tuple, Dict, Optional, Union, List
+from typing import Tuple, Dict, Optional
 import math
 import torch
 import torch.nn as nn
@@ -84,7 +84,7 @@ class MobileNetDetectionHead(nn.Module):
             self._grid_cache_key = cache_key
         return self._cached_grid, self._cached_grid_logits
 
-    def _forward_single(
+    def forward(
         self, feat_map: torch.Tensor, feat_deform: Optional[torch.Tensor] = None
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, Optional[Dict[str, torch.Tensor]]]:
         B, _, H, W = feat_map.shape
@@ -102,33 +102,6 @@ class MobileNetDetectionHead(nn.Module):
 
         pred_boxes = torch.cat([cxcy, wh], dim=1)
         return cls_logits, pred_boxes, obj_logits, None
-
-    def forward(
-        self,
-        feat_map: Union[torch.Tensor, Dict[str, torch.Tensor], Tuple[torch.Tensor, ...], list],
-        feat_deform: Optional[torch.Tensor] = None,
-    ):
-        if isinstance(feat_map, dict):
-            cls_logits_dict = {}
-            pred_boxes_dict = {}
-            obj_logits_dict = {}
-            for k, v in feat_map.items():
-                cls_l, pred_b, obj_l, _ = self._forward_single(v, feat_deform)
-                cls_logits_dict[k] = cls_l
-                pred_boxes_dict[k] = pred_b
-                obj_logits_dict[k] = obj_l
-            return cls_logits_dict, pred_boxes_dict, obj_logits_dict, None
-        elif isinstance(feat_map, (list, tuple)):
-            cls_logits_list = []
-            pred_boxes_list = []
-            obj_logits_list = []
-            for v in feat_map:
-                cls_l, pred_b, obj_l, _ = self._forward_single(v, feat_deform)
-                cls_logits_list.append(cls_l)
-                pred_boxes_list.append(pred_b)
-                obj_logits_list.append(obj_l)
-            return cls_logits_list, pred_boxes_list, obj_logits_list, None
-        return self._forward_single(feat_map, feat_deform)
 
 def build_2d_sincos_position_embedding(H: int, W: int, embed_dim: int, device=None, dtype=torch.float32) -> Tensor:
     """
@@ -161,6 +134,7 @@ def build_2d_sincos_position_embedding(H: int, W: int, embed_dim: int, device=No
     return pos_emb
 
 
+@HEADS.register_module(name="DeformableHead")
 @HEADS.register_module(name="DeformableDetectionHead")
 class DeformableHead(nn.Module):
     """
@@ -187,15 +161,15 @@ class DeformableHead(nn.Module):
         self.num_points = num_points
         self.head_dim = dim // num_heads
 
-        # self.to_q= nn.Linear(dim, dim)
-        # self.to_k= nn.Linear(dim, dim)
-        # self.to_v= nn.Linear(dim, dim)
-        # self.scale= 1 / math.sqrt(dim)
+        self.to_q= nn.Linear(dim, dim)
+        self.to_k= nn.Linear(dim, dim)
+        self.to_v= nn.Linear(dim, dim)
+        self.scale= 1 / math.sqrt(dim)
 
         self.to_q2= nn.Linear(dim, dim)
         self.to_k2= nn.Linear(dim, dim)
         self.to_v2= nn.Linear(dim, dim)
-        self.scale= 1 / math.sqrt(dim)
+        self.scale2= 1 / math.sqrt(dim)
 
         self.query_proj = nn.Sequential(
             nn.Linear(dim, dim),
@@ -298,36 +272,37 @@ class DeformableHead(nn.Module):
             )
         return self._pos_embed_cache[cache_key]
 
-    def _forward_single(
+    def forward(
         self,
         feat_map: torch.Tensor,
         feat_deform: Optional[torch.Tensor] = None,
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, Dict[str, torch.Tensor]]:
+    ) -> Tuple[torch.Tensor, torch.Tensor, Dict[str, torch.Tensor]]:
         if feat_deform is None:
             feat_deform = feat_map
         """
         feat_map: (B,C,H,W)
         """
-        B, C, H, W = feat_map.shape
+        B,C,H,W = feat_map.shape
         
         feat_map = feat_map + self._get_pos_embed(H, W, C, feat_map.device, feat_map.dtype)
-        feat_map = feat_map.view(B, C, H * W).permute(0, 2, 1) # (B,N,C)
+        feat_map = feat_map.view(B,C, H*W).permute(0, 2, 1) # (B,N,C)
 
-        B_def, C_def, H_def, W_def = feat_deform.shape
-        feat_deform_with_pos = feat_deform + self._get_pos_embed(H_def, W_def, C_def, feat_map.device, feat_map.dtype)
+
+        B_def, C_def, H_def, W_def= feat_deform.shape
+        feat_deform = feat_deform + self._get_pos_embed(H_def, W_def, C_def, feat_map.device, feat_map.dtype)
 
         _, grid_logits = self._get_reference_grid(H, W, device=feat_map.device, dtype=feat_map.dtype)
-        # 2. Dự đoán độ lệch (offset delta) từ đặc trưng v: [B, N, 2]
+        # 2. Dự đoán độ lệch (offset delta) từ đặc trưng feat_map: [B, N, 2]
         delta_ref = self.query_proj(feat_map).view(B, H * W, 2)
         # 3. ref = sigmoid(grid_logits + delta): [B, N, 2]
         ref = (grid_logits.unsqueeze(0) + delta_ref).sigmoid()
-        sampling = self.sampling_offsets(feat_map).view(B, H * W, self.num_points, 2) # (B,N, num_points, 2)
-        spatial_scale = feat_map.new_tensor([1.0 / W_def, 1.0 / H_def])
+        sampling = self.sampling_offsets(feat_map).view(B, H*W, self.num_points, 2) # (B,N, num_points, 2)
+        spatial_scale = torch.tensor([1.0 / W_def, 1.0 / H_def], device=feat_map.device, dtype=feat_map.dtype)
         sampling_locations = ref.unsqueeze(-2) + sampling * spatial_scale
         sampling_grid = 2.0 * sampling_locations - 1.0
 
         sampled_feat = F.grid_sample(
-            feat_deform_with_pos,
+            feat_deform,
             sampling_grid,
             mode="bilinear",
             padding_mode="zeros",
@@ -342,14 +317,15 @@ class DeformableHead(nn.Module):
 
         dots = torch.einsum('b n d, b n p d -> b n p', q, k)
         dots = dots * self.scale
-        attn = torch.softmax(dots, dim=-1) 
+        attn = torch.softmax(dots, dim= -1) 
         feat = torch.einsum('b n p d, b n p -> b n d', v2, attn)
-        feat = feat.permute(0, 2, 1).view(B, C, H, W)
+        feat =  feat.permute(0, 2, 1).view(B, C, H, W)
 
         cls_logits = self.cls_head(feat)  # (B, num_classes, H, W)
         obj_logits = self.obj_head(feat)  # (B, 1, H, W)
         feat = feat_map.permute(0, 2, 1).view(B, C, H, W) + feat
         box_deltas = self.box_head(feat).permute(0, 2, 3, 1).view(B, H * W, 4)  # (B, N, 4)
+        
 
         dx = box_deltas[..., 0].sigmoid()
         dy = box_deltas[..., 1].sigmoid()
@@ -375,46 +351,9 @@ class DeformableHead(nn.Module):
             "offsets": sampling.view(B, H, W, self.num_points, 2),
             "obj_logits": obj_logits,
         }
+        self.last_ref = ref_map
+        self.last_obj_logits = obj_logits
         return cls_logits, boxes_map, obj_logits, sampling_info
-
-    def forward(
-        self,
-        feat_map: Union[torch.Tensor, Dict[str, torch.Tensor], Tuple[torch.Tensor, ...], list],
-        feat_deform: Optional[torch.Tensor] = None,
-    ):
-        if isinstance(feat_map, dict):
-            cls_logits_dict = {}
-            pred_boxes_dict = {}
-            obj_logits_dict = {}
-            sampling_info_dict = {}
-            for k, v in feat_map.items():
-                cls_l, pred_b, obj_l, s_info = self._forward_single(v, feat_deform)
-                cls_logits_dict[k] = cls_l
-                pred_boxes_dict[k] = pred_b
-                obj_logits_dict[k] = obj_l
-                sampling_info_dict[k] = s_info
-            self.last_ref = {k: v["ref"] for k, v in sampling_info_dict.items() if "ref" in v}
-            self.last_obj_logits = obj_logits_dict
-            return cls_logits_dict, pred_boxes_dict, obj_logits_dict, sampling_info_dict
-        elif isinstance(feat_map, (list, tuple)):
-            cls_logits_list = []
-            pred_boxes_list = []
-            obj_logits_list = []
-            sampling_info_list = []
-            for v in feat_map:
-                cls_l, pred_b, obj_l, s_info = self._forward_single(v, feat_deform)
-                cls_logits_list.append(cls_l)
-                pred_boxes_list.append(pred_b)
-                obj_logits_list.append(obj_l)
-                sampling_info_list.append(s_info)
-            self.last_ref = [s["ref"] for s in sampling_info_list if "ref" in s]
-            self.last_obj_logits = obj_logits_list
-            return cls_logits_list, pred_boxes_list, obj_logits_list, sampling_info_list
-        else:
-            cls_l, pred_b, obj_l, s_info = self._forward_single(feat_map, feat_deform)
-            self.last_ref = s_info["ref"]
-            self.last_obj_logits = obj_l
-            return cls_l, pred_b, obj_l, s_info
 
 
 

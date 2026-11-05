@@ -44,6 +44,7 @@ class WandbHook(BaseHook):
     def before_train(self, trainer: "BaseTrainer") -> None:
         if not getattr(trainer, "is_main_process", True):
             return
+
         import wandb
 
         run_name = self.name or os.path.basename(os.path.normpath(trainer.work_dir))
@@ -66,6 +67,7 @@ class WandbHook(BaseHook):
     def after_train_iter(self, trainer: "BaseTrainer", batch_idx: int, outputs: Dict[str, Any]) -> None:
         if not getattr(trainer, "is_main_process", True):
             return
+
         import wandb
 
         log_dict = {}
@@ -98,6 +100,7 @@ class WandbHook(BaseHook):
     def after_val(self, trainer: "BaseTrainer", val_metrics: Dict[str, float]) -> None:
         if not getattr(trainer, "is_main_process", True):
             return
+
         import wandb
 
         log_dict = {f"val/{k}": float(v) for k, v in val_metrics.items() if isinstance(v, (int, float))}
@@ -107,6 +110,7 @@ class WandbHook(BaseHook):
     def after_train(self, trainer: "BaseTrainer") -> None:
         if not getattr(trainer, "is_main_process", True):
             return
+
         import wandb
 
         wandb.finish()

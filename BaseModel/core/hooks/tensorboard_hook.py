@@ -31,6 +31,7 @@ class TensorboardHook(BaseHook):
     def before_train(self, trainer: "BaseTrainer") -> None:
         if not getattr(trainer, "is_main_process", True):
             return
+
         from torch.utils.tensorboard import SummaryWriter
 
         tb_dir = self.log_dir or os.path.join(trainer.work_dir, "tf_logs")
@@ -41,6 +42,9 @@ class TensorboardHook(BaseHook):
             trainer.logger.info(f"[TensorboardHook] Writing TensorBoard events to: {tb_dir}")
 
     def after_train_iter(self, trainer: "BaseTrainer", batch_idx: int, outputs: Dict[str, Any]) -> None:
+        if not getattr(trainer, "is_main_process", True):
+            return
+
         if self.writer is None:
             return
 
@@ -70,6 +74,9 @@ class TensorboardHook(BaseHook):
             self.writer.add_image(tag, img_tensor, global_step=step)
 
     def after_val(self, trainer: "BaseTrainer", val_metrics: Dict[str, float]) -> None:
+        if not getattr(trainer, "is_main_process", True):
+            return
+
         if self.writer is None:
             return
 
@@ -79,6 +86,9 @@ class TensorboardHook(BaseHook):
                 self.writer.add_scalar(f"val/{k}", float(v), global_step=epoch)
 
     def after_train(self, trainer: "BaseTrainer") -> None:
+        if not getattr(trainer, "is_main_process", True):
+            return
+
         if self.writer is not None:
             self.writer.flush()
             self.writer.close()

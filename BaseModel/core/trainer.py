@@ -464,7 +464,7 @@ class BaseTrainer:
             if hasattr(raw_model, "forward_val") and callable(raw_model.forward_val):
                 outputs = raw_model.forward_val(inputs, targets)
             else:
-                preds = self.model(inputs)
+                preds = self.model(inputs, targets) if targets is not None else self.model(inputs)
                 outputs = preds if isinstance(preds, dict) and "preds" in preds else {"preds": preds}
 
             # If model didn't calculate loss internally, compute it via trainer.loss_fn

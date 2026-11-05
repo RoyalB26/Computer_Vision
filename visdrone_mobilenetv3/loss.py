@@ -11,7 +11,7 @@ from .utils import cxcywh_to_xyxy, xywh_to_xyxy
 
 
 def compute_multi_ref_loss(
-    ref_tensor: torch.Tensor,
+    ref_tensor: Union[torch.Tensor, Dict[str, torch.Tensor]],
     targets: Optional[List[Dict[str, torch.Tensor]]],
     device: torch.device,
     num_classes: int = 10,
@@ -20,13 +20,13 @@ def compute_multi_ref_loss(
     scale_range: Optional[Tuple[float, float]] = None,
 ) -> torch.Tensor:
     """
-    Tính toán Ref Loss đa điểm (Vector hóa 100% trên GPU - không đồng bộ CPU, không dùng all_reduce gây deadlock):
+    Tính toán Ref Loss đa điểm (Vector hóa 100% trên GPU - không đồng bộ CPU, không all_reduce tránh deadlock):
     1. Nhiều ref point có thể trỏ về cùng 1 object (mỗi object nhận K điểm mục tiêu phân tán trong box).
-    2. Các ref point trỏ về cùng 1 object phải có vị trí khác nhau (scatter mask + phạt repulsion nếu quá gần nhau).
+    2. Các ref point trỏ về cùng 1 object phải có vị trí khác nhau (phạt repulsion nếu quá gần nhau).
     3. Bao quát công bằng mọi object trong ảnh (mỗi object đều có quota K điểm, không bị dồn hết vào 1 object).
 
     Args:
-        ref_tensor: Tensor [B, 2, H, W] hoặc [B, N, 2] tọa độ reference points [0, 1].
+        ref_tensor: Tensor [B, 2, H, W] hoặc [B, N, 2] tọa độ reference points [0, 1], hoặc Dict của chúng.
         targets: List target dicts.
         device: torch.device.
         num_classes: Số lượng class đối tượng.
@@ -36,6 +36,20 @@ def compute_multi_ref_loss(
     Returns:
         torch.Tensor: Scalar loss cho reference points.
     """
+    if isinstance(ref_tensor, dict):
+        losses = [
+            compute_multi_ref_loss(
+                ref_tensor=v,
+                targets=targets,
+                device=device,
+                num_classes=num_classes,
+                num_ref_per_obj=num_ref_per_obj,
+                repulsion_weight=repulsion_weight,
+            )
+            for v in ref_tensor.values()
+        ]
+        return sum(losses) / max(len(losses), 1)
+
     if targets is None or ref_tensor is None:
         return ref_tensor.sum() * 0.0 if ref_tensor is not None else torch.tensor(0.0, device=device)
 
@@ -47,7 +61,6 @@ def compute_multi_ref_loss(
     else:
         return ref_tensor.sum() * 0.0
 
-    # 1. Gom toàn bộ GT boxes trong batch thành 1 tensor duy nhất (tránh boolean indexing lặp nhiều lần gây GPU-CPU sync)
     boxes_list = []
     labels_list = []
     batch_idx_list = []
@@ -101,7 +114,7 @@ def compute_multi_ref_loss(
     dtype = ref_flat.dtype
     if len(labels_list) == len(boxes_list):
         all_labels = torch.cat(labels_list, dim=0)
-        valid_f = ((all_labels >= 0) & (all_labels < num_classes)).to(dtype)  # [Total_M], tránh boolean indexing gây GPU-CPU sync
+        valid_f = ((all_labels >= 0) & (all_labels < num_classes)).to(dtype)
     else:
         valid_f = torch.ones(total_m, device=device, dtype=dtype)
 
@@ -132,45 +145,39 @@ def compute_multi_ref_loss(
     w = all_boxes[:, 2].clamp(0.001, 1.0)
     h = all_boxes[:, 3].clamp(0.001, 1.0)
 
-    centers = torch.stack([cx, cy], dim=-1)  # [Total_M, 2]
-    wh = torch.stack([w, h], dim=-1)        # [Total_M, 2]
+    centers = torch.stack([cx, cy], dim=-1)
+    wh = torch.stack([w, h], dim=-1)
 
-    # Tạo K điểm mục tiêu khác nhau cho mỗi object: [Total_M, K, 2]
     target_points = (centers.unsqueeze(1) + rel_offsets.unsqueeze(0) * wh.unsqueeze(1)).clamp(0.0, 1.0)
-
-    # Lấy tập ref tương ứng của từng ảnh cho mỗi object: [Total_M, N, 2]
     obj_refs = ref_flat[batch_idx]
 
-    # 2. Matching 100% trên GPU trong no_grad (không dùng scipy/CPU, không dùng cdist p=1 chậm)
+    # Matching 100% trên GPU trong no_grad (tránh CPU-GPU sync)
     with torch.no_grad():
-        cost = (target_points.unsqueeze(2) - obj_refs.unsqueeze(1)).abs().sum(dim=-1)  # [Total_M, K, N]
+        cost = (target_points.unsqueeze(2) - obj_refs.unsqueeze(1)).abs().sum(dim=-1)
         chosen_indices = []
         for k in range(num_ref_per_obj):
-            idx_k = cost[:, k, :].argmin(dim=-1)  # [Total_M]
+            idx_k = cost[:, k, :].argmin(dim=-1)
             chosen_indices.append(idx_k)
             if k + 1 < num_ref_per_obj:
                 cost.scatter_(2, idx_k.view(-1, 1, 1).expand(-1, num_ref_per_obj, 1), float("inf"))
-        min_c = torch.stack(chosen_indices, dim=1)  # [Total_M, K]
+        min_c = torch.stack(chosen_indices, dim=1)
 
-    matched_refs = torch.gather(obj_refs, 1, min_c.unsqueeze(-1).expand(-1, -1, 2))  # [Total_M, K, 2]
+    matched_refs = torch.gather(obj_refs, 1, min_c.unsqueeze(-1).expand(-1, -1, 2))
 
-    # 3. Pull loss: Kéo các điểm ref về các vị trí đa dạng của object
     pull_per_obj = F.smooth_l1_loss(matched_refs, target_points, beta=0.01, reduction="none").sum(dim=(1, 2))
     total_pull_loss = (pull_per_obj * valid_f).sum()
 
-    # 4. Diversity / Repulsion loss: Vector hóa toàn bộ cặp điểm cho tất cả object cùng lúc
     if num_ref_per_obj > 1:
         triu_i, triu_j = torch.triu_indices(num_ref_per_obj, num_ref_per_obj, offset=1, device=device)
-        pair_dists = torch.norm(matched_refs[:, triu_i] - matched_refs[:, triu_j], p=2, dim=-1)  # [Total_M, num_pairs]
+        pair_dists = torch.norm(matched_refs[:, triu_i] - matched_refs[:, triu_j], p=2, dim=-1)
         obj_scale = torch.sqrt(w * h)
-        margins = torch.clamp(0.25 * obj_scale, min=0.02, max=0.15).unsqueeze(1)  # [Total_M, 1]
+        margins = torch.clamp(0.25 * obj_scale, min=0.02, max=0.15).unsqueeze(1)
         rep_per_obj = F.relu(margins - pair_dists).sum(dim=-1)
         total_rep_loss = (rep_per_obj * valid_f).sum()
     else:
         total_rep_loss = ref_tensor.sum() * 0.0
 
-    # Chuẩn hóa cục bộ trên từng GPU (DDP sẽ tự động trung bình hóa gradient giữa các GPU khi backward,
-    # tuyệt đối không gọi all_reduce ở đây vì nếu 1 GPU có 0 object ở tầng c12 sẽ gây lệch pha all_reduce -> deadlock)
+    # Chuẩn hóa cục bộ trên mỗi GPU (DDP tự động trung bình hóa gradient khi backward)
     norm_pts = (valid_f.sum() * num_ref_per_obj).clamp(min=1.0)
     return (total_pull_loss + repulsion_weight * total_rep_loss) / norm_pts + (ref_tensor.sum() * 0.0)
 
@@ -210,11 +217,7 @@ class MobileNetDetectionLoss(nn.Module):
         self.alpha = alpha
         self.num_ref_per_obj = num_ref_per_obj
         self.ref_repulsion_weight = ref_repulsion_weight
-        self.scale_ranges = scale_ranges or {
-            "c3": (0.0, 0.20),
-            "c5": (0.03, 0.40),
-            "c12": (0.10, 1.0),
-        }
+        self.scale_ranges = scale_ranges
 
         # 3x3 Gaussian Kernel
         self.register_buffer(
@@ -241,7 +244,7 @@ class MobileNetDetectionLoss(nn.Module):
         if obj_logits is None and sampling_info is not None and "obj_logits" in sampling_info:
             obj_logits = sampling_info["obj_logits"]
 
-        # Khởi tạo 0.0 gắn với đồ thị tính toán của pred_boxes / sampling_info để DDP không bao giờ báo thiếu grad
+        # Khởi tạo loss gắn với đồ thị tính toán để DDP không bao giờ báo thiếu gradient
         total_box_loss = pred_boxes.sum() * 0.0
         total_deform_in_box = cls_logits.sum() * 0.0
         if sampling_info is not None:
@@ -249,6 +252,7 @@ class MobileNetDetectionLoss(nn.Module):
                 total_deform_in_box = total_deform_in_box + sampling_info["sampling_locations"].sum() * 0.0
             if "attn_weights" in sampling_info:
                 total_deform_in_box = total_deform_in_box + sampling_info["attn_weights"].sum() * 0.0
+
         num_pos_total = 0
 
         # Khởi tạo center mask cho toàn bộ batch [B, num_classes, H, W]
@@ -290,7 +294,6 @@ class MobileNetDetectionLoss(nn.Module):
                     gt_h = gt_boxes[:, 3].clamp(min=1e-4)
                     gt_xyxy = xywh_to_xyxy(gt_boxes)
 
-                # Lọc theo scale_range của tầng tương ứng (nếu có)
                 if scale_range is not None:
                     scale = torch.sqrt(gt_w * gt_h)
                     scale_mask = (scale >= scale_range[0]) & (scale <= scale_range[1])
@@ -326,10 +329,10 @@ class MobileNetDetectionLoss(nn.Module):
 
                         # Ràng buộc Deformable In-Box Alignment (nếu có sampling_info)
                         if sampling_info is not None and "sampling_locations" in sampling_info and "attn_weights" in sampling_info:
-                            b_locs = sampling_info["sampling_locations"][b]  # [H, W, nh, np, 2]
-                            b_attn = sampling_info["attn_weights"][b]        # [H, W, nh, np]
-                            pos_pts = b_locs[grid_y, grid_x]                 # [num_pos, nh, np, 2]
-                            pos_w = b_attn[grid_y, grid_x]                   # [num_pos, nh, np]
+                            b_locs = sampling_info["sampling_locations"][b]
+                            b_attn = sampling_info["attn_weights"][b]
+                            pos_pts = b_locs[grid_y, grid_x]
+                            pos_w = b_attn[grid_y, grid_x]
 
                             px = pos_pts[..., 0]
                             py = pos_pts[..., 1]
@@ -455,7 +458,7 @@ class MobileNetDetectionLoss(nn.Module):
             boxes_dict = pred_boxes
             obj_dict = obj_logits if isinstance(obj_logits, dict) else {}
             samp_dict = sampling_info if isinstance(sampling_info, dict) else {}
-            range_dict = self.scale_ranges
+            range_dict = self.scale_ranges or {}
 
         results = {}
         for k in cls_dict.keys():
