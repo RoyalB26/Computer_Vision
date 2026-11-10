@@ -39,6 +39,8 @@ data:
     batch_size: 4
     shuffle: true
     num_workers: 4
+    prefetch_factor: 2
+    persistent_workers: True
 
   val:
     dataset:
@@ -51,10 +53,11 @@ data:
       seed: 42
       pipeline:
         - type: "Action_Slot_Transform"
-    batch_size: 4
+    batch_size: 1
     shuffle: true
-    num_workers: 4
-
+    num_workers: 0
+    prefetch_factor: 2
+    persistent_workers: True
 # 3. Optimizer Configuration
 optimizer:
   type: "AdamW"
