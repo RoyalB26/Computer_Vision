@@ -30,7 +30,11 @@ class X3DBackbone(BaseBackbone):
 
     def __init__(self, pretrained: bool = True, freeze_stages: int = 3, freeze_all: bool = False, unfreeze_all: bool = False):
         super().__init__()
-        x3d_hub = torch.hub.load('facebookresearch/pytorchvideo:main', 'x3d_m', pretrained=pretrained)
+        try:
+            from pytorchvideo.models.hub import x3d_m
+            x3d_hub = x3d_m(pretrained=pretrained)
+        except Exception:
+            x3d_hub = torch.hub.load('facebookresearch/pytorchvideo:main', 'x3d_m', pretrained=pretrained)
         # All residual stages except the final 1x1x1 classification head
         self.blocks = x3d_hub.blocks[:-1]
         self._out_channels = 192

@@ -19,7 +19,11 @@ class X3D_Baseline(nn.Module):
         self.num_ego_class = num_ego_class
         self.num_actor_class = num_actor_class
 
-        x3d_hub = torch.hub.load('facebookresearch/pytorchvideo:main', 'x3d_m', pretrained=True)
+        try:
+            from pytorchvideo.models.hub import x3d_m
+            x3d_hub = x3d_m(pretrained=pretrained if 'pretrained' in locals() else True)
+        except Exception:
+            x3d_hub = torch.hub.load('facebookresearch/pytorchvideo:main', 'x3d_m', pretrained=True)
         self.blocks = x3d_hub.blocks
         in_feat = 2048
 
