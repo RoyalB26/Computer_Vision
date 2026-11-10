@@ -37,7 +37,7 @@ data:
         - type: "Action_Slot_Transform"
     batch_size: 16
     shuffle: true
-    num_workers: 8
+    num_workers: 12
 
   val:
     dataset:
@@ -51,7 +51,7 @@ data:
         - type: "Action_Slot_Transform"
     batch_size: 16
     shuffle: true
-    num_workers: 4
+    num_workers: 12
 
 # 3. Optimizer Configuration
 optimizer:
