@@ -131,6 +131,11 @@ class BaseTrainer:
             os.makedirs(self.work_dir, exist_ok=True)
         self._register_default_hooks()
 
+        # Attach trainer reference to metrics if supported
+        for metric in self.metrics.values():
+            if hasattr(metric, "set_trainer"):
+                metric.set_trainer(self)
+
     @property
     def is_main_process(self) -> bool:
         """Check if current process is the main rank (Rank 0)."""
@@ -379,8 +384,12 @@ class BaseTrainer:
         self.model.eval()
         self.call_hook("before_val")
 
-        # Reset all metrics
+        # Reset all metrics and set current epoch
         for metric in self.metrics.values():
+            if hasattr(metric, "set_epoch"):
+                metric.set_epoch(self.epoch + 1)
+            elif hasattr(metric, "epoch"):
+                metric.epoch = self.epoch + 1
             if hasattr(metric, "reset"):
                 metric.reset()
 

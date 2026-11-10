@@ -195,6 +195,7 @@ class VisdroneDetector(BaseModel):
         targets: Optional[List[Dict[str, torch.Tensor]]] = None,
         **kwargs,
     ) -> Dict[str, torch.Tensor]:
+        
         map_pred, feat_deform = self.extract_features(inputs)
         head_out = self.head(map_pred, feat_deform)
 

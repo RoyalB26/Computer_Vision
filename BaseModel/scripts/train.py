@@ -208,8 +208,11 @@ def main():
 
     # 14. Start Training or Eval Only
     if args.eval_only:
+        trainer.call_hook("before_train")
         logger.info("Executing evaluation only...")
         val_metrics = trainer.val_epoch()
+        trainer.call_hook("after_epoch")
+        trainer.call_hook("after_train")
         logger.info(f"Final Evaluation Metrics: {val_metrics}")
     else:
         trainer.train()

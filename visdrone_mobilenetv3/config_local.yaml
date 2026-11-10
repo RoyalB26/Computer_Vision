@@ -38,7 +38,7 @@ data:
         - type: "Resize"
           size: [960, 960]
         - type: "ToTensor"
-    batch_size: 4
+    batch_size: 2
     shuffle: true
     num_workers: 0
     collate_fn:
@@ -57,7 +57,7 @@ data:
         - type: "Resize"
           size: [960, 960]
         - type: "ToTensor"
-    batch_size: 1
+    batch_size: 2
     shuffle: false
     num_workers: 0
     collate_fn:

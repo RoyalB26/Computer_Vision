@@ -381,6 +381,15 @@ class ExcelTracker(BaseHook):
 
         self._last_val_metrics = val_metrics.copy() if val_metrics else {}
 
+        # Update Per_Class_Lastest sheet if provided by any metric
+        epoch_idx = (getattr(trainer, "epoch", 0) or 0) + 1
+        if hasattr(trainer, "metrics"):
+            for m in trainer.metrics.values():
+                if hasattr(m, "get_per_class_records"):
+                    records = m.get_per_class_records(epoch=epoch_idx)
+                    if records:
+                        self.sheets_data["Per_Class_Lastest"] = records
+
     def after_epoch(self, trainer: "BaseTrainer") -> None:
         """Compile epoch data and update Excel workbook."""
         if not getattr(trainer, "is_main_process", True):
@@ -474,7 +483,7 @@ class ExcelTracker(BaseHook):
         # 4. Custom Registered Sheets
         # ---------------------------------------------------------
         for sheet_name, metric_dict in self.custom_metrics.items():
-            if sheet_name not in ["Epoch_Overview", "Gradients_Detail", "Detection"]:
+            if sheet_name not in ["Epoch_Overview", "Gradients_Detail", "Detection", "Per_Class_Lastest"]:
                 custom_row: Dict[str, Any] = {"Epoch": epoch_idx}
                 for col_name, callback in metric_dict.items():
                     try:
@@ -482,6 +491,14 @@ class ExcelTracker(BaseHook):
                     except Exception:
                         custom_row[col_name] = None
                 self.sheets_data[sheet_name].append(custom_row)
+
+        # Update Per_Class_Lastest sheet if provided by any metric
+        if hasattr(trainer, "metrics"):
+            for m in trainer.metrics.values():
+                if hasattr(m, "get_per_class_records"):
+                    records = m.get_per_class_records(epoch=epoch_idx)
+                    if records:
+                        self.sheets_data["Per_Class_Lastest"] = records
 
         # 4. Save to Excel file
         if self.auto_save:
@@ -491,6 +508,14 @@ class ExcelTracker(BaseHook):
         """Final save upon training completion."""
         if not getattr(trainer, "is_main_process", True):
             return
+
+        epoch_idx = (getattr(trainer, "epoch", 0) or 0) + 1
+        if hasattr(trainer, "metrics"):
+            for m in trainer.metrics.values():
+                if hasattr(m, "get_per_class_records"):
+                    records = m.get_per_class_records(epoch=epoch_idx)
+                    if records:
+                        self.sheets_data["Per_Class_Lastest"] = records
 
         self.save()
 

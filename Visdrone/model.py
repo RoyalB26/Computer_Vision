@@ -884,6 +884,7 @@ class VisDroneDetector(BaseModel):
         targets: Optional[List[Dict[str, torch.Tensor]]] = None,
         **kwargs,
     ) -> Dict[str, torch.Tensor]:
+        
         """Tính toán Detection Loss trong quá trình huấn luyện với FPN và Deformable Sampling Loss."""
         slots, map_pred, feat_deform, p5, attn = self.extract_features(inputs)
         cls_logits, pred_boxes, sampling_info = self.head(slots, map_pred, feat_deform)
