@@ -39,7 +39,7 @@ class Action_Slot_Transform:
 
         for i, img in enumerate(data):
             if isinstance(img, torch.Tensor) or hasattr(img, "resize"):
-                data[i] = TF.resize(img, [224,224], interpolation=InterpolationMode.BILINEAR)
+                data[i] = TF.resize(img, [256,768], interpolation=InterpolationMode.BILINEAR)
         return data
     
     def resize_masks(self, data):

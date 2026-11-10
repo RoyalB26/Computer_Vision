@@ -193,7 +193,7 @@ class ActionSlotLoss(nn.Module):
             bg_attn = attn[:, ::self.mask_every_frame, -1, :, :].reshape(b, l//self.mask_every_frame, h, w)
             bg_attn_loss = self.obj_bce(bg_attn, bg_seg)
 
-        loss = {'attn_loss':attn_loss,'bg_attn_loss':bg_attn_loss}
+        loss = {'attn_loss':attn_loss,'bg_attn_loss': 0.5 * bg_attn_loss}
         if validate:
             loss['action_inter'] = None
             loss['action_union'] = None
@@ -219,6 +219,6 @@ class ActionSlotLoss(nn.Module):
         actor_loss = self.actor_loss(pred['actor'],label['actor'])
         attention_loss = self.attn_loss(pred['attn'],label,validate)
 
-        loss = {"loss_ego":ego_loss, "loss_actor": actor_loss} 
+        loss = {"loss_ego": 0.5 * ego_loss, "loss_actor": actor_loss} 
         loss |= attention_loss
         return loss

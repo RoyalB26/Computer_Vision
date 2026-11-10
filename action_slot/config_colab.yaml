@@ -56,7 +56,7 @@ data:
 # 3. Optimizer Configuration
 optimizer:
   type: "AdamW"
-  lr: 0.002
+  lr: 0.0005
   weight_decay: 0.0001
 
 # 4. Learning Rate Scheduler Configuration

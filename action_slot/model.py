@@ -80,7 +80,7 @@ class ActionSlotModel(BaseModel):
             input_dim=self.slot_dim,
             resolution=list(resolution3d),
             num_actor_class=num_actor_class,
-            slot_dropout=kwargs.get('slot_dropout', 0.1),
+            slot_dropout=kwargs.get('slot_dropout', 0.0),
         )
 
         # 5. Modular Classification Head
@@ -178,7 +178,7 @@ class ActionSlotModel(BaseModel):
         
         """Tính toán Detection Loss trong quá trình huấn luyện với FPN và Deformable Sampling Loss."""
         slots, ego_x, attn_masks = self.extract_features(inputs)
-        pred_ego, pred_actor = self.head(slots, ego_x=ego_x, attn=attn_masks)
+        pred_ego, pred_actor = self.head(slots, ego_x=ego_x)
 
         pred = {
             "actor": pred_actor,
@@ -196,7 +196,7 @@ class ActionSlotModel(BaseModel):
     ) -> List[Dict[str, torch.Tensor]]:
         """Dự đoán bounding box, class label và confidence score khi suy luận / đánh giá."""
         slots, ego_x, attn_masks = self.extract_features(inputs)
-        pred_ego, pred_actor = self.head(slots, ego_x=ego_x, attn=attn_masks)
+        pred_ego, pred_actor = self.head(slots, ego_x=ego_x)
 
         pred = {
             "actor": pred_actor,
@@ -214,7 +214,7 @@ class ActionSlotModel(BaseModel):
     ) -> Dict[str, Any]:
         """Validation forward pass: tính validation losses và trích xuất preds phục vụ tính mAP."""
         slots, ego_x, attn_masks = self.extract_features(inputs)
-        pred_ego, pred_actor = self.head(slots, ego_x=ego_x, attn=attn_masks)
+        pred_ego, pred_actor = self.head(slots, ego_x=ego_x)
 
         pred = {
             "actor": pred_actor,

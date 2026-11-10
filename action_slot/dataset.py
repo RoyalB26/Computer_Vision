@@ -272,9 +272,23 @@ class ACTION_SLOT_LMDBDataset(BaseDataset):
 
 if __name__ == "__main__":
     data_roots = [r"D:/apps/Datasets/TACO/data"]
-    ds = ACTION_SLOT_LMDBDataset(data_root=data_roots, split="val")
+    ds = ACTION_SLOT_LMDBDataset(data_root=data_roots, split="train")
     print(f"Loaded {len(ds)} samples across roots: {data_roots}")
     if len(ds) > 0:
-        sample = ds.get_data_info(0)
-        print("Sample 0 path:", sample["targets"]["path"]["rgb_path"])
-        print("Num video frames:", len(sample["inputs"]))
+        for i in range(len(ds)):
+            sample = ds.get_data_info(i)
+            if "ap_Town07" in sample["targets"]["path"]["rgb_path"] and "t2" in sample["targets"]["path"]["rgb_prefix"] and "12" in sample["targets"]["path"]["rgb_prefix"]:
+                print(f"Sample {i} path:", sample["targets"]["path"]["rgb_path"])
+                print(f"Sample {i} rgb_prefix:", sample["targets"]["path"]["rgb_prefix"])
+                print("Num video frames:", len(sample["inputs"]))
+                # for x in sample["inputs"]:
+                #     x.show()
+                import matplotlib.pyplot as plt
+
+                fig, axes = plt.subplots(4, 4, figsize=(16, 6))
+                for i, ax in enumerate(axes.flat):
+                    ax.imshow(sample["inputs"][i])
+                    ax.axis('off')
+
+                plt.tight_layout()
+                plt.show()

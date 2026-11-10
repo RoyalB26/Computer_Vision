@@ -63,8 +63,10 @@ class SlotAttention(nn.Module):
         self.slot_dropout = slot_dropout
 
         # Learnable Gaussian parameters for slot initialization
-        self.slots_mu = nn.Parameter(torch.randn(1, num_slots, dim))
-        self.slots_sigma = nn.Parameter(torch.randn(1, num_slots, dim).abs())
+        self.slots_mu = nn.Parameter(torch.randn(1, 1, dim)).cuda()
+        self.slots_sigma = torch.randn(1, 1, dim).cuda()
+        self.slots_sigma = nn.Parameter(self.slots_sigma.absolute())
+
 
         self.FC1 = nn.Linear(dim, dim)
         self.FC2 = nn.Linear(dim, dim)
@@ -81,17 +83,15 @@ class SlotAttention(nn.Module):
         self.norm_input = nn.LayerNorm(dim)
         self.norm_slots = nn.LayerNorm(dim)
         self.norm_pre_ff = nn.LayerNorm(dim)
-
-        self.attn_dropout = nn.Dropout(p=slot_dropout) if slot_dropout > 0 else nn.Identity()
-        self.ff_dropout = nn.Dropout(p=slot_dropout) if slot_dropout > 0 else nn.Identity()
-
-        # Direct learnable slots parameter (deterministic & fully differentiable)
-        self.slots = nn.Parameter(torch.randn(1, num_slots, dim) * 0.02)
-
+        
+        mu = self.slots_mu.expand(1, self.num_slots, -1)
+        sigma = self.slots_sigma.expand(1, self.num_slots, -1)
+        slots = torch.normal(mu, sigma)
         self.pool = nn.AdaptiveAvgPool1d(1)
-        self.pe = SoftPositionEmbed3D(
-            dim, [resolution[0], resolution[1], resolution[2]]
-        )
+        self.pe = SoftPositionEmbed3D(dim, [resolution[0], resolution[1], resolution[2]])
+
+        slots = slots.contiguous()
+        self.register_buffer("slots", slots)
 
     def get_3d_slot(self, slots, inputs):
         b, l, h, w, d = inputs.shape
@@ -103,40 +103,29 @@ class SlotAttention(nn.Module):
         inputs = F.relu(inputs)
         inputs = self.FC2(inputs)
 
-        if slots.shape[0] != b:
-            slots = slots.expand(b, -1, -1)
+        slots_prev = slots
 
+        b, n, d = inputs.shape
         inputs = self.norm_input(inputs)
-        k = self.to_k(inputs)
-        v = self.to_v(inputs)
+        k, v = self.to_k(inputs), self.to_v(inputs)
         slots = self.norm_slots(slots)
         q = self.to_q(slots)
-
-        self.last_q = q.detach()
-        self.last_k = k.detach()
-        self.last_v = v.detach()
-
         dots = torch.einsum('bid,bjd->bij', q, k) * self.scale
         attn_ori = dots.softmax(dim=1) + self.eps
         attn = attn_ori / attn_ori.sum(dim=-1, keepdim=True)
-        self.last_attn = attn_ori.detach()
+        slots = torch.einsum('bjd,bij->bid', v, attn)
 
-        # Attention dropout for regularizing peak sharpness
-        attn_dropped = self.attn_dropout(attn)
-
-        slots = torch.einsum('bjd,bij->bid', v, attn_dropped)
         slots = slots.reshape(b, -1, d)
-
         if self.allocated_slot:
             slots = slots[:, :self.num_actor_class, :]
         else:
             slots = slots[:, :self.num_slots, :]
-
-        # Feedforward with dropout
-        ff_out = self.fc2(self.ff_dropout(F.relu(self.fc1(self.norm_pre_ff(slots)))))
-        slots = slots + ff_out
+        slots = slots + self.fc2(F.relu(self.fc1(self.norm_pre_ff(slots))))
         return slots, attn_ori
 
+    
     def forward(self, inputs, num_slots=None):
-        slots_out, attns = self.get_3d_slot(self.slots, inputs)
+        b, nf, h, w, d = inputs.shape
+        slots = self.slots.expand(b,-1,-1)
+        slots_out, attns = self.get_3d_slot(slots, inputs)
         return slots_out, attns
