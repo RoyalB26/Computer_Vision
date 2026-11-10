@@ -1,0 +1,42 @@
+# ==============================================================================
+# Requirements for Action Slot (Spatiotemporal Action Recognition & Slot Attention)
+# ==============================================================================
+
+# --- Deep Learning Framework ---
+# PyTorch và Torchvision hỗ trợ CUDA GPU
+torch>=2.0.0
+torchvision>=0.15.0
+
+# --- Video Backbones & PyTorchVideo Hub Models ---
+# X3D, SlowFast và các mô hình trích xuất đặc trưng video từ PyTorchVideo / Facebook Research
+pytorchvideo>=0.1.5
+fvcore>=0.1.5
+iopath>=0.1.10
+
+# --- Data Loading, Storage & Image Processing ---
+# Đọc dữ liệu LMDB tốc độ cao cho tập dữ liệu TACO / CARLA video clips
+lmdb>=3.0.0
+numpy>=1.24.0,<2.0.0
+Pillow>=9.4.0
+opencv-python>=4.5.0
+
+# --- Evaluation Metrics & Loss Computation ---
+# scikit-learn: Tính PR-AUC (average_precision_score), precision, recall, f1-score trong TACOActionMetric
+# scipy: Thuật toán Hungarian matching (linear_sum_assignment) trong ActionSlotLoss
+scikit-learn>=1.2.0
+scipy>=1.10.0
+
+# --- Configuration & Terminal UI ---
+# PyYAML: Đọc và phân giải cấu hình YAML (config.yaml)
+# tqdm: Thanh tiến trình hiển thị trong quá trình Train / Validation
+PyYAML>=6.0
+tqdm>=4.65.0
+
+# --- Experiment Tracking & Excel Reports ---
+# pandas & openpyxl: Ghi nhận và xuất toàn bộ metrics, gradient, per-class records vào file Excel (training_metrics.xlsx)
+pandas>=2.0.0
+openpyxl>=3.1.2
+
+# --- Optional Visualizations & TensorBoard ---
+matplotlib>=3.7.0
+tensorboard>=2.10.0
