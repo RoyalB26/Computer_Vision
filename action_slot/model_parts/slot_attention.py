@@ -65,7 +65,7 @@ class SlotAttention(nn.Module):
         # Learnable Gaussian parameters for slot initialization
         self.slots_mu = nn.Parameter(torch.randn(1, 1, dim))
         self.slots_sigma = nn.Parameter(torch.randn(1, 1, dim).abs())
-
+        self.register_buffer("slots_eps", torch.randn(1, num_slots, dim))
 
         self.FC1 = nn.Linear(dim, dim)
         self.FC2 = nn.Linear(dim, dim)
@@ -83,14 +83,8 @@ class SlotAttention(nn.Module):
         self.norm_slots = nn.LayerNorm(dim)
         self.norm_pre_ff = nn.LayerNorm(dim)
         
-        mu = self.slots_mu.expand(1, self.num_slots, -1)
-        sigma = self.slots_sigma.expand(1, self.num_slots, -1)
-        slots = torch.normal(mu, sigma)
         self.pool = nn.AdaptiveAvgPool1d(1)
         self.pe = SoftPositionEmbed3D(dim, [resolution[0], resolution[1], resolution[2]])
-
-        slots = slots.contiguous()
-        self.register_buffer("slots", slots)
 
     def get_3d_slot(self, slots, inputs):
         b, l, h, w, d = inputs.shape
@@ -125,6 +119,8 @@ class SlotAttention(nn.Module):
     
     def forward(self, inputs, num_slots=None):
         b, nf, h, w, d = inputs.shape
-        slots = self.slots.expand(b,-1,-1)
+        mu = self.slots_mu.expand(1, self.num_slots, -1)
+        sigma = self.slots_sigma.expand(1, self.num_slots, -1)
+        slots = (mu + sigma * self.slots_eps).expand(b, -1, -1)
         slots_out, attns = self.get_3d_slot(slots, inputs)
         return slots_out, attns
