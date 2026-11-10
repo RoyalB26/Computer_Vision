@@ -29,7 +29,7 @@ data:
     dataset:
       type: "ACTION_SLOT_LMDBDataset"
       data_root:
-        - "content/data"
+        - "/content/data"
       split: "train"
       sequence_len: 16
       seed: 42
@@ -43,7 +43,7 @@ data:
     dataset:
       type: "ACTION_SLOT_LMDBDataset"
       data_root:
-        - "content/data"
+        - "/content/data"
       split: "val"
       sequence_len: 16
       seed: 42
@@ -97,8 +97,8 @@ hooks:
 
 # 7. Training Engine Configuration
 train_cfg:
-  max_epochs: 1
-  val_interval: 1                           # Đánh giá validation và tính mAP ở MỌI epoch để tracking liên tục
+  max_epochs: 100
+  val_interval: 10                           # Đánh giá validation và tính mAP ở MỌI epoch để tracking liên tục
   log_interval: 2500                        # In log tiến trình mỗi 2500 batches
   grad_clip: 1.0                            # Gradient clipping chuẩn 1.0 chống gradient explosion
   use_amp: false                            # Chạy FP32 chính xác cao
