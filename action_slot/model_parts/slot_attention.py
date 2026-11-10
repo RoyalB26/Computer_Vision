@@ -63,9 +63,8 @@ class SlotAttention(nn.Module):
         self.slot_dropout = slot_dropout
 
         # Learnable Gaussian parameters for slot initialization
-        self.slots_mu = nn.Parameter(torch.randn(1, 1, dim)).cuda()
-        self.slots_sigma = torch.randn(1, 1, dim).cuda()
-        self.slots_sigma = nn.Parameter(self.slots_sigma.absolute())
+        self.slots_mu = nn.Parameter(torch.randn(1, 1, dim))
+        self.slots_sigma = nn.Parameter(torch.randn(1, 1, dim).abs())
 
 
         self.FC1 = nn.Linear(dim, dim)

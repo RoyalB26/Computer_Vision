@@ -139,8 +139,9 @@ class TACOActionMetric(BaseMetric):
         # Multi-GPU Distributed Synchronization if applicable
         if torch.distributed.is_available() and torch.distributed.is_initialized():
             world_size = torch.distributed.get_world_size()
-            scores_tensor = torch.from_numpy(scores_arr).cuda()
-            targets_tensor = torch.from_numpy(targets_arr).cuda()
+            curr_dev = torch.device('cuda', torch.cuda.current_device()) if torch.cuda.is_available() else torch.device('cpu')
+            scores_tensor = torch.from_numpy(scores_arr).to(curr_dev)
+            targets_tensor = torch.from_numpy(targets_arr).to(curr_dev)
 
             gathered_scores = [torch.zeros_like(scores_tensor) for _ in range(world_size)]
             gathered_targets = [torch.zeros_like(targets_tensor) for _ in range(world_size)]

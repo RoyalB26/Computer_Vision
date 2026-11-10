@@ -20,7 +20,7 @@ def inter_and_union(pred, mask, num_class=1, start_class=0):
 
 
 class ActionSlotLoss(nn.Module):
-    def __init__(self, num_actor_class, attention_res=None, bce_pos_weight = 10, device = 'cpu'):
+    def __init__(self, num_actor_class, attention_res=None, bce_pos_weight = 10, device = None):
         super(ActionSlotLoss, self).__init__()
         self.num_actor_class = num_actor_class
         self.attention_res = attention_res
@@ -81,7 +81,7 @@ class ActionSlotLoss(nn.Module):
             batch_idx = torch.cat([torch.full_like(src, i) for i, (src, _) in enumerate(indx)]).detach()
             src_idx = torch.cat([src for (src, _) in indx]).detach()
             idx = (batch_idx, src_idx)
-            target_classes_o = torch.cat([t[J] for t, (_, J) in zip(label, indx)]).cuda()
+            target_classes_o = torch.cat([t[J] for t, (_, J) in zip(label, indx)]).to(pred.device)
             target_classes = torch.full(pred.shape[:2], self.num_actor_class,
                                 dtype=torch.int64, device=out_prob.device)
 
@@ -109,7 +109,7 @@ class ActionSlotLoss(nn.Module):
             obj_mask_list = []
             obj_mask = label['obj_masks']
             for i in range(self.seq_len//self.mask_every_frame):
-                obj_mask_list.append(obj_mask[i].to(self.device, dtype=torch.float32))
+                obj_mask_list.append(obj_mask[i].to(attn.device, dtype=torch.float32))
             obj_mask_list = torch.stack(obj_mask_list, 0)
             obj_mask_list = torch.permute(obj_mask_list, (1, 0, 2, 3, 4)) #[batch, len, n, h, w]
             b, l, n, h, w = obj_mask_list.shape
@@ -154,7 +154,7 @@ class ActionSlotLoss(nn.Module):
             class_idx = class_idx.view(b, self.num_actor_class, 1, 1, 1).repeat(1, 1, l, h, w)
             class_idx = torch.permute(class_idx, (0, 2, 1, 3, 4))
 
-            attn_gt = torch.zeros([b, l, self.num_actor_class, h, w], dtype=torch.float32).cuda()
+            attn_gt = torch.zeros([b, l, self.num_actor_class, h, w], dtype=torch.float32, device=action_attn.device)
             attn_loss = self.obj_bce(action_attn[class_idx], attn_gt[class_idx])
 
         # Action-slot, background mask + negative mask
@@ -175,7 +175,7 @@ class ActionSlotLoss(nn.Module):
             class_idx = class_idx.view(b, self.num_actor_class, 1, 1, 1).repeat(1, 1, l, h, w)
             class_idx = torch.permute(class_idx, (0, 2, 1, 3, 4))
 
-            attn_gt = torch.zeros([b, l, self.num_actor_class, h, w], dtype=torch.float32).cuda()
+            attn_gt = torch.zeros([b, l, self.num_actor_class, h, w], dtype=torch.float32, device=action_attn.device)
 
             attn_loss = self.obj_bce(action_attn[class_idx], attn_gt[class_idx])
             bg_attn_loss = self.obj_bce(bg_attn, bg_seg)
