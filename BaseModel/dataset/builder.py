@@ -30,6 +30,30 @@ def build_dataset(cfg: Union[Dict[str, Any], Dataset], default_args: Optional[Di
     return build_from_cfg(cfg, DATASETS, default_args=default_args)
 
 
+def _dataloader_worker_init_fn(worker_id: int):
+    """Worker initialization to prevent CPU thread thrashing and ensure reproducibility."""
+    import os
+    import random
+    import numpy as np
+    import torch
+
+    # Tắt đa luồng ẩn của OpenCV/NumPy/Torch trong từng worker để không tranh chấp CPU cores
+    try:
+        import cv2
+        cv2.setNumThreads(0)
+    except ImportError:
+        pass
+
+    torch.set_num_threads(1)
+    os.environ["OMP_NUM_THREADS"] = "1"
+    os.environ["MKL_NUM_THREADS"] = "1"
+
+    # Đảm bảo worker có seed ngẫu nhiên độc lập
+    worker_seed = (torch.initial_seed() + worker_id) % (2**32)
+    np.random.seed(worker_seed)
+    random.seed(worker_seed)
+
+
 def build_dataloader(
     dataset: Union[Dict[str, Any], Dataset],
     batch_size: int = 16,
@@ -38,6 +62,7 @@ def build_dataloader(
     pin_memory: bool = True,
     drop_last: bool = False,
     collate_fn: Optional[Union[str, Dict[str, Any], Callable]] = None,
+    worker_init_fn: Optional[Callable] = None,
     **kwargs,
 ) -> DataLoader:
     """Build a PyTorch DataLoader from dataset or dataset config.
@@ -63,6 +88,14 @@ def build_dataloader(
     if num_workers <= 0:
         kwargs.pop("persistent_workers", None)
         kwargs.pop("prefetch_factor", None)
+        init_fn = None
+    else:
+        init_fn = worker_init_fn if worker_init_fn is not None else _dataloader_worker_init_fn
+        # Mặc định cấu hình persistent_workers và prefetch_factor để pipeline nạp liên tục
+        if "persistent_workers" not in kwargs:
+            kwargs["persistent_workers"] = True
+        if "prefetch_factor" not in kwargs:
+            kwargs["prefetch_factor"] = 2
 
     return DataLoader(
         dataset=dataset,
@@ -73,5 +106,6 @@ def build_dataloader(
         pin_memory=pin_memory,
         drop_last=drop_last,
         collate_fn=collate_fn,
+        worker_init_fn=init_fn,
         **kwargs,
     )
