@@ -174,6 +174,13 @@ class ActionSlotModel(BaseModel):
         label['bg_seg'] = torch.stack(label['bg_seg'], dim = 0)
 
         loss = self.loss_fn(pred, label, validate)
+
+        # Attach predictions and ground truth for metric evaluation (e.g., train actor mAP)
+        if isinstance(loss, dict):
+            if "actor" in pred:
+                loss["pred_actor"] = pred["actor"].detach()
+            if "actor" in label and isinstance(label["actor"], torch.Tensor):
+                loss["target_actor"] = label["actor"].detach()
         
         return loss
 

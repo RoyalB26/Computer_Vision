@@ -30,6 +30,10 @@ class BaseHook:
         """Called after each training epoch finishes."""
         pass
 
+    def after_train_epoch(self, trainer: "BaseTrainer") -> None:
+        """Called immediately after training loop of an epoch finishes (before validation)."""
+        pass
+
     def before_train_iter(self, trainer: "BaseTrainer", batch_idx: int, data_batch: Dict[str, Any]) -> None:
         """Called before each training iteration."""
         pass

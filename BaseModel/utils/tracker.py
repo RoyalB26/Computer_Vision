@@ -410,6 +410,10 @@ class ExcelTracker(BaseHook):
             if k != "loss":
                 overview_row[f"Train_{k}"] = round(v / avg_count, 6)
 
+        # Train Actor mAP if tracked
+        if hasattr(trainer, "train_actor_map") and trainer.train_actor_map is not None:
+            overview_row["Train_Actor_mAP"] = round(float(trainer.train_actor_map), 6)
+
         # Validation Losses & Metrics
         if "val_loss" in self._last_val_metrics:
             overview_row["Val_Loss"] = round(float(self._last_val_metrics["val_loss"]), 6)

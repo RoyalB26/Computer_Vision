@@ -57,6 +57,7 @@ class ACTION_SLOT_LMDBDataset(BaseDataset):
         sequence_len: int = 16,
         mask_every_frame: int = 4,
         min_frames: int = 1,
+        filter_non_contiguous: bool = False,
         use_obj_mask: bool = False,
         num_samples: Optional[int] = None,
         test_mode: bool = False,
@@ -67,6 +68,7 @@ class ACTION_SLOT_LMDBDataset(BaseDataset):
         self.sequence_len = sequence_len
         self.mask_every_frame = mask_every_frame
         self.min_frames = min_frames
+        self.filter_non_contiguous = filter_non_contiguous
         self.use_obj_mask = use_obj_mask
         self.num_samples = num_samples
 
@@ -302,6 +304,21 @@ class ACTION_SLOT_LMDBDataset(BaseDataset):
             if matched_rgb is None or len(rgb_keys) < self.min_frames or not bg_keys:
                 continue
 
+            # Kiểm tra xem video có bị khuyết số frame ở giữa hay không
+            is_non_contiguous = False
+            try:
+                s_frame = int(rgb_keys[0].split("/")[-1].split(".")[0])
+                e_frame = int(rgb_keys[-1].split("/")[-1].split(".")[0])
+                if len(rgb_keys) != (e_frame - s_frame + 1):
+                    is_non_contiguous = True
+                    non_contiguous_count += 1
+            except Exception:
+                pass
+
+            # Loại bỏ các video bị khiếm khuyết nếu filter_non_contiguous=True
+            if self.filter_non_contiguous and is_non_contiguous:
+                continue
+
             videos, segs, case_type = self._build_scenario_clips(
                 rgb_keys=rgb_keys,
                 bg_keys=bg_keys,
@@ -311,14 +328,6 @@ class ACTION_SLOT_LMDBDataset(BaseDataset):
 
             if not videos:
                 continue
-
-            try:
-                s_frame = int(rgb_keys[0].split("/")[-1].split(".")[0])
-                e_frame = int(rgb_keys[-1].split("/")[-1].split(".")[0])
-                if len(rgb_keys) != (e_frame - s_frame + 1):
-                    non_contiguous_count += 1
-            except Exception:
-                pass
 
             if case_type in case_counts:
                 case_counts[case_type] += 1
@@ -348,7 +357,10 @@ class ACTION_SLOT_LMDBDataset(BaseDataset):
         print(f"  + Trường hợp 1 (>=50 frames liên tục) : {case_counts['case1_ge50']}")
         print(f"  + Trường hợp 2 (16 - 49 frames thực tế) : {case_counts['case2_16to49']}")
         print(f"  + Trường hợp 3 (<16 frames, nội suy đều): {case_counts['case3_lt16']}")
-        print(f"  + Số video bị khuyết số frame ở giữa  : {non_contiguous_count}")
+        if self.filter_non_contiguous:
+            print(f"  + Đã loại bỏ số video bị khuyết frame ở giữa: {non_contiguous_count}")
+        else:
+            print(f"  + Số video bị khuyết số frame ở giữa  : {non_contiguous_count}")
 
         indices = list(range(total))
         rng = random.Random(self.seed)

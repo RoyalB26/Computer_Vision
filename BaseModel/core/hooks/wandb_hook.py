@@ -97,6 +97,15 @@ class WandbHook(BaseHook):
         import wandb
         wandb.log({tag: wandb.Image(image, caption=caption)}, step=step)
 
+    def after_train_epoch(self, trainer: "BaseTrainer") -> None:
+        if not getattr(trainer, "is_main_process", True):
+            return
+
+        import wandb
+
+        if hasattr(trainer, "train_actor_map") and trainer.train_actor_map is not None:
+            wandb.log({"train/actor_mAP": round(float(trainer.train_actor_map), 6)}, step=trainer.iter)
+
     def after_val(self, trainer: "BaseTrainer", val_metrics: Dict[str, float]) -> None:
         if not getattr(trainer, "is_main_process", True):
             return

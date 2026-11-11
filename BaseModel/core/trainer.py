@@ -211,6 +211,7 @@ class BaseTrainer:
 
             # Train one epoch
             self.train_epoch()
+            self.call_hook("after_train_epoch")
 
             # Run validation if scheduled
             if self.should_validate(epoch):
