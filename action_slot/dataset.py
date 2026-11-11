@@ -148,18 +148,26 @@ class ACTION_SLOT_LMDBDataset(BaseDataset):
         bg_keys: List[str],
         clean_rgb_prefix: str,
         clean_bg_prefix: str,
-    ) -> Tuple[List[List[str]], List[List[str]]]:
-        """Build strided clips of length `self.sequence_len` for both `num_frame >= 50` and `num_frame < 50`."""
+    ) -> Tuple[List[List[str]], List[List[str]], str]:
+        """Build strided clips of length `self.sequence_len` for both `num_frame >= 50` and `num_frame < 50`.
+        
+        Returns:
+            (videos, segs, case_type) where case_type is one of:
+              - 'case1_ge50' (num_frame >= 50 and n_rgb >= 50)
+              - 'case2_16to49' (16 <= n_rgb < 50)
+              - 'case3_lt16' (n_rgb < 16)
+        """
         videos: List[List[str]] = []
         segs: List[List[str]] = []
         if not rgb_keys or not bg_keys:
-            return videos, segs
+            return videos, segs, "unknown"
 
         rgb_set = set(rgb_keys)
         bg_set = set(bg_keys)
         max_num = 50
         n_rgb = len(rgb_keys)
         ext = os.path.splitext(rgb_keys[0])[1] or ".jpg"
+        case_type = "unknown"
 
         try:
             start_frame = int(rgb_keys[0].split("/")[-1].split(".")[0])
@@ -185,10 +193,13 @@ class ACTION_SLOT_LMDBDataset(BaseDataset):
                 if len(videos_temp) == self.sequence_len:
                     videos.append(videos_temp)
                     segs.append(self._match_bg_keys(videos_temp, clean_bg_prefix, bg_set, bg_keys))
+            if videos:
+                case_type = "case1_ge50"
 
         # 2. Fallback for scenarios with num_frame < 50 (or sparse frame numbering where `videos` is still empty)
         if not videos:
             if n_rgb >= self.sequence_len:
+                case_type = "case2_16to49"
                 step_idx = max(1, n_rgb // self.sequence_len)
                 max_start = n_rgb - (self.sequence_len - 1) * step_idx
                 for m in range(min(max_num, max(1, max_start))):
@@ -197,12 +208,13 @@ class ACTION_SLOT_LMDBDataset(BaseDataset):
                     segs.append(self._match_bg_keys(videos_temp, clean_bg_prefix, bg_set, bg_keys))
             else:
                 # 0 < n_rgb < sequence_len: uniform temporal interpolation to exact `sequence_len` frames
+                case_type = "case3_lt16"
                 idxs = np.linspace(0, n_rgb - 1, self.sequence_len).round().astype(int).tolist()
                 videos_temp = [rgb_keys[i] for i in idxs]
                 videos.append(videos_temp)
                 segs.append(self._match_bg_keys(videos_temp, clean_bg_prefix, bg_set, bg_keys))
 
-        return videos, segs
+        return videos, segs, case_type
 
     def load_annotations(self) -> List[Dict[str, Any]]:
         """Scan annotation entries, resolve LMDB paths, and build strided frame sequences."""
@@ -228,6 +240,8 @@ class ACTION_SLOT_LMDBDataset(BaseDataset):
 
         self.videos_path = []
         self.label = {}
+        case_counts = {"case1_ge50": 0, "case2_16to49": 0, "case3_lt16": 0}
+        non_contiguous_count = 0
 
         for k, v in data.items():
             split_path = k.split("/")
@@ -288,7 +302,7 @@ class ACTION_SLOT_LMDBDataset(BaseDataset):
             if matched_rgb is None or len(rgb_keys) < self.min_frames or not bg_keys:
                 continue
 
-            videos, segs = self._build_scenario_clips(
+            videos, segs, case_type = self._build_scenario_clips(
                 rgb_keys=rgb_keys,
                 bg_keys=bg_keys,
                 clean_rgb_prefix=clean_rgb_prefix,
@@ -297,6 +311,17 @@ class ACTION_SLOT_LMDBDataset(BaseDataset):
 
             if not videos:
                 continue
+
+            try:
+                s_frame = int(rgb_keys[0].split("/")[-1].split(".")[0])
+                e_frame = int(rgb_keys[-1].split("/")[-1].split(".")[0])
+                if len(rgb_keys) != (e_frame - s_frame + 1):
+                    non_contiguous_count += 1
+            except Exception:
+                pass
+
+            if case_type in case_counts:
+                case_counts[case_type] += 1
 
             self.videos_path.append({
                 "scenario_key": k,
@@ -316,7 +341,15 @@ class ACTION_SLOT_LMDBDataset(BaseDataset):
         close_lmdb()
         self.env_cache.clear()
 
+        # In thống kê số lượng video thuộc mỗi trường hợp ra terminal
         total = len(self.videos_path)
+        print(f"[{self.split.upper()} DATASET] Thống kê số lượng video:")
+        print(f"  + Tổng số scenario hợp lệ : {total}")
+        print(f"  + Trường hợp 1 (>=50 frames liên tục) : {case_counts['case1_ge50']}")
+        print(f"  + Trường hợp 2 (16 - 49 frames thực tế) : {case_counts['case2_16to49']}")
+        print(f"  + Trường hợp 3 (<16 frames, nội suy đều): {case_counts['case3_lt16']}")
+        print(f"  + Số video bị khuyết số frame ở giữa  : {non_contiguous_count}")
+
         indices = list(range(total))
         rng = random.Random(self.seed)
         rng.shuffle(indices)
