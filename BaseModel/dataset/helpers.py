@@ -93,6 +93,9 @@ def open_lmdb(
     db_path: str,
     readonly: bool = True,
     max_readers: int = 128,
+    lock: bool = False,
+    readahead: bool = False,
+    meminit: bool = False,
 ):
     """Safely open an LMDB environment and return (env, txn).
 
@@ -104,6 +107,9 @@ def open_lmdb(
         db_path: Directory containing LMDB database files (`data.mdb`).
         readonly: Whether to open in read-only mode.
         max_readers: Maximum number of concurrent reader slots.
+        lock: Whether to lock the database file (False for multi-reader).
+        readahead: Whether to prefetch pages (False saves memory/IO for random access).
+        meminit: Initialize memory buffers (False for speed).
     """
     try:
         import lmdb

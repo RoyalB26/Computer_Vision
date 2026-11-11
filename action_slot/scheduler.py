@@ -29,5 +29,5 @@ class TACOLRScheduler(LambdaLR):
         verbose: If True, prints a message to stdout for each update. Default: False.
     """
 
-    def __init__(self, optimizer, last_epoch: int = -1, verbose: bool = False):
-        super().__init__(optimizer, lr_lambda=taco_lambda_lr, last_epoch=last_epoch, verbose=verbose)
+    def __init__(self, optimizer, last_epoch: int = -1, **kwargs):
+        super().__init__(optimizer, lr_lambda=taco_lambda_lr, last_epoch=last_epoch)

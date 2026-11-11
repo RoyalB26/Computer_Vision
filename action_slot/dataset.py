@@ -14,6 +14,7 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 import numpy as np
 from PIL import Image
 import torch
+from tqdm import tqdm
 
 from BaseModel.core import DATASETS
 from BaseModel.dataset import BaseDataset, close_lmdb, open_lmdb
@@ -100,7 +101,13 @@ class ACTION_SLOT_LMDBDataset(BaseDataset):
     def _get_lmdb_env(self, path: str):
         """Lazily initialize and cache LMDB environment for a path."""
         if path not in self.env_cache or self.env_cache[path] is None:
-            env, txn = open_lmdb(path, readonly=True)
+            env, txn = open_lmdb(
+                path,
+                readonly=True,
+                lock=False,
+                readahead=False,
+                meminit=False,
+            )
             txn.abort()
             self.env_cache[path] = env
         return self.env_cache[path]
@@ -245,7 +252,7 @@ class ACTION_SLOT_LMDBDataset(BaseDataset):
         case_counts = {"case1_ge50": 0, "case2_16to49": 0, "case3_lt16": 0}
         non_contiguous_count = 0
 
-        for k, v in data.items():
+        for k, v in tqdm(data.items(), desc=f"[{self.split.upper()} DATASET] Loading scenarios", dynamic_ncols=True):
             split_path = k.split("/")
             folder_name = split_path[0] + "_lmdb"
             raw_folder = split_path[0]

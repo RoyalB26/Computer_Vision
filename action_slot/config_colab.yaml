@@ -5,13 +5,14 @@ project_name: "action_slot"
 device: "cuda"  
 seed: 42
 tqdm: true
-accumulate: 2
+accumulate: 3
 
 custom_imports:
   - "action_slot.model"
   - "action_slot.dataset"
   - "action_slot.transform"
   - "action_slot.metrics"
+  - "action_slot.scheduler"
 
 # 1. Model Configuration: Hand Digit Detector with Deformable Slot Attention Head
 model:
@@ -38,7 +39,7 @@ data:
       seed: 42
       pipeline:
         - type: "Action_Slot_Transform"
-    batch_size: 12
+    batch_size: 8
     shuffle: true
     num_workers: 12
 
@@ -52,21 +53,19 @@ data:
       seed: 42
       pipeline:
         - type: "Action_Slot_Transform"
-    batch_size: 12
+    batch_size: 8
     shuffle: true
     num_workers: 12
 
 # 3. Optimizer Configuration (đồng bộ với D:\v7\Action-slot: lr=5e-4, wd=0.07)
 optimizer:
   type: "AdamW"
-  lr: 0.001
+  lr: 0.0005
   weight_decay: 0.07
 
-# 4. Learning Rate Scheduler Configuration (Code gốc train_taco.py không dùng scheduler)
+# 4. Learning Rate Scheduler Configuration (Đồng bộ chuẩn xác với D:\v7\Action-slot: tăng x1.1 mỗi epoch trong 11 epoch đầu, sau đó giảm theo 0.7^(epoch//3))
 lr_scheduler:
-  type: "CosineAnnealingLR"
-  T_max: 100
-  eta_min: 0.00001
+  type: "TACOLRScheduler"
 
 # 5. Evaluation Metrics Configuration
 metrics:
@@ -105,3 +104,4 @@ train_cfg:
   log_interval: 2500                        # In log tiến trình mỗi 2500 batches
   grad_clip: null                           # Không clip gradient (đồng bộ với D:\v7\Action-slot)
   use_amp: false                            # Chạy FP32 chính xác cao
+  accumulate: 3                             # Tích lũy gradient (8 * 3 = 24 samples tương đương batch_size=24 của v7)

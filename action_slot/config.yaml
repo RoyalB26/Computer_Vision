@@ -11,6 +11,7 @@ custom_imports:
   - "action_slot.dataset"
   - "action_slot.transform"
   - "action_slot.metrics"
+  - "action_slot.scheduler"
 
 # 1. Model Configuration: Hand Digit Detector with Deformable Slot Attention Head
 model:
@@ -63,11 +64,9 @@ optimizer:
   lr: 0.0005
   weight_decay: 0.07
 
-# 4. Learning Rate Scheduler Configuration (Code gốc train_taco.py không dùng scheduler)
-# lr_scheduler:
-#   type: "CosineAnnealingLR"
-#   T_max: 100
-#   eta_min: 0.00001
+# 4. Learning Rate Scheduler Configuration (Đồng bộ chuẩn xác với D:\v7\Action-slot: tăng x1.1 mỗi epoch trong 11 epoch đầu, sau đó giảm theo 0.7^(epoch//3))
+lr_scheduler:
+  type: "TACOLRScheduler"
 
 # 5. Evaluation Metrics Configuration
 metrics:
