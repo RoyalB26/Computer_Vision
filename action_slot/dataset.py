@@ -25,7 +25,9 @@ class ACTION_SLOT_LMDBDataset(BaseDataset):
 
     Matches the temporal strided frame sampling of the original TACO dataset:
       - Computes `step = num_frame // sequence_len` across the full scenario duration.
-      - Builds up to `max_num = 50` strided 16-frame clips per scenario.
+      - Builds up to `max_num = 50` strided 16-frame clips per scenario using verified existing LMDB keys.
+      - Gracefully handles scenarios with `num_frame < 50` (including `16 <= num_frame < 50` and `num_frame < 16`)
+        or non-contiguous frame numbers so every sample always yields exact `sequence_len` frames.
       - During `train`: randomly samples one of the strided clips (`random.randint`).
       - During `val`: selects the middle strided clip (`len(videos) // 2`).
 
@@ -38,7 +40,7 @@ class ACTION_SLOT_LMDBDataset(BaseDataset):
         seed: Random seed for sample indexing.
         sequence_len: Number of video frames in clip.
         mask_every_frame: Frequency of mask extraction.
-        min_frames: Minimum number of frames required for a valid scenario (default 50).
+        min_frames: Minimum number of frames required for a valid scenario (default 1).
         use_obj_mask: Whether to load object instance masks from LMDB (default False).
         num_samples: Optional limit on total samples loaded.
         test_mode: Whether running in evaluation mode.
@@ -54,7 +56,7 @@ class ACTION_SLOT_LMDBDataset(BaseDataset):
         seed: int = 42,
         sequence_len: int = 16,
         mask_every_frame: int = 4,
-        min_frames: int = 50,
+        min_frames: int = 1,
         use_obj_mask: bool = False,
         num_samples: Optional[int] = None,
         test_mode: bool = False,
@@ -102,34 +104,105 @@ class ACTION_SLOT_LMDBDataset(BaseDataset):
         return self.env_cache[path]
 
     @staticmethod
-    def _get_first_last_frame(env, prefix_path: str) -> Optional[Tuple[int, int]]:
-        """Find (start_frame, end_frame) for a scenario prefix in O(log N) via LMDB B-tree seeks."""
+    def _get_prefix_keys(env, prefix_path: str) -> List[str]:
+        """Return all keys in LMDB starting with prefix_path using key-only B-tree cursor iteration."""
         p = prefix_path.replace("\\", "/").rstrip("/") + "/"
-        p_end = p[:-1] + "0"  # ASCII '0' (0x30) immediately follows '/' (0x2f)
+        keys: List[str] = []
         with env.begin() as txn:
             cursor = txn.cursor()
-            if not cursor.set_range(p.encode("utf-8")):
-                return None
-            first_key = cursor.key().decode("utf-8")
-            if not first_key.startswith(p):
-                return None
+            if cursor.set_range(p.encode("utf-8")):
+                while True:
+                    k_str = cursor.key().decode("utf-8")
+                    if k_str.startswith(p):
+                        keys.append(k_str)
+                    else:
+                        break
+                    if not cursor.next():
+                        break
+        return keys
 
-            if cursor.set_range(p_end.encode("utf-8")):
-                if not cursor.prev():
-                    return None
+    @staticmethod
+    def _match_bg_keys(
+        video_keys: List[str],
+        clean_bg_prefix: str,
+        bg_set: set,
+        bg_keys: List[str],
+    ) -> List[str]:
+        """Match each selected RGB frame key to its corresponding background mask key (or closest existing key)."""
+        seg_temp: List[str] = []
+        n_vid = len(video_keys)
+        n_bg = len(bg_keys)
+        for idx, vk in enumerate(video_keys):
+            stem = vk.split("/")[-1].split(".")[0]
+            cand = f"{clean_bg_prefix}/{stem}.png"
+            if cand in bg_set:
+                seg_temp.append(cand)
             else:
-                if not cursor.last():
-                    return None
-            last_key = cursor.key().decode("utf-8")
-            if not last_key.startswith(p):
-                return None
+                bg_idx = min(n_bg - 1, int(round(idx * (n_bg - 1) / max(1, n_vid - 1))))
+                seg_temp.append(bg_keys[bg_idx])
+        return seg_temp
+
+    def _build_scenario_clips(
+        self,
+        rgb_keys: List[str],
+        bg_keys: List[str],
+        clean_rgb_prefix: str,
+        clean_bg_prefix: str,
+    ) -> Tuple[List[List[str]], List[List[str]]]:
+        """Build strided clips of length `self.sequence_len` for both `num_frame >= 50` and `num_frame < 50`."""
+        videos: List[List[str]] = []
+        segs: List[List[str]] = []
+        if not rgb_keys or not bg_keys:
+            return videos, segs
+
+        rgb_set = set(rgb_keys)
+        bg_set = set(bg_keys)
+        max_num = 50
+        n_rgb = len(rgb_keys)
+        ext = os.path.splitext(rgb_keys[0])[1] or ".jpg"
 
         try:
-            start_frame = int(first_key.split("/")[-1].split(".")[0])
-            end_frame = int(last_key.split("/")[-1].split(".")[0])
-            return start_frame, end_frame
+            start_frame = int(rgb_keys[0].split("/")[-1].split(".")[0])
+            end_frame = int(rgb_keys[-1].split("/")[-1].split(".")[0])
+            num_frame = end_frame - start_frame + 1
         except (ValueError, IndexError):
-            return None
+            start_frame, end_frame, num_frame = 0, n_rgb - 1, n_rgb
+
+        # 1. Standard TACO strided sampling when num_frame >= 50 and n_rgb >= 50
+        if num_frame >= 50 and n_rgb >= 50:
+            step = max(1, num_frame // self.sequence_len)
+            for m in range(max_num):
+                start = start_frame + m
+                if start_frame + (self.sequence_len - 1) * step > end_frame:
+                    break
+                videos_temp: List[str] = []
+                for i in range(start, end_frame + 1, step):
+                    rgb_k = f"{clean_rgb_prefix}/{str(i).zfill(8)}{ext}"
+                    if rgb_k in rgb_set:
+                        videos_temp.append(rgb_k)
+                    if len(videos_temp) == self.sequence_len:
+                        break
+                if len(videos_temp) == self.sequence_len:
+                    videos.append(videos_temp)
+                    segs.append(self._match_bg_keys(videos_temp, clean_bg_prefix, bg_set, bg_keys))
+
+        # 2. Fallback for scenarios with num_frame < 50 (or sparse frame numbering where `videos` is still empty)
+        if not videos:
+            if n_rgb >= self.sequence_len:
+                step_idx = max(1, n_rgb // self.sequence_len)
+                max_start = n_rgb - (self.sequence_len - 1) * step_idx
+                for m in range(min(max_num, max(1, max_start))):
+                    videos_temp = [rgb_keys[m + k * step_idx] for k in range(self.sequence_len)]
+                    videos.append(videos_temp)
+                    segs.append(self._match_bg_keys(videos_temp, clean_bg_prefix, bg_set, bg_keys))
+            else:
+                # 0 < n_rgb < sequence_len: uniform temporal interpolation to exact `sequence_len` frames
+                idxs = np.linspace(0, n_rgb - 1, self.sequence_len).round().astype(int).tolist()
+                videos_temp = [rgb_keys[i] for i in idxs]
+                videos.append(videos_temp)
+                segs.append(self._match_bg_keys(videos_temp, clean_bg_prefix, bg_set, bg_keys))
+
+        return videos, segs
 
     def load_annotations(self) -> List[Dict[str, Any]]:
         """Scan annotation entries, resolve LMDB paths, and build strided frame sequences."""
@@ -155,7 +228,6 @@ class ACTION_SLOT_LMDBDataset(BaseDataset):
 
         self.videos_path = []
         self.label = {}
-        max_required_seg_idx = ((self.sequence_len - 1) // self.mask_every_frame) * self.mask_every_frame
 
         for k, v in data.items():
             split_path = k.split("/")
@@ -172,8 +244,8 @@ class ACTION_SLOT_LMDBDataset(BaseDataset):
             matched_rgb = None
             matched_bg = None
             matched_obj = None
-            rgb_range = None
-            bg_range = None
+            rgb_keys: List[str] = []
+            bg_keys: List[str] = []
 
             # Search across all specified data roots
             for root in self.data_roots:
@@ -202,50 +274,26 @@ class ACTION_SLOT_LMDBDataset(BaseDataset):
                 for c_rgb, c_bg, c_obj in candidates:
                     if os.path.exists(c_rgb) and os.path.exists(c_bg):
                         rgb_env = self._get_lmdb_env(c_rgb)
-                        r_range = self._get_first_last_frame(rgb_env, clean_rgb_prefix)
-                        if r_range is not None:
+                        r_keys = self._get_prefix_keys(rgb_env, clean_rgb_prefix)
+                        if r_keys:
                             bg_env = self._get_lmdb_env(c_bg)
-                            b_range = self._get_first_last_frame(bg_env, clean_bg_prefix)
-                            matched_rgb, matched_bg, matched_obj = c_rgb, c_bg, c_obj
-                            rgb_range, bg_range = r_range, b_range
-                            break
+                            b_keys = self._get_prefix_keys(bg_env, clean_bg_prefix)
+                            if b_keys:
+                                matched_rgb, matched_bg, matched_obj = c_rgb, c_bg, c_obj
+                                rgb_keys, bg_keys = r_keys, b_keys
+                                break
                 if matched_rgb is not None:
                     break
 
-            if matched_rgb is None or rgb_range is None:
+            if matched_rgb is None or len(rgb_keys) < self.min_frames or not bg_keys:
                 continue
 
-            start_frame, end_frame = rgb_range
-            num_frame = end_frame - start_frame + 1
-            if num_frame < self.min_frames or num_frame < self.sequence_len:
-                continue
-
-            if bg_range is not None:
-                bg_start_frame, bg_end_frame = bg_range
-            else:
-                bg_start_frame, bg_end_frame = start_frame, end_frame
-
-            step = max(1, num_frame // self.sequence_len)
-            videos: List[List[str]] = []
-            segs: List[List[str]] = []
-            max_num = 50
-
-            for m in range(max_num):
-                start = start_frame + m
-                if start_frame + (self.sequence_len - 1) * step > end_frame:
-                    break
-                videos_temp: List[str] = []
-                seg_temp: List[str] = []
-                for i in range(start, end_frame + 1, step):
-                    if start_frame <= i <= end_frame:
-                        videos_temp.append(f"{clean_rgb_prefix}/{str(i).zfill(8)}.jpg")
-                    if bg_start_frame <= i <= bg_end_frame:
-                        seg_temp.append(f"{clean_bg_prefix}/{str(i).zfill(8)}.png")
-                    if len(videos_temp) == self.sequence_len:
-                        break
-                if len(videos_temp) == self.sequence_len and len(seg_temp) > max_required_seg_idx:
-                    videos.append(videos_temp)
-                    segs.append(seg_temp)
+            videos, segs = self._build_scenario_clips(
+                rgb_keys=rgb_keys,
+                bg_keys=bg_keys,
+                clean_rgb_prefix=clean_rgb_prefix,
+                clean_bg_prefix=clean_bg_prefix,
+            )
 
             if not videos:
                 continue
@@ -365,6 +413,20 @@ class ACTION_SLOT_LMDBDataset(BaseDataset):
             for sample in bg_masks:
                 img = Image.open(io.BytesIO(sample["image"])).convert("L")
                 target["bg_seg"].append(img)
+
+        # Guarantee exact sequence length and background mask count across all batch items
+        if data:
+            while len(data) < self.sequence_len:
+                data.append(data[-1].copy())
+            if len(data) > self.sequence_len:
+                data = data[:self.sequence_len]
+
+        expected_bg_len = max(1, self.sequence_len // self.mask_every_frame)
+        if target["bg_seg"]:
+            while len(target["bg_seg"]) < expected_bg_len:
+                target["bg_seg"].append(target["bg_seg"][-1].copy())
+            if len(target["bg_seg"]) > expected_bg_len:
+                target["bg_seg"] = target["bg_seg"][:expected_bg_len]
 
         if self.use_obj_mask and path.get("mask_obj_path"):
             obj_env = self._get_lmdb_env(path["mask_obj_path"])

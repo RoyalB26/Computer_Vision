@@ -49,6 +49,7 @@ class Action_Slot_Transform:
             if isinstance(mask, torch.Tensor) or hasattr(mask, "resize"):
                 data[i] = TF.resize(mask, [32,96], interpolation=InterpolationMode.NEAREST)
         return data
+    
     def to_np(self, v):
         transform = transforms.Compose([
                         transforms.ToTensor(),

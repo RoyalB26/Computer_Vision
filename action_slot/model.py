@@ -114,7 +114,8 @@ class ActionSlotModel(BaseModel):
         self,
         videos: Union[List[torch.Tensor], torch.Tensor],
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-
+        if isinstance(videos, list):
+            videos = torch.stack(videos, dim=0)
         videos = videos.permute(0, 2, 1, 3, 4)
         seq_len = videos.shape[2]
         batch_size = videos.shape[0]
