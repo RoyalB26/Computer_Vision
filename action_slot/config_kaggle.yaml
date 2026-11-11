@@ -11,7 +11,6 @@ custom_imports:
   - "action_slot.dataset"
   - "action_slot.transform"
   - "action_slot.metrics"
-  - "action_slot.scheduler"
 
 # 1. Model Configuration: Hand Digit Detector with Deformable Slot Attention Head
 model:
@@ -32,8 +31,7 @@ data:
     dataset:
       type: "ACTION_SLOT_LMDBDataset"
       data_root:
-        - "/kaggle/input/datasets/royalb26/taco-lmdb-part1"
-        - "/kaggle/input/datasets/royalb26/taco-lmdb-part2"
+        - "/tmp/taco-lmdb-part1"
       split: "train"
       sequence_len: 16
       seed: 42
@@ -42,14 +40,14 @@ data:
     batch_size: 4
     shuffle: true
     num_workers: 4
-
+    prefetch_factor: 2
+    persistent_workers: True
 
   val:
     dataset:
       type: "ACTION_SLOT_LMDBDataset"
       data_root:
-        - "/kaggle/input/datasets/royalb26/taco-lmdb-part1"
-        - "/kaggle/input/datasets/royalb26/taco-lmdb-part2"
+        - - "/tmp/taco-lmdb-part1"
       split: "val"
       sequence_len: 16
       seed: 42
@@ -57,7 +55,9 @@ data:
         - type: "Action_Slot_Transform"
     batch_size: 1
     shuffle: true
-    num_workers: 4
+    num_workers: 0
+    prefetch_factor: 2
+    persistent_workers: True
 
 # 3. Optimizer Configuration (đồng bộ với D:\v7\Action-slot: lr=5e-4, wd=0.07)
 optimizer:
