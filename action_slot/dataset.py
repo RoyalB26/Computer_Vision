@@ -286,7 +286,7 @@ class ACTION_SLOT_LMDBDataset(BaseDataset):
 
         # 1. Khám phá toàn bộ các thư mục Town LMDB qua các data_roots (chỉ 1 pass duy nhất, tránh gọi os.path.exists hàng ngàn lần trên Kaggle)
         town_info: Dict[str, Dict[str, Any]] = {}
-        for root in self.data_roots:
+        for root in tqdm(self.data_roots, desc=f"[{self.split.upper()} DATASET] Discovering towns in data_roots", dynamic_ncols=True):
             if not os.path.exists(root):
                 continue
 
@@ -306,7 +306,8 @@ class ACTION_SLOT_LMDBDataset(BaseDataset):
 
             if os.path.isdir(root):
                 try:
-                    for item in os.listdir(root):
+                    sub_items = os.listdir(root)
+                    for item in tqdm(sub_items, desc=f"[{self.split.upper()} DATASET] Scanning {os.path.basename(root)}", leave=False, dynamic_ncols=True):
                         item_dir = os.path.join(root, item)
                         if not os.path.isdir(item_dir):
                             continue
@@ -325,10 +326,34 @@ class ACTION_SLOT_LMDBDataset(BaseDataset):
                 except Exception:
                     pass
 
-        # 2. Cơ chế quét nhanh toàn bộ key trong LMDB (Key-Only Sweep) theo từng Town, lưu dictionary in-memory
+        # 1.1 Quét trước key-index cho các Town đã tìm thấy với tqdm
         from collections import defaultdict
         town_key_index: Dict[str, Dict[str, List[str]]] = {}
+        unique_lmdb_paths = set()
+        for t_data in town_info.values():
+            if t_data.get("rgb"):
+                unique_lmdb_paths.add(t_data["rgb"])
+            if t_data.get("bg"):
+                unique_lmdb_paths.add(t_data["bg"])
 
+        for lmdb_path in tqdm(sorted(unique_lmdb_paths), desc=f"[{self.split.upper()} DATASET] Indexing LMDB keys", dynamic_ncols=True):
+            pdict = defaultdict(list)
+            try:
+                env = self._get_lmdb_env(lmdb_path)
+                with env.begin(write=False) as txn:
+                    cur = txn.cursor()
+                    if cur.first():
+                        while True:
+                            k_str = cur.key().decode("utf-8")
+                            pfx = "/".join(k_str.split("/")[:-1])
+                            pdict[pfx].append(k_str)
+                            if not cur.next():
+                                break
+            except Exception:
+                pass
+            town_key_index[lmdb_path] = pdict
+
+        # 2. Cơ chế tra cứu key in-memory từ town_key_index
         def get_town_prefix_keys(lmdb_path: str, target_prefix: str) -> List[str]:
             if lmdb_path not in town_key_index:
                 pdict = defaultdict(list)
