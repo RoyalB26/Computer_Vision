@@ -4,7 +4,7 @@ work_dir: "./work_dirs/action_slot"
 device: "cuda"  
 seed: 42
 tqdm: true
-accumulate: 4
+accumulate: 2
 
 custom_imports:
   - "action_slot.model"
@@ -32,7 +32,7 @@ data:
     dataset:
       type: "ACTION_SLOT_LMDBDataset"
       data_root:
-        - "/kaggle/input/datasets/royalb26/taco-lmdb-part1"
+        - /tmp/taco-lmdb-part1
         - "/kaggle/input/datasets/royalb26/taco-lmdb-part2"
       split: "train"
       sequence_len: 16
@@ -42,14 +42,12 @@ data:
     batch_size: 8
     shuffle: true
     num_workers: 4
-    prefetch_factor: 2
-    persistent_workers: True
 
   val:
     dataset:
       type: "ACTION_SLOT_LMDBDataset"
       data_root:
-        - "/kaggle/input/datasets/royalb26/taco-lmdb-part1"
+        - /tmp/taco-lmdb-part1
         - "/kaggle/input/datasets/royalb26/taco-lmdb-part2"
       split: "val"
       sequence_len: 16
@@ -59,8 +57,6 @@ data:
     batch_size: 1
     shuffle: true
     num_workers: 0
-    prefetch_factor: 2
-    persistent_workers: True
 
 # 3. Optimizer Configuration (đồng bộ với D:\v7\Action-slot: lr=5e-4, wd=0.07)
 optimizer:
