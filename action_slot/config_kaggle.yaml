@@ -11,6 +11,7 @@ custom_imports:
   - "action_slot.dataset"
   - "action_slot.transform"
   - "action_slot.metrics"
+  - "action_slot.scheduler"
 
 # 1. Model Configuration: Hand Digit Detector with Deformable Slot Attention Head
 model:
