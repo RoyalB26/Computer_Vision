@@ -191,7 +191,6 @@ class ActionSlotModel(BaseModel):
         # print(inputs["bg_seg"].shape)
         # print(targets['ego'].shape)
         # print(targets['actor'].shape)
-        
         """Tính toán Detection Loss trong quá trình huấn luyện với FPN và Deformable Sampling Loss."""
         slots, ego_x, attn_masks = self.extract_features(inputs)
         pred_ego, pred_actor = self.head(slots, ego_x=ego_x)
@@ -211,6 +210,7 @@ class ActionSlotModel(BaseModel):
         **kwargs,
     ) -> List[Dict[str, torch.Tensor]]:
         """Dự đoán bounding box, class label và confidence score khi suy luận / đánh giá."""
+        
         slots, ego_x, attn_masks = self.extract_features(inputs)
         pred_ego, pred_actor = self.head(slots, ego_x=ego_x)
 
