@@ -48,7 +48,21 @@ class ActionSlotModel(BaseModel):
         self.slot_dim = slot_dim
         self.ego_c = ego_c
 
-        self.backbone = X3DBackbone(pretrained= True, unfreeze_all= True)
+        finetune_last_n_stages = kwargs.get('finetune_last_n_stages', 2)
+        freeze_stages = kwargs.get('freeze_stages', None)
+        freeze_all = kwargs.get('freeze_all', False)
+        unfreeze_all = kwargs.get('unfreeze_all', False)
+        freeze_bn = kwargs.get('freeze_bn', True)
+        pretrained_backbone = kwargs.get('pretrained_backbone', True)
+
+        self.backbone = X3DBackbone(
+            pretrained=pretrained_backbone,
+            finetune_last_n_stages=finetune_last_n_stages,
+            freeze_stages=freeze_stages,
+            freeze_all=freeze_all,
+            unfreeze_all=unfreeze_all,
+            freeze_bn=freeze_bn,
+        )
         in_c = self.backbone.out_channels
 
         # 2. Ego Feature Branch

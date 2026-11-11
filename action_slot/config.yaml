@@ -21,6 +21,7 @@ model:
   ego_c: 64
   bg_slot: true
   dropout: 0.5
+  finetune_last_n_stages: 2  # Chỉ fine-tune 2 stage cuối của backbone (ResStage 3 & 4), freeze stem & stage 1, 2
 
 # 2. Dataset Configuration
 # Hỗ trợ cấu hình nhiều data_root dưới dạng danh sách (list) hoặc đường dẫn đơn (str)
