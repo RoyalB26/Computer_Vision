@@ -85,6 +85,14 @@ def main():
     # 6. Build Dataloaders
     logger.info("Building dataloaders...")
     data_cfg = cfg.data
+
+    def _extra_loader_kwargs(split_cfg):
+        extra = {}
+        for k in ("persistent_workers", "prefetch_factor", "worker_init_fn"):
+            if k in split_cfg and split_cfg[k] is not None:
+                extra[k] = split_cfg[k]
+        return extra
+
     train_loader = build_dataloader(
         dataset=data_cfg.train.dataset,
         batch_size=data_cfg.train.get("batch_size", 16),
@@ -93,6 +101,7 @@ def main():
         pin_memory=data_cfg.train.get("pin_memory", True),
         drop_last=data_cfg.train.get("drop_last", True),
         collate_fn=data_cfg.train.get("collate_fn", None),
+        **_extra_loader_kwargs(data_cfg.train),
     )
 
     val_loader = None
@@ -105,6 +114,7 @@ def main():
             pin_memory=data_cfg.val.get("pin_memory", True),
             drop_last=False,
             collate_fn=data_cfg.val.get("collate_fn", None),
+            **_extra_loader_kwargs(data_cfg.val),
         )
 
     # Thống kê số lượng dữ liệu

@@ -30,25 +30,25 @@ def build_dataset(cfg: Union[Dict[str, Any], Dataset], default_args: Optional[Di
     return build_from_cfg(cfg, DATASETS, default_args=default_args)
 
 
-def _dataloader_worker_init_fn(worker_id: int):
-    """Worker initialization to prevent CPU thread thrashing and ensure reproducibility."""
+def _dataloader_worker_init_fn(worker_id: int, threads_per_worker: int = 1):
+    """Worker initialization to prevent OpenCV/OpenMP thread oversubscription and keep RNG independent."""
     import os
     import random
     import numpy as np
     import torch
 
-    # Tắt đa luồng ẩn của OpenCV/NumPy/Torch trong từng worker để không tranh chấp CPU cores
+    # Ngăn OpenCV tạo thêm thread pool ngầm trong mỗi worker gây nghẽn context-switch trên CPU nhiều worker
     try:
         import cv2
         cv2.setNumThreads(0)
     except ImportError:
         pass
 
-    torch.set_num_threads(1)
-    os.environ["OMP_NUM_THREADS"] = "1"
-    os.environ["MKL_NUM_THREADS"] = "1"
+    threads = max(1, int(threads_per_worker))
+    torch.set_num_threads(threads)
+    os.environ["OMP_NUM_THREADS"] = str(threads)
+    os.environ["MKL_NUM_THREADS"] = str(threads)
 
-    # Đảm bảo worker có seed ngẫu nhiên độc lập
     worker_seed = (torch.initial_seed() + worker_id) % (2**32)
     np.random.seed(worker_seed)
     random.seed(worker_seed)
@@ -90,10 +90,18 @@ def build_dataloader(
         kwargs.pop("prefetch_factor", None)
         init_fn = None
     else:
-        init_fn = worker_init_fn if worker_init_fn is not None else _dataloader_worker_init_fn
-        # Mặc định cấu hình persistent_workers và prefetch_factor để pipeline nạp liên tục
+        if worker_init_fn is not None:
+            init_fn = worker_init_fn
+        else:
+            import os
+            from functools import partial
+            world_size = max(1, int(os.environ.get("WORLD_SIZE", "1")))
+            total_cpus = os.cpu_count() or 4
+            threads_per_worker = max(1, total_cpus // max(1, num_workers * world_size))
+            init_fn = partial(_dataloader_worker_init_fn, threads_per_worker=threads_per_worker)
+        # Chỉ giữ persistent_workers mặc định cho train loader (hoặc khi được cấu hình tường minh)
         if "persistent_workers" not in kwargs:
-            kwargs["persistent_workers"] = True
+            kwargs["persistent_workers"] = bool(shuffle or sampler is not None)
         if "prefetch_factor" not in kwargs:
             kwargs["prefetch_factor"] = 2
 

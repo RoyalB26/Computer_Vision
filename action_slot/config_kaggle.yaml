@@ -42,7 +42,7 @@ data:
     batch_size: 8
     shuffle: true
     num_workers: 2          # Kaggle có 4 vCPU; accelerate chạy 2 rank -> 2 worker/rank = 4 worker tổng (tránh tranh chấp CPU)
-    prefetch_factor: 4
+    prefetch_factor: 2
     persistent_workers: True
 
   val:

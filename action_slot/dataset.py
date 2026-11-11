@@ -16,6 +16,13 @@ from PIL import Image
 import torch
 from tqdm import tqdm
 
+try:
+    import cv2
+    _HAS_CV2 = True
+except ImportError:
+    cv2 = None
+    _HAS_CV2 = False
+
 from BaseModel.core import DATASETS
 from BaseModel.dataset import BaseDataset, close_lmdb, open_lmdb
 
@@ -63,11 +70,13 @@ class ACTION_SLOT_LMDBDataset(BaseDataset):
         num_samples: Optional[int] = None,
         test_mode: bool = False,
         lmdb_readahead: Optional[bool] = None,
+        fast_decode: bool = True,
         **kwargs,
     ):
         self.split = split.lower()
         # None = tự động (bật readahead cho ổ mạng/FUSE, tắt cho ổ cục bộ)
         self.lmdb_readahead = lmdb_readahead
+        self.fast_decode = fast_decode
         self.seed = seed
         self.sequence_len = sequence_len
         self.mask_every_frame = mask_every_frame
@@ -100,6 +109,23 @@ class ACTION_SLOT_LMDBDataset(BaseDataset):
             pipeline=pipeline,
             test_mode=test_mode,
         )
+
+        # Kích hoạt OpenCV DCT-scaled fast decode khi pipeline chỉ gồm Action_Slot_Transform
+        # Giúp giải mã JPEG 1536x512 thẳng về uint8 (16, 3, 256, 768) nhanh gấp ~4-9 lần
+        self._fast_rgb_hw: Tuple[int, int] = (256, 768)
+        self._fast_bg_hw: Tuple[int, int] = (32, 96)
+        tf_list = getattr(getattr(self, "pipeline", None), "transforms", []) or []
+        self._use_fast_cv2 = (
+            _HAS_CV2
+            and self.fast_decode
+            and not self.use_obj_mask
+            and len(tf_list) == 1
+            and type(tf_list[0]).__name__ == "Action_Slot_Transform"
+        )
+        if self._use_fast_cv2:
+            tf0 = tf_list[0]
+            self._fast_rgb_hw = tuple(getattr(tf0, "video_size", (256, 768)))
+            self._fast_bg_hw = tuple(getattr(tf0, "mask_size", (32, 96)))
 
     # Các tiền tố ổ mạng/FUSE phổ biến (Kaggle input = GCS FUSE, Colab Drive = FUSE)
     _NETWORK_PREFIXES = ("/kaggle/input", "/content/drive", "/gcs", "/mnt/gcs")
@@ -632,6 +658,51 @@ class ACTION_SLOT_LMDBDataset(BaseDataset):
                     results.append(pickle.loads(val))
         return results
 
+    def _decode_rgb_frames_cv2(
+        self, videos: List[Dict[str, Any]], target_hw: Tuple[int, int] = (256, 768)
+    ) -> torch.Tensor:
+        """Giải mã trực tiếp các JPEG bytes sang uint8 Tensor (T, 3, H, W) bằng OpenCV/libjpeg-turbo DCT 1/2."""
+        target_h, target_w = target_hw
+        n = min(len(videos), self.sequence_len)
+        arr = np.empty((self.sequence_len, target_h, target_w, 3), dtype=np.uint8)
+        for i in range(n):
+            buf = np.frombuffer(videos[i]["image"], dtype=np.uint8)
+            mat = cv2.imdecode(buf, cv2.IMREAD_REDUCED_COLOR_2)
+            if mat is None or mat.shape[0] < target_h or mat.shape[1] < target_w:
+                mat = cv2.imdecode(buf, cv2.IMREAD_COLOR)
+            if mat is None:
+                pil_img = Image.open(io.BytesIO(videos[i]["image"])).convert("RGB").resize((target_w, target_h), Image.BILINEAR)
+                arr[i] = np.asarray(pil_img, dtype=np.uint8)
+                continue
+            if mat.shape[0] != target_h or mat.shape[1] != target_w:
+                mat = cv2.resize(mat, (target_w, target_h), interpolation=cv2.INTER_LINEAR)
+            cv2.cvtColor(mat, cv2.COLOR_BGR2RGB, dst=arr[i])
+        for i in range(n, self.sequence_len):
+            arr[i] = arr[n - 1]
+        return torch.from_numpy(arr).permute(0, 3, 1, 2).contiguous()
+
+    def _decode_bg_masks_cv2(
+        self, bg_masks: List[Dict[str, Any]], target_hw: Tuple[int, int] = (32, 96)
+    ) -> torch.Tensor:
+        """Giải mã trực tiếp PNG mask sang float32 Tensor (T_mask, 1, H, W) trong [0, 1]."""
+        target_h, target_w = target_hw
+        expected_len = max(1, self.sequence_len // self.mask_every_frame)
+        n = min(len(bg_masks), expected_len)
+        arr = np.empty((expected_len, 1, target_h, target_w), dtype=np.uint8)
+        for i in range(n):
+            buf = np.frombuffer(bg_masks[i]["image"], dtype=np.uint8)
+            mat = cv2.imdecode(buf, cv2.IMREAD_GRAYSCALE)
+            if mat is None:
+                pil_m = Image.open(io.BytesIO(bg_masks[i]["image"])).convert("L").resize((target_w, target_h), Image.NEAREST)
+                arr[i, 0] = np.asarray(pil_m, dtype=np.uint8)
+                continue
+            if mat.shape[0] != target_h or mat.shape[1] != target_w:
+                mat = cv2.resize(mat, (target_w, target_h), interpolation=cv2.INTER_NEAREST)
+            arr[i, 0] = mat
+        for i in range(n, expected_len):
+            arr[i, 0] = arr[n - 1, 0]
+        return torch.from_numpy(arr).float().div_(255.0)
+
     def get_data_info(self, idx: int) -> Dict[str, Any]:
         """Fetch strided clip frames and ground-truth targets."""
         real_idx = self.data_infos[idx]["lmdb_idx"]
@@ -665,14 +736,22 @@ class ACTION_SLOT_LMDBDataset(BaseDataset):
             raw_bg = self.get_first_n_images_by_prefix(bg_env, path["bg_prefix"], num_images=self.sequence_len)
             bg_masks = [s for i, s in enumerate(raw_bg) if i % self.mask_every_frame == 0]
 
+        # Chỉ giữ scenario_key nhẹ trong path để tránh pickle & quét to_device qua 1,600 chuỗi clip dư thừa mỗi sample
         target: Dict[str, Any] = {
             "bg_seg": [],
             "obj_masks": [],
             "raw": [],
             "ego": torch.tensor(label["ego"]),
             "actor": torch.FloatTensor(label["agents"]),
-            "path": path,
+            "path": {"scenario_key": path["scenario_key"]},
         }
+
+        if self._use_fast_cv2:
+            data: Any = self._decode_rgb_frames_cv2(videos, self._fast_rgb_hw) if videos else []
+            if bg_masks:
+                target["bg_seg"] = self._decode_bg_masks_cv2(bg_masks, self._fast_bg_hw)
+            return {"inputs": data, "targets": target}
+
         data = []
 
         if videos:

@@ -7,82 +7,99 @@ root_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 if root_dir not in sys.path:
     sys.path.insert(0, root_dir)
 
-from typing import Any, Callable, Dict, List, Optional, Union
-from torch import Tensor
+from typing import Any, Dict, List, Tuple
 import numpy as np
 import torch
-import torchvision.transforms as transforms
 from BaseModel.core.registrar import TRANSFORMS
-# from core.registry import build_from_cfg
 
 
 @TRANSFORMS.register_module("Action_Slot_Transform")
 class Action_Slot_Transform:
-    def __call__(self, data: Dict[str, Any]) -> Dict[str, Any]:
-        if data['inputs']:
-            data['inputs'] = self.process_videos(data['inputs'])
+    """Chuẩn hóa video clip và background mask; hỗ trợ truyền uint8 lên GPU để giảm 4x băng thông."""
 
-        if "bg_seg" in data['targets']:
-            data['targets']['bg_seg'] = self.process_masks(data['targets']['bg_seg'])
-        
+    def __init__(
+        self,
+        video_size: Tuple[int, int] = (256, 768),
+        mask_size: Tuple[int, int] = (32, 96),
+        normalize_on_gpu: bool = True,
+    ):
+        self.video_size = tuple(video_size)
+        self.mask_size = tuple(mask_size)
+        self.normalize_on_gpu = normalize_on_gpu
+
+    def __call__(self, data: Dict[str, Any]) -> Dict[str, Any]:
+        inputs = data.get("inputs")
+        if isinstance(inputs, torch.Tensor):
+            if inputs.shape[-2:] != self.video_size:
+                import torchvision.transforms.functional as TF
+                from torchvision.transforms import InterpolationMode
+                inputs = TF.resize(inputs, list(self.video_size), interpolation=InterpolationMode.BILINEAR, antialias=False)
+            if not self.normalize_on_gpu and inputs.dtype == torch.uint8:
+                inputs = inputs.float().mul_(1.0 / (255.0 * 0.225)).add_(-0.45 / 0.225)
+            data["inputs"] = inputs
+        elif inputs:
+            data["inputs"] = self.process_videos(inputs)
+
+        targets = data.get("targets", {})
+        bg_seg = targets.get("bg_seg")
+        if isinstance(bg_seg, torch.Tensor):
+            if bg_seg.shape[-2:] != self.mask_size:
+                import torchvision.transforms.functional as TF
+                from torchvision.transforms import InterpolationMode
+                bg_seg = TF.resize(bg_seg, list(self.mask_size), interpolation=InterpolationMode.NEAREST)
+            if bg_seg.dtype == torch.uint8:
+                bg_seg = bg_seg.float().div_(255.0)
+            targets["bg_seg"] = bg_seg
+        elif bg_seg:
+            targets["bg_seg"] = self.process_masks(bg_seg)
+
         return data
 
     def process_videos(self, data: List[Any]) -> torch.Tensor:
-        """Vectorized transform: chuyển đổi danh sách ảnh thành 1 Batch Tensor và resize đồng loạt."""
-        import torchvision.transforms.functional as TF
-        from torchvision.transforms import InterpolationMode
+        """Fallback path cho danh sách PIL.Image/ndarray: resize ở uint8 trước khi chuẩn hóa."""
         from PIL import Image
+        import torchvision.transforms.functional as TF
 
-        # Đảm bảo chuyển tất cả các frame thành numpy array (16, H, W, 3)
-        np_frames = []
-        for img in data:
+        target_h, target_w = self.video_size
+        arr = np.empty((len(data), target_h, target_w, 3), dtype=np.uint8)
+        for i, img in enumerate(data):
             if isinstance(img, Image.Image):
-                np_frames.append(np.asarray(img))
-            elif isinstance(img, np.ndarray):
-                np_frames.append(img)
-            elif isinstance(img, torch.Tensor):
-                np_frames.append(img.cpu().numpy())
+                if img.size != (target_w, target_h):
+                    img = img.resize((target_w, target_h), Image.BILINEAR)
+                arr[i] = np.asarray(img, dtype=np.uint8)
             else:
-                np_frames.append(np.asarray(img))
+                np_img = img.cpu().numpy() if isinstance(img, torch.Tensor) else np.asarray(img)
+                if np_img.shape[:2] != (target_h, target_w):
+                    im_pil = Image.fromarray(np_img.astype(np.uint8, copy=False)).resize((target_w, target_h), Image.BILINEAR)
+                    arr[i] = np.asarray(im_pil, dtype=np.uint8)
+                else:
+                    arr[i] = np_img
 
-        # Gom 16 frames thành Tensor 4D: (T, C, H, W) kiểu uint8
-        arr = np.stack(np_frames, axis=0) # (16, H, W, C)
-        tensor = torch.from_numpy(arr).permute(0, 3, 1, 2) # (16, C, H, W)
-
-        # Resize toàn bộ 16 frame cùng lúc bằng C++ Tensor backend
-        tensor = TF.resize(tensor, [256, 768], interpolation=InterpolationMode.BILINEAR, antialias=True)
-        # Chuyển float32 và chuẩn hóa nhanh
-        tensor = tensor.float().div_(255.0)
-        tensor = TF.normalize(tensor, mean=[0.45, 0.45, 0.45], std=[0.225, 0.225, 0.225])
+        tensor = torch.from_numpy(arr).permute(0, 3, 1, 2).contiguous()
+        if not self.normalize_on_gpu:
+            tensor = tensor.float().mul_(1.0 / (255.0 * 0.225)).add_(-0.45 / 0.225)
         return tensor
 
     def process_masks(self, data: List[Any]) -> torch.Tensor:
-        """Vectorized transform cho background mask (T_mask, 1, 32, 96)."""
-        import torchvision.transforms.functional as TF
-        from torchvision.transforms import InterpolationMode
+        """Fallback path cho danh sách background mask (T_mask, 1, 32, 96)."""
         from PIL import Image
 
-        np_masks = []
-        for m in data:
+        target_h, target_w = self.mask_size
+        arr = np.empty((len(data), 1, target_h, target_w), dtype=np.uint8)
+        for i, m in enumerate(data):
             if isinstance(m, Image.Image):
-                np_masks.append(np.asarray(m))
-            elif isinstance(m, np.ndarray):
-                np_masks.append(m)
-            elif isinstance(m, torch.Tensor):
-                np_masks.append(m.cpu().numpy())
+                if m.size != (target_w, target_h):
+                    m = m.resize((target_w, target_h), Image.NEAREST)
+                arr[i, 0] = np.asarray(m, dtype=np.uint8)
             else:
-                np_masks.append(np.asarray(m))
+                np_m = np.squeeze(m.cpu().numpy() if isinstance(m, torch.Tensor) else np.asarray(m))
+                if np_m.shape[:2] != (target_h, target_w):
+                    m_pil = Image.fromarray(np_m.astype(np.uint8, copy=False)).resize((target_w, target_h), Image.NEAREST)
+                    arr[i, 0] = np.asarray(m_pil, dtype=np.uint8)
+                else:
+                    arr[i, 0] = np_m
 
-        arr = np.stack(np_masks, axis=0) # (T_mask, H, W)
-        if arr.ndim == 3:
-            arr = np.expand_dims(arr, axis=1) # (T_mask, 1, H, W)
-        elif arr.ndim == 4 and arr.shape[-1] == 1:
-            arr = np.transpose(arr, (0, 3, 1, 2))
-
-        tensor = torch.from_numpy(arr) # uint8
-        tensor = TF.resize(tensor, [32, 96], interpolation=InterpolationMode.NEAREST)
-        tensor = tensor.float().div_(255.0)
-        return tensor
+        return torch.from_numpy(arr).float().div_(255.0)
 
 
     

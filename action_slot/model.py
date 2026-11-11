@@ -116,6 +116,9 @@ class ActionSlotModel(BaseModel):
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         if isinstance(videos, list):
             videos = torch.stack(videos, dim=0)
+        if videos.dtype == torch.uint8:
+            # Chuyển uint8 [0, 255] -> float32 chuẩn hóa (mean=0.45, std=0.225) trên GPU để giảm 4x băng thông CPU->GPU
+            videos = videos.float().mul_(1.0 / (255.0 * 0.225)).add_(-0.45 / 0.225)
         videos = videos.permute(0, 2, 1, 3, 4)
         seq_len = videos.shape[2]
         batch_size = videos.shape[0]
