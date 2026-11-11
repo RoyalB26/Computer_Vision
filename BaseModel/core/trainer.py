@@ -81,6 +81,11 @@ class BaseTrainer:
                 kwargs_handlers=[ddp_kwargs],
             )
             self.device = self.accelerator.device
+            # Đảm bảo mọi parameter liền kề (contiguous) để gradient khớp layout bucket của DDP
+            # (tránh cảnh báo "Grad strides do not match bucket view strides" và copy thừa mỗi bước)
+            for p in model.parameters():
+                if not p.data.is_contiguous():
+                    p.data = p.data.contiguous()
             self.model, self.optimizer, self.train_loader = self.accelerator.prepare(
                 model, optimizer, train_loader
             )

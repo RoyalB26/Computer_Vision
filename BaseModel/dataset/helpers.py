@@ -134,9 +134,9 @@ def open_lmdb(
             abs_path,
             max_readers=max_readers,
             readonly=readonly,
-            lock=False,
-            readahead=False,
-            meminit=False,
+            lock=lock,
+            readahead=readahead,
+            meminit=meminit,
         )
 
     env = _LMDB_ENV_CACHE[cache_key]

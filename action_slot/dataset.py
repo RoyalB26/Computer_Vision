@@ -62,9 +62,12 @@ class ACTION_SLOT_LMDBDataset(BaseDataset):
         use_obj_mask: bool = False,
         num_samples: Optional[int] = None,
         test_mode: bool = False,
+        lmdb_readahead: Optional[bool] = None,
         **kwargs,
     ):
         self.split = split.lower()
+        # None = tự động (bật readahead cho ổ mạng/FUSE, tắt cho ổ cục bộ)
+        self.lmdb_readahead = lmdb_readahead
         self.seed = seed
         self.sequence_len = sequence_len
         self.mask_every_frame = mask_every_frame
@@ -98,14 +101,43 @@ class ACTION_SLOT_LMDBDataset(BaseDataset):
             test_mode=test_mode,
         )
 
+    # Các tiền tố ổ mạng/FUSE phổ biến (Kaggle input = GCS FUSE, Colab Drive = FUSE)
+    _NETWORK_PREFIXES = ("/kaggle/input", "/content/drive", "/gcs", "/mnt/gcs")
+
+    @classmethod
+    def _is_network_path(cls, path: str) -> bool:
+        """Phát hiện đường dẫn nằm trên ổ mạng / FUSE (đọc ngẫu nhiên từng trang 4KB rất chậm)."""
+        raw = str(path).replace("\\", "/")
+        p = os.path.abspath(path).replace("\\", "/")
+        if raw.startswith(cls._NETWORK_PREFIXES) or p.startswith(cls._NETWORK_PREFIXES):
+            return True
+        try:
+            best_mnt, best_fs = "", ""
+            with open("/proc/mounts", "r") as f:
+                for line in f:
+                    parts = line.split()
+                    if len(parts) >= 3 and p.startswith(parts[1]) and len(parts[1]) > len(best_mnt):
+                        best_mnt, best_fs = parts[1], parts[2]
+            return best_fs.startswith("fuse") or best_fs in ("nfs", "nfs4", "cifs", "smbfs")
+        except Exception:
+            return False
+
     def _get_lmdb_env(self, path: str):
-        """Lazily initialize and cache LMDB environment for a path."""
+        """Lazily initialize and cache LMDB environment for a path.
+
+        readahead=False trên ổ đĩa cục bộ (tránh thrash RAM khi đọc ngẫu nhiên),
+        nhưng tự bật readahead=True trên ổ mạng/FUSE: mỗi ảnh JPEG ~110KB = ~28 trang 4KB,
+        với readahead=False sẽ thành ~28 lượt round-trip mạng riêng lẻ cho MỖI frame.
+        """
         if path not in self.env_cache or self.env_cache[path] is None:
+            readahead = self.lmdb_readahead
+            if readahead is None:
+                readahead = self._is_network_path(path)
             env, txn = open_lmdb(
                 path,
                 readonly=True,
                 lock=False,
-                readahead=False,
+                readahead=readahead,
                 meminit=False,
             )
             txn.abort()
