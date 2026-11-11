@@ -259,6 +259,16 @@ class ACTION_SLOT_LMDBDataset(BaseDataset):
                     with open(cp, "rb") as f:
                         cached = pickle.load(f)
                     if isinstance(cached, dict) and "videos_path" in cached and len(cached["videos_path"]) > 0:
+                        # Kiểm tra xem cache có đúng với data_root hiện tại hay không (tránh xung đột khi chuyển giữa Local / Colab / Kaggle)
+                        cached_roots = cached.get("data_roots", [])
+                        current_roots = [os.path.abspath(r) for r in self.data_roots]
+                        if cached_roots and cached_roots != current_roots:
+                            continue
+
+                        # Kiểm tra tính tồn tại của tệp trên máy hiện tại
+                        sample_rgb = cached["videos_path"][0].get("rgb_path", "")
+                        if not os.path.exists(sample_rgb):
+                            continue
                         self.videos_path = cached["videos_path"]
                         self.label = cached.get("label", {})
                         case_counts = cached.get("case_counts", {"case1_ge50": len(self.videos_path), "case2_16to49": 0, "case3_lt16": 0})
@@ -472,6 +482,7 @@ class ACTION_SLOT_LMDBDataset(BaseDataset):
                     cache_file = os.path.join(save_dir, f".cache_taco_{self.split}.pkl")
                     with open(cache_file, "wb") as f:
                         pickle.dump({
+                            "data_roots": [os.path.abspath(r) for r in self.data_roots],
                             "videos_path": self.videos_path,
                             "label": self.label,
                             "case_counts": case_counts,
