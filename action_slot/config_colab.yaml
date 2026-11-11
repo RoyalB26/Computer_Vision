@@ -35,7 +35,7 @@ data:
       seed: 42
       pipeline:
         - type: "Action_Slot_Transform"
-    batch_size: 16
+    batch_size: 12
     shuffle: true
     num_workers: 12
 
@@ -49,7 +49,7 @@ data:
       seed: 42
       pipeline:
         - type: "Action_Slot_Transform"
-    batch_size: 16
+    batch_size: 12
     shuffle: true
     num_workers: 12
 
