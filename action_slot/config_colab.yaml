@@ -18,7 +18,7 @@ model:
   num_actor_class: 64
   num_slots: 64
   slot_dim: 256
-  ego_c: 64
+  ego_c: 128
   bg_slot: true
   dropout: 0.5
 
