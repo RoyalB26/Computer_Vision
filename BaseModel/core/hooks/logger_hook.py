@@ -5,6 +5,7 @@ from typing import TYPE_CHECKING, Any, Dict, List, Optional
 import numpy as np
 import torch
 from ..registrar import HOOKS
+from ...utils.device import all_gather_numpy
 from .base_hook import BaseHook
 
 if TYPE_CHECKING:
@@ -61,14 +62,14 @@ class LoggerHook(BaseHook):
             tgt_act = outputs["target_actor"]
             if pred_act is not None and tgt_act is not None:
                 if hasattr(pred_act, "detach"):
-                    scores = torch.sigmoid(pred_act.detach().float()).cpu().numpy()
+                    scores = torch.sigmoid(pred_act.detach().float()).contiguous().cpu().numpy()
                 else:
-                    scores = np.asarray(pred_act, dtype=np.float32)
+                    scores = np.ascontiguousarray(pred_act, dtype=np.float32)
 
                 if hasattr(tgt_act, "detach"):
-                    targets = tgt_act.detach().float().cpu().numpy()
+                    targets = tgt_act.detach().float().contiguous().cpu().numpy()
                 else:
-                    targets = np.asarray(tgt_act, dtype=np.float32)
+                    targets = np.ascontiguousarray(tgt_act, dtype=np.float32)
 
                 self._train_pred_actors.append(scores)
                 self._train_target_actors.append(targets)
@@ -147,17 +148,9 @@ class LoggerHook(BaseHook):
         self._train_target_actors.clear()
 
         # Multi-GPU Distributed Synchronization if applicable
-        if torch.distributed.is_available() and torch.distributed.is_initialized():
-            curr_dev = torch.device('cuda', torch.cuda.current_device()) if torch.cuda.is_available() else torch.device('cpu')
-            scores_tensor = torch.from_numpy(scores_arr).to(curr_dev)
-            targets_tensor = torch.from_numpy(targets_arr).to(curr_dev)
-            world_size = torch.distributed.get_world_size()
-            gathered_scores = [torch.zeros_like(scores_tensor) for _ in range(world_size)]
-            gathered_targets = [torch.zeros_like(targets_tensor) for _ in range(world_size)]
-            torch.distributed.all_gather(gathered_scores, scores_tensor)
-            torch.distributed.all_gather(gathered_targets, targets_tensor)
-            scores_arr = torch.cat(gathered_scores, dim=0).cpu().numpy()
-            targets_arr = torch.cat(gathered_targets, dim=0).cpu().numpy()
+        trainer_dev = getattr(trainer, "device", None)
+        scores_arr = all_gather_numpy(scores_arr, device=trainer_dev)
+        targets_arr = all_gather_numpy(targets_arr, device=trainer_dev)
 
         try:
             from sklearn.metrics import average_precision_score

@@ -10,6 +10,7 @@ import torch
 from sklearn.metrics import average_precision_score
 
 from BaseModel.core.registrar import METRICS
+from BaseModel.utils.device import all_gather_numpy
 from BaseModel.utils.metrics.base_metric import BaseMetric
 from .taco_labels import TACO_ACTOR_LABELS, TACO_EGO_LABELS
 
@@ -108,12 +109,12 @@ class TACOActionMetric(BaseMetric):
 
         # Ensure correct shapes: [B, num_classes]
         if pred_actor.ndim != 2 or target_actor.ndim != 2:
-            pred_actor = pred_actor.view(-1, self.num_classes)
-            target_actor = target_actor.view(-1, self.num_classes)
+            pred_actor = pred_actor.reshape(-1, self.num_classes)
+            target_actor = target_actor.reshape(-1, self.num_classes)
 
-        # Convert logits to probabilities via sigmoid
-        scores = torch.sigmoid(pred_actor.detach().float()).cpu().numpy()
-        gts = target_actor.detach().float().cpu().numpy()
+        # Convert logits to probabilities via sigmoid (C-contiguous for fast concat & DDP)
+        scores = torch.sigmoid(pred_actor.detach().float()).contiguous().cpu().numpy()
+        gts = target_actor.detach().float().contiguous().cpu().numpy()
 
         self.all_scores.append(scores)
         self.all_targets.append(gts)
@@ -137,20 +138,8 @@ class TACOActionMetric(BaseMetric):
         targets_arr = np.concatenate(self.all_targets, axis=0)  # [N, num_classes]
 
         # Multi-GPU Distributed Synchronization if applicable
-        if torch.distributed.is_available() and torch.distributed.is_initialized():
-            world_size = torch.distributed.get_world_size()
-            curr_dev = torch.device('cuda', torch.cuda.current_device()) if torch.cuda.is_available() else torch.device('cpu')
-            scores_tensor = torch.from_numpy(scores_arr).to(curr_dev)
-            targets_tensor = torch.from_numpy(targets_arr).to(curr_dev)
-
-            gathered_scores = [torch.zeros_like(scores_tensor) for _ in range(world_size)]
-            gathered_targets = [torch.zeros_like(targets_tensor) for _ in range(world_size)]
-
-            torch.distributed.all_gather(gathered_scores, scores_tensor)
-            torch.distributed.all_gather(gathered_targets, targets_tensor)
-
-            scores_arr = torch.cat(gathered_scores, dim=0).cpu().numpy()
-            targets_arr = torch.cat(gathered_targets, dim=0).cpu().numpy()
+        scores_arr = all_gather_numpy(scores_arr)
+        targets_arr = all_gather_numpy(targets_arr)
 
         records: List[Dict[str, Any]] = []
         aps: List[float] = []
