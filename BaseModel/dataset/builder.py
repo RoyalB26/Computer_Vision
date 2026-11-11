@@ -60,6 +60,10 @@ def build_dataloader(
         sampler = DistributedSampler(dataset, shuffle=shuffle, drop_last=drop_last)
         shuffle = False  # Shuffle được xử lý bởi DistributedSampler
 
+    if num_workers <= 0:
+        kwargs.pop("persistent_workers", None)
+        kwargs.pop("prefetch_factor", None)
+
     return DataLoader(
         dataset=dataset,
         batch_size=batch_size,

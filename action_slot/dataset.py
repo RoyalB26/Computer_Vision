@@ -247,46 +247,65 @@ class ACTION_SLOT_LMDBDataset(BaseDataset):
         with open(data_path, "r", encoding="utf-8") as f:
             data = json.load(f)
 
+        local_rank = int(os.environ.get("LOCAL_RANK", os.environ.get("RANK", "0")))
+        world_size = int(os.environ.get("WORLD_SIZE", "1"))
+        disable_tqdm = local_rank > 0
+
         # 0. Kiểm tra và nạp từ cache file nếu đã được tạo từ trước (load tức thì trong 0.05 giây)
         cache_candidates = [
             os.path.join("./work_dirs", f".cache_taco_{self.split}.pkl"),
             os.path.join(os.path.dirname(data_path), f".cache_taco_{self.split}.pkl"),
             f".cache_taco_{self.split}.pkl",
         ]
-        for cp in cache_candidates:
-            if os.path.exists(cp):
-                try:
-                    with open(cp, "rb") as f:
-                        cached = pickle.load(f)
-                    if isinstance(cached, dict) and "videos_path" in cached and len(cached["videos_path"]) > 0:
-                        # Kiểm tra xem cache có đúng với data_root hiện tại hay không (tránh xung đột khi chuyển giữa Local / Colab / Kaggle)
-                        cached_roots = cached.get("data_roots", [])
-                        current_roots = [os.path.abspath(r) for r in self.data_roots]
-                        if cached_roots and cached_roots != current_roots:
-                            continue
 
-                        # Kiểm tra tính tồn tại của tệp trên máy hiện tại
-                        sample_rgb = cached["videos_path"][0].get("rgb_path", "")
-                        if not os.path.exists(sample_rgb):
-                            continue
-                        self.videos_path = cached["videos_path"]
-                        self.label = cached.get("label", {})
-                        case_counts = cached.get("case_counts", {"case1_ge50": len(self.videos_path), "case2_16to49": 0, "case3_lt16": 0})
-                        non_contiguous_count = cached.get("non_contiguous_count", 0)
-                        print(f"[{self.split.upper()} DATASET] Nạp siêu tốc {len(self.videos_path)} scenarios từ file cache: {cp}")
-                        total = len(self.videos_path)
-                        indices = list(range(total))
-                        rng = random.Random(self.seed)
-                        rng.shuffle(indices)
-                        if self.num_samples:
-                            indices = indices[:self.num_samples]
-                        return [{"lmdb_idx": idx} for idx in indices]
-                except Exception:
-                    pass
+        def _try_load_cache() -> Optional[List[Dict[str, Any]]]:
+            for cp in cache_candidates:
+                if os.path.exists(cp):
+                    try:
+                        with open(cp, "rb") as f:
+                            cached = pickle.load(f)
+                        if isinstance(cached, dict) and "videos_path" in cached and len(cached["videos_path"]) > 0:
+                            # Kiểm tra xem cache có đúng với data_root hiện tại hay không (tránh xung đột khi chuyển giữa Local / Colab / Kaggle)
+                            cached_roots = cached.get("data_roots", [])
+                            current_roots = [os.path.abspath(r) for r in self.data_roots]
+                            if cached_roots and cached_roots != current_roots:
+                                continue
+
+                            # Kiểm tra tính tồn tại của tệp trên máy hiện tại
+                            sample_rgb = cached["videos_path"][0].get("rgb_path", "")
+                            if not os.path.exists(sample_rgb):
+                                continue
+                            self.videos_path = cached["videos_path"]
+                            self.label = cached.get("label", {})
+                            if not disable_tqdm:
+                                print(f"[{self.split.upper()} DATASET] Nạp siêu tốc {len(self.videos_path)} scenarios từ file cache: {cp}")
+                            total = len(self.videos_path)
+                            indices = list(range(total))
+                            rng = random.Random(self.seed)
+                            rng.shuffle(indices)
+                            if self.num_samples:
+                                indices = indices[:self.num_samples]
+                            return [{"lmdb_idx": idx} for idx in indices]
+                    except Exception:
+                        pass
+            return None
+
+        cached_res = _try_load_cache()
+        if cached_res is not None:
+            return cached_res
+
+        # Nếu chạy Multi-GPU (accelerate launch / DDP), chỉ để Rank 0 quét đĩa & ghi cache, các Rank khác chờ nạp cache
+        if world_size > 1 and local_rank > 0:
+            import time
+            for _ in range(600):  # Chờ tối đa 120 giây cho Rank 0 tạo cache
+                time.sleep(0.2)
+                cached_res = _try_load_cache()
+                if cached_res is not None:
+                    return cached_res
 
         # 1. Khám phá toàn bộ các thư mục Town LMDB qua các data_roots (chỉ 1 pass duy nhất, tránh gọi os.path.exists hàng ngàn lần trên Kaggle)
         town_info: Dict[str, Dict[str, Any]] = {}
-        for root in tqdm(self.data_roots, desc=f"[{self.split.upper()} DATASET] Discovering towns in data_roots", dynamic_ncols=True):
+        for root in tqdm(self.data_roots, desc=f"[{self.split.upper()} DATASET] Discovering towns in data_roots", dynamic_ncols=True, disable=disable_tqdm):
             if not os.path.exists(root):
                 continue
 
@@ -307,7 +326,7 @@ class ACTION_SLOT_LMDBDataset(BaseDataset):
             if os.path.isdir(root):
                 try:
                     sub_items = os.listdir(root)
-                    for item in tqdm(sub_items, desc=f"[{self.split.upper()} DATASET] Scanning {os.path.basename(root)}", leave=False, dynamic_ncols=True):
+                    for item in tqdm(sub_items, desc=f"[{self.split.upper()} DATASET] Scanning {os.path.basename(root)}", leave=False, dynamic_ncols=True, disable=disable_tqdm):
                         item_dir = os.path.join(root, item)
                         if not os.path.isdir(item_dir):
                             continue
@@ -326,20 +345,38 @@ class ACTION_SLOT_LMDBDataset(BaseDataset):
                 except Exception:
                     pass
 
-        # 1.1 Quét trước key-index cho các Town đã tìm thấy với tqdm
+        # 1.1 Chỉ quét key-index trên `mask_background` của các Town thực sự cần cho split hiện tại:
+        #   - `mask_background/data.mdb` chỉ nặng ~40MB/town (nhỏ hơn 45 lần so với `rgb_front/data.mdb` nặng 2-15GB)
+        #     và có các B+tree leaf pages nằm liền kề nhau 100% (0 overflow pages).
+        #   - Đọc tuần tự `mask_background/data.mdb` theo chunk 16MB vào OS Page Cache + mở với `readahead=True`
+        #     giúp tránh hoàn toàn hàng chục ngàn lượt đọc ngẫu nhiên 4KB qua mạng (FUSE) trên Kaggle/Colab.
         from collections import defaultdict
+        import lmdb
         town_key_index: Dict[str, Dict[str, List[str]]] = {}
-        unique_lmdb_paths = set()
-        for t_data in town_info.values():
-            if t_data.get("rgb"):
-                unique_lmdb_paths.add(t_data["rgb"])
-            if t_data.get("bg"):
-                unique_lmdb_paths.add(t_data["bg"])
+        required_norm_towns = {k.split("/")[0].replace("_lmdb", "") for k in data.keys()}
+        unique_bg_lmdb_paths = sorted({
+            town_info[nt]["bg"]
+            for nt in required_norm_towns
+            if nt in town_info and town_info[nt].get("bg")
+        })
 
-        for lmdb_path in tqdm(sorted(unique_lmdb_paths), desc=f"[{self.split.upper()} DATASET] Indexing LMDB keys", dynamic_ncols=True):
+        def _index_lmdb_fast(lmdb_path: str) -> Dict[str, List[str]]:
             pdict = defaultdict(list)
             try:
-                env = self._get_lmdb_env(lmdb_path)
+                mdb_file = os.path.join(lmdb_path, "data.mdb")
+                if os.path.exists(mdb_file) and os.path.getsize(mdb_file) <= 256 * 1024 * 1024:
+                    # Đọc tuần tự file nhỏ (mask_background ~40MB) vào OS Page Cache chỉ với vài syscall 16MB
+                    with open(mdb_file, "rb") as f_warm:
+                        while f_warm.read(16 * 1024 * 1024):
+                            pass
+                env = lmdb.open(
+                    lmdb_path,
+                    readonly=True,
+                    lock=False,
+                    readahead=True,
+                    meminit=False,
+                    max_readers=128,
+                )
                 with env.begin(write=False) as txn:
                     cur = txn.cursor()
                     if cur.first():
@@ -349,28 +386,18 @@ class ACTION_SLOT_LMDBDataset(BaseDataset):
                             pdict[pfx].append(k_str)
                             if not cur.next():
                                 break
+                env.close()
             except Exception:
                 pass
-            town_key_index[lmdb_path] = pdict
+            return pdict
+
+        for bg_lmdb_path in tqdm(unique_bg_lmdb_paths, desc=f"[{self.split.upper()} DATASET] Indexing LMDB keys", dynamic_ncols=True, disable=disable_tqdm):
+            town_key_index[bg_lmdb_path] = _index_lmdb_fast(bg_lmdb_path)
 
         # 2. Cơ chế tra cứu key in-memory từ town_key_index
         def get_town_prefix_keys(lmdb_path: str, target_prefix: str) -> List[str]:
             if lmdb_path not in town_key_index:
-                pdict = defaultdict(list)
-                try:
-                    env = self._get_lmdb_env(lmdb_path)
-                    with env.begin(write=False) as txn:
-                        cur = txn.cursor()
-                        if cur.first():
-                            while True:
-                                k_str = cur.key().decode("utf-8")
-                                pfx = "/".join(k_str.split("/")[:-1])
-                                pdict[pfx].append(k_str)
-                                if not cur.next():
-                                    break
-                except Exception:
-                    pass
-                town_key_index[lmdb_path] = pdict
+                town_key_index[lmdb_path] = _index_lmdb_fast(lmdb_path)
             return town_key_index[lmdb_path].get(target_prefix, [])
 
         self.videos_path = []
@@ -378,7 +405,7 @@ class ACTION_SLOT_LMDBDataset(BaseDataset):
         case_counts = {"case1_ge50": 0, "case2_16to49": 0, "case3_lt16": 0}
         non_contiguous_count = 0
 
-        for k, v in tqdm(data.items(), desc=f"[{self.split.upper()} DATASET] Loading scenarios", dynamic_ncols=True):
+        for k, v in tqdm(data.items(), desc=f"[{self.split.upper()} DATASET] Loading scenarios", dynamic_ncols=True, disable=disable_tqdm):
             split_path = k.split("/")
             town_key = split_path[0]
             norm_town = town_key.replace("_lmdb", "")
@@ -398,18 +425,16 @@ class ACTION_SLOT_LMDBDataset(BaseDataset):
             rgb_keys: List[str] = []
             bg_keys: List[str] = []
 
-            # Tra cứu siêu tốc O(1) qua pre-discovered town_info
+            # Tra cứu siêu tốc O(1) qua pre-discovered town_info (suy xuất rgb_keys trực tiếp từ bg_keys để không phải quét file rgb_front 50GB)
             if norm_town in town_info:
                 info = town_info[norm_town]
-                r_keys = get_town_prefix_keys(info["rgb"], clean_rgb_prefix)
-                if r_keys:
-                    b_keys = get_town_prefix_keys(info["bg"], clean_bg_prefix)
-                    if b_keys:
-                        matched_rgb = info["rgb"]
-                        matched_bg = info["bg"]
-                        matched_obj = info["obj"]
-                        rgb_keys = r_keys
-                        bg_keys = b_keys
+                b_keys = get_town_prefix_keys(info["bg"], clean_bg_prefix)
+                if b_keys:
+                    matched_rgb = info["rgb"]
+                    matched_bg = info["bg"]
+                    matched_obj = info["obj"]
+                    bg_keys = b_keys
+                    rgb_keys = [f"{clean_rgb_prefix}/{bk.split('/')[-1].split('.')[0]}.jpg" for bk in b_keys]
 
             # Fallback tra cứu truyền thống nếu town chưa có trong pre-discovery
             if matched_rgb is None:
@@ -438,15 +463,12 @@ class ACTION_SLOT_LMDBDataset(BaseDataset):
 
                     for c_rgb, c_bg, c_obj in candidates:
                         if os.path.exists(c_rgb) and os.path.exists(c_bg):
-                            rgb_env = self._get_lmdb_env(c_rgb)
-                            r_keys = self._get_prefix_keys(rgb_env, clean_rgb_prefix)
-                            if r_keys:
-                                bg_env = self._get_lmdb_env(c_bg)
-                                b_keys = self._get_prefix_keys(bg_env, clean_bg_prefix)
-                                if b_keys:
-                                    matched_rgb, matched_bg, matched_obj = c_rgb, c_bg, c_obj
-                                    rgb_keys, bg_keys = r_keys, b_keys
-                                    break
+                            b_keys = get_town_prefix_keys(c_bg, clean_bg_prefix)
+                            if b_keys:
+                                matched_rgb, matched_bg, matched_obj = c_rgb, c_bg, c_obj
+                                bg_keys = b_keys
+                                rgb_keys = [f"{clean_rgb_prefix}/{bk.split('/')[-1].split('.')[0]}.jpg" for bk in b_keys]
+                                break
                     if matched_rgb is not None:
                         break
 
@@ -499,13 +521,14 @@ class ACTION_SLOT_LMDBDataset(BaseDataset):
         close_lmdb()
         self.env_cache.clear()
 
-        # Tự động lưu cache index để tái sử dụng ngay lập tức ở lần chạy sau (chỉ mất 0.05 giây)
+        # Tự động lưu cache index nguyên tử (atomic write) để tái sử dụng ngay lập tức và an toàn cho Multi-GPU
         if len(self.videos_path) > 0:
             for save_dir in ["./work_dirs", os.path.dirname(data_path)]:
                 try:
                     os.makedirs(save_dir, exist_ok=True)
                     cache_file = os.path.join(save_dir, f".cache_taco_{self.split}.pkl")
-                    with open(cache_file, "wb") as f:
+                    tmp_file = f"{cache_file}.tmp.{os.getpid()}"
+                    with open(tmp_file, "wb") as f:
                         pickle.dump({
                             "data_roots": [os.path.abspath(r) for r in self.data_roots],
                             "videos_path": self.videos_path,
@@ -513,22 +536,25 @@ class ACTION_SLOT_LMDBDataset(BaseDataset):
                             "case_counts": case_counts,
                             "non_contiguous_count": non_contiguous_count,
                         }, f)
-                    print(f"[{self.split.upper()} DATASET] Đã lưu file cache: {cache_file}")
+                    os.replace(tmp_file, cache_file)
+                    if not disable_tqdm:
+                        print(f"[{self.split.upper()} DATASET] Đã lưu file cache: {cache_file}")
                     break
                 except Exception:
                     pass
 
         # In thống kê số lượng video thuộc mỗi trường hợp ra terminal
         total = len(self.videos_path)
-        print(f"[{self.split.upper()} DATASET] Thống kê số lượng video:")
-        print(f"  + Tổng số scenario hợp lệ : {total}")
-        print(f"  + Trường hợp 1 (>=50 frames liên tục) : {case_counts['case1_ge50']}")
-        print(f"  + Trường hợp 2 (16 - 49 frames thực tế) : {case_counts['case2_16to49']}")
-        print(f"  + Trường hợp 3 (<16 frames, nội suy đều): {case_counts['case3_lt16']}")
-        if self.filter_non_contiguous:
-            print(f"  + Đã loại bỏ số video bị khuyết frame ở giữa: {non_contiguous_count}")
-        else:
-            print(f"  + Số video bị khuyết số frame ở giữa  : {non_contiguous_count}")
+        if not disable_tqdm:
+            print(f"[{self.split.upper()} DATASET] Thống kê số lượng video:")
+            print(f"  + Tổng số scenario hợp lệ : {total}")
+            print(f"  + Trường hợp 1 (>=50 frames liên tục) : {case_counts['case1_ge50']}")
+            print(f"  + Trường hợp 2 (16 - 49 frames thực tế) : {case_counts['case2_16to49']}")
+            print(f"  + Trường hợp 3 (<16 frames, nội suy đều): {case_counts['case3_lt16']}")
+            if self.filter_non_contiguous:
+                print(f"  + Đã loại bỏ số video bị khuyết frame ở giữa: {non_contiguous_count}")
+            else:
+                print(f"  + Số video bị khuyết số frame ở giữa  : {non_contiguous_count}")
 
         indices = list(range(total))
         rng = random.Random(self.seed)
