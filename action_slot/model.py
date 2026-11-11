@@ -31,11 +31,11 @@ class ActionSlotModel(BaseModel):
 
     def __init__(
         self,
-        num_ego_class: int = 7,
+        num_ego_class: int = 4,
         num_actor_class: int = 64,
         num_slots: int = 64,
         slot_dim: int = 256,
-        ego_c: int = 64,
+        ego_c: int = 128,
         bg_slot: bool = False,
         resolution3d: tuple = (16, 8, 24),
         dropout: float = 0.5,
@@ -94,6 +94,7 @@ class ActionSlotModel(BaseModel):
             input_dim=self.slot_dim,
             resolution=list(resolution3d),
             num_actor_class=num_actor_class,
+            allocated_slot=kwargs.get('allocated_slot', True),
             slot_dropout=kwargs.get('slot_dropout', 0.0),
         )
 
@@ -120,6 +121,7 @@ class ActionSlotModel(BaseModel):
 
         # 1. Backbone feature extraction: (B, C, T_feat, H_feat, W_feat)
         feats = self.backbone(videos)
+        feats = self.drop(feats)
 
         # 2. Ego feature branch
         ego_x = None

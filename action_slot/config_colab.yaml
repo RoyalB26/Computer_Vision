@@ -14,14 +14,14 @@ custom_imports:
 # 1. Model Configuration: Hand Digit Detector with Deformable Slot Attention Head
 model:
   type: "ActionSlotModel"
-  num_ego_class: 7
+  num_ego_class: 4
   num_actor_class: 64
   num_slots: 64
   slot_dim: 256
   ego_c: 128
   bg_slot: true
   dropout: 0.5
-  finetune_last_n_stages: 2  # Chỉ fine-tune 2 stage cuối của backbone (ResStage 3 & 4), freeze stem & stage 1, 2
+  finetune_last_n_stages: 2  # Chỉ fine-tune 2 stage cuối của backbone (đặt unfreeze_all: true nếu muốn mở toàn bộ như v7)
 
 # 2. Dataset Configuration
 # Hỗ trợ cấu hình nhiều data_root dưới dạng danh sách (list) hoặc đường dẫn đơn (str)
@@ -54,17 +54,17 @@ data:
     shuffle: true
     num_workers: 12
 
-# 3. Optimizer Configuration
+# 3. Optimizer Configuration (đồng bộ với D:\v7\Action-slot: lr=5e-4, wd=0.07)
 optimizer:
   type: "AdamW"
   lr: 0.0005
-  weight_decay: 0.0001
+  weight_decay: 0.07
 
-# 4. Learning Rate Scheduler Configuration
-lr_scheduler:
-  type: "CosineAnnealingLR"
-  T_max: 100
-  eta_min: 0.00001
+# 4. Learning Rate Scheduler Configuration (Code gốc train_taco.py không dùng scheduler)
+# lr_scheduler:
+#   type: "CosineAnnealingLR"
+#   T_max: 100
+#   eta_min: 0.00001
 
 # 5. Evaluation Metrics Configuration
 metrics:
@@ -99,7 +99,7 @@ hooks:
 # 7. Training Engine Configuration
 train_cfg:
   max_epochs: 100
-  val_interval: 10                           # Đánh giá validation và tính mAP ở MỌI epoch để tracking liên tục
+  val_interval: 10                           # Đánh giá validation và tính mAP mỗi 10 epochs
   log_interval: 2500                        # In log tiến trình mỗi 2500 batches
-  grad_clip: 1.0                            # Gradient clipping chuẩn 1.0 chống gradient explosion
+  grad_clip: null                           # Không clip gradient (đồng bộ với D:\v7\Action-slot)
   use_amp: false                            # Chạy FP32 chính xác cao

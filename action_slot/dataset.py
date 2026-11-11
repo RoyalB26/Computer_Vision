@@ -10,7 +10,7 @@ import io
 import json
 import pickle
 import random
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Dict, List, Optional, Tuple, Union
 import numpy as np
 from PIL import Image
 import torch
@@ -23,6 +23,12 @@ from BaseModel.dataset import BaseDataset, open_lmdb
 class ACTION_SLOT_LMDBDataset(BaseDataset):
     """LMDB-based Action Slot dataset supporting single or multiple data_root paths.
 
+    Matches the temporal strided frame sampling of the original TACO dataset:
+      - Computes `step = num_frame // sequence_len` across the full scenario duration.
+      - Builds up to `max_num = 50` strided 16-frame clips per scenario.
+      - During `train`: randomly samples one of the strided clips (`random.randint`).
+      - During `val`: selects the middle strided clip (`len(videos) // 2`).
+
     Args:
         data_root: Single directory path (str) or list of directory paths (List[str]).
         data_roots: Optional alias for data_root when configuring multiple roots.
@@ -32,6 +38,8 @@ class ACTION_SLOT_LMDBDataset(BaseDataset):
         seed: Random seed for sample indexing.
         sequence_len: Number of video frames in clip.
         mask_every_frame: Frequency of mask extraction.
+        min_frames: Minimum number of frames required for a valid scenario (default 50).
+        use_obj_mask: Whether to load object instance masks from LMDB (default False).
         num_samples: Optional limit on total samples loaded.
         test_mode: Whether running in evaluation mode.
     """
@@ -46,6 +54,8 @@ class ACTION_SLOT_LMDBDataset(BaseDataset):
         seed: int = 42,
         sequence_len: int = 16,
         mask_every_frame: int = 4,
+        min_frames: int = 50,
+        use_obj_mask: bool = False,
         num_samples: Optional[int] = None,
         test_mode: bool = False,
         **kwargs,
@@ -54,6 +64,8 @@ class ACTION_SLOT_LMDBDataset(BaseDataset):
         self.seed = seed
         self.sequence_len = sequence_len
         self.mask_every_frame = mask_every_frame
+        self.min_frames = min_frames
+        self.use_obj_mask = use_obj_mask
         self.num_samples = num_samples
 
         # 1. Normalize data_root(s) into a unified list of paths
@@ -81,8 +93,44 @@ class ACTION_SLOT_LMDBDataset(BaseDataset):
             test_mode=test_mode,
         )
 
+    def _get_lmdb_env(self, path: str):
+        """Lazily initialize and cache LMDB environment for a path."""
+        if path not in self.env_cache or self.env_cache[path] is None:
+            self.env_cache[path], _ = open_lmdb(path, readonly=True)
+        return self.env_cache[path]
+
+    @staticmethod
+    def _get_first_last_frame(env, prefix_path: str) -> Optional[Tuple[int, int]]:
+        """Find (start_frame, end_frame) for a scenario prefix in O(log N) via LMDB B-tree seeks."""
+        p = prefix_path.replace("\\", "/").rstrip("/") + "/"
+        p_end = p[:-1] + "0"  # ASCII '0' (0x30) immediately follows '/' (0x2f)
+        with env.begin() as txn:
+            cursor = txn.cursor()
+            if not cursor.set_range(p.encode("utf-8")):
+                return None
+            first_key = cursor.key().decode("utf-8")
+            if not first_key.startswith(p):
+                return None
+
+            if cursor.set_range(p_end.encode("utf-8")):
+                if not cursor.prev():
+                    return None
+            else:
+                if not cursor.last():
+                    return None
+            last_key = cursor.key().decode("utf-8")
+            if not last_key.startswith(p):
+                return None
+
+        try:
+            start_frame = int(first_key.split("/")[-1].split(".")[0])
+            end_frame = int(last_key.split("/")[-1].split(".")[0])
+            return start_frame, end_frame
+        except (ValueError, IndexError):
+            return None
+
     def load_annotations(self) -> List[Dict[str, Any]]:
-        """Scan annotation entries and resolve file paths across all configured data_roots."""
+        """Scan annotation entries, resolve LMDB paths, and build strided frame sequences."""
         # Determine annotation file path
         if getattr(self, "ann_file", None) and os.path.exists(self.ann_file):
             data_path = self.ann_file
@@ -105,7 +153,7 @@ class ACTION_SLOT_LMDBDataset(BaseDataset):
 
         self.videos_path = []
         self.label = {}
-        matched_roots = set()
+        max_required_seg_idx = ((self.sequence_len - 1) // self.mask_every_frame) * self.mask_every_frame
 
         for k, v in data.items():
             split_path = k.split("/")
@@ -116,50 +164,106 @@ class ACTION_SLOT_LMDBDataset(BaseDataset):
             bg_prefix = os.path.join(split_path[1], "variant_scenario", split_path[2], "mask", "background")
             obj_prefix = os.path.join(split_path[1], "variant_scenario", split_path[2], "mask", "object")
 
+            clean_rgb_prefix = rgb_prefix.replace("\\", "/").rstrip("/")
+            clean_bg_prefix = bg_prefix.replace("\\", "/").rstrip("/")
+
             matched_rgb = None
             matched_bg = None
             matched_obj = None
+            rgb_range = None
+            bg_range = None
 
             # Search across all specified data roots
             for root in self.data_roots:
-                # 1. Standard structure: root / <folder_name> / rgb_front
-                c_rgb = os.path.join(root, folder_name, "rgb_front")
-                c_bg = os.path.join(root, folder_name, "mask_background")
-                c_obj = os.path.join(root, folder_name, "mask_object")
-                if os.path.exists(c_rgb):
-                    matched_rgb, matched_bg, matched_obj = c_rgb, c_bg, c_obj
-                    matched_roots.add(root)
-                    break
-
-                # 2. Root is directly the LMDB folder (e.g. root = ".../ap_Town07_lmdb")
+                candidates = [
+                    (
+                        os.path.join(root, folder_name, "rgb_front"),
+                        os.path.join(root, folder_name, "mask_background"),
+                        os.path.join(root, folder_name, "mask_object"),
+                    ),
+                    (
+                        os.path.join(root, raw_folder, "rgb_front"),
+                        os.path.join(root, raw_folder, "mask_background"),
+                        os.path.join(root, raw_folder, "mask_object"),
+                    ),
+                ]
                 if os.path.basename(os.path.normpath(root)) in (folder_name, raw_folder):
-                    c_rgb = os.path.join(root, "rgb_front")
-                    c_bg = os.path.join(root, "mask_background")
-                    c_obj = os.path.join(root, "mask_object")
-                    if os.path.exists(c_rgb):
-                        matched_rgb, matched_bg, matched_obj = c_rgb, c_bg, c_obj
-                        matched_roots.add(root)
-                        break
+                    candidates.insert(
+                        1,
+                        (
+                            os.path.join(root, "rgb_front"),
+                            os.path.join(root, "mask_background"),
+                            os.path.join(root, "mask_object"),
+                        ),
+                    )
 
-                # 3. Structure without _lmdb suffix: root / <raw_folder> / rgb_front
-                c_rgb = os.path.join(root, raw_folder, "rgb_front")
-                c_bg = os.path.join(root, raw_folder, "mask_background")
-                c_obj = os.path.join(root, raw_folder, "mask_object")
-                if os.path.exists(c_rgb):
-                    matched_rgb, matched_bg, matched_obj = c_rgb, c_bg, c_obj
-                    matched_roots.add(root)
+                for c_rgb, c_bg, c_obj in candidates:
+                    if os.path.exists(c_rgb) and os.path.exists(c_bg):
+                        rgb_env = self._get_lmdb_env(c_rgb)
+                        r_range = self._get_first_last_frame(rgb_env, clean_rgb_prefix)
+                        if r_range is not None:
+                            bg_env = self._get_lmdb_env(c_bg)
+                            b_range = self._get_first_last_frame(bg_env, clean_bg_prefix)
+                            matched_rgb, matched_bg, matched_obj = c_rgb, c_bg, c_obj
+                            rgb_range, bg_range = r_range, b_range
+                            break
+                if matched_rgb is not None:
                     break
 
-            if matched_rgb is not None:
-                self.videos_path.append({
-                    "rgb_path": matched_rgb,
-                    "mask_bg_path": matched_bg,
-                    "mask_obj_path": matched_obj,
-                    "rgb_prefix": rgb_prefix,
-                    "bg_prefix": bg_prefix,
-                    "obj_prefix": obj_prefix,
-                })
-                self.label[rgb_prefix] = v
+            if matched_rgb is None or rgb_range is None:
+                continue
+
+            start_frame, end_frame = rgb_range
+            num_frame = end_frame - start_frame + 1
+            if num_frame < self.min_frames or num_frame < self.sequence_len:
+                continue
+
+            if bg_range is not None:
+                bg_start_frame, bg_end_frame = bg_range
+            else:
+                bg_start_frame, bg_end_frame = start_frame, end_frame
+
+            step = max(1, num_frame // self.sequence_len)
+            videos: List[List[str]] = []
+            segs: List[List[str]] = []
+            max_num = 50
+
+            for m in range(max_num):
+                start = start_frame + m
+                if start_frame + (self.sequence_len - 1) * step > end_frame:
+                    break
+                videos_temp: List[str] = []
+                seg_temp: List[str] = []
+                for i in range(start, end_frame + 1, step):
+                    if start_frame <= i <= end_frame:
+                        videos_temp.append(f"{clean_rgb_prefix}/{str(i).zfill(8)}.jpg")
+                    if bg_start_frame <= i <= bg_end_frame:
+                        seg_temp.append(f"{clean_bg_prefix}/{str(i).zfill(8)}.png")
+                    if len(videos_temp) == self.sequence_len:
+                        break
+                if len(videos_temp) == self.sequence_len and len(seg_temp) > max_required_seg_idx:
+                    videos.append(videos_temp)
+                    segs.append(seg_temp)
+
+            if not videos:
+                continue
+
+            self.videos_path.append({
+                "scenario_key": k,
+                "rgb_path": matched_rgb,
+                "mask_bg_path": matched_bg,
+                "mask_obj_path": matched_obj,
+                "rgb_prefix": rgb_prefix,
+                "bg_prefix": bg_prefix,
+                "obj_prefix": obj_prefix,
+                "videos": videos,
+                "segs": segs,
+                "label": v,
+            })
+            self.label[k] = v
+
+        # Clear cached LMDB handles before DataLoader forks/spawns workers
+        self.env_cache.clear()
 
         total = len(self.videos_path)
         indices = list(range(total))
@@ -170,12 +274,6 @@ class ACTION_SLOT_LMDBDataset(BaseDataset):
             indices = indices[:self.num_samples]
 
         return [{"lmdb_idx": idx} for idx in indices]
-
-    def _get_lmdb_env(self, path: str):
-        """Lazily initialize and cache LMDB environment for a path."""
-        if path not in self.env_cache or self.env_cache[path] is None:
-            self.env_cache[path], _ = open_lmdb(path, readonly=True)
-        return self.env_cache[path]
 
     def get_first_n_images_by_prefix(self, env, prefix_path: str, num_images: int = 16):
         """Retrieve up to num_images from LMDB matching prefix."""
@@ -201,19 +299,49 @@ class ACTION_SLOT_LMDBDataset(BaseDataset):
 
         return results
 
+    @staticmethod
+    def _fetch_samples_by_keys(env, keys: List[str]) -> List[Any]:
+        """Fetch and unpickle exact keys from LMDB in a single read transaction."""
+        results = []
+        with env.begin() as txn:
+            for k in keys:
+                val = txn.get(k.encode("utf-8"))
+                if val is not None:
+                    results.append(pickle.loads(val))
+        return results
+
     def get_data_info(self, idx: int) -> Dict[str, Any]:
-        """Fetch sample data and ground-truth targets."""
+        """Fetch strided clip frames and ground-truth targets."""
         real_idx = self.data_infos[idx]["lmdb_idx"]
         path = self.videos_path[real_idx]
-        label = self.label[path["rgb_prefix"]]
+        label = path.get("label") or self.label[path["scenario_key"]]
 
         rgb_env = self._get_lmdb_env(path["rgb_path"])
         bg_env = self._get_lmdb_env(path["mask_bg_path"])
-        obj_env = self._get_lmdb_env(path["mask_obj_path"])
 
-        videos = self.get_first_n_images_by_prefix(rgb_env, path["rgb_prefix"], num_images=self.sequence_len)
-        bg_masks = self.get_first_n_images_by_prefix(bg_env, path["bg_prefix"], num_images=self.sequence_len)
-        obj_masks = self.get_first_n_images_by_prefix(obj_env, path["obj_prefix"], num_images=self.sequence_len)
+        videos_clips = path.get("videos", [])
+        segs_clips = path.get("segs", [])
+
+        if videos_clips:
+            if self.split == "train":
+                sample_idx = random.randint(0, len(videos_clips) - 1)
+            else:
+                sample_idx = len(videos_clips) // 2
+
+            seq_video_keys = videos_clips[sample_idx]
+            seq_seg_all_keys = segs_clips[sample_idx]
+            seq_seg_keys = [
+                seq_seg_all_keys[i]
+                for i in range(0, self.sequence_len, self.mask_every_frame)
+                if i < len(seq_seg_all_keys)
+            ]
+
+            videos = self._fetch_samples_by_keys(rgb_env, seq_video_keys)
+            bg_masks = self._fetch_samples_by_keys(bg_env, seq_seg_keys)
+        else:
+            videos = self.get_first_n_images_by_prefix(rgb_env, path["rgb_prefix"], num_images=self.sequence_len)
+            raw_bg = self.get_first_n_images_by_prefix(bg_env, path["bg_prefix"], num_images=self.sequence_len)
+            bg_masks = [s for i, s in enumerate(raw_bg) if i % self.mask_every_frame == 0]
 
         target: Dict[str, Any] = {
             "bg_seg": [],
@@ -231,12 +359,13 @@ class ACTION_SLOT_LMDBDataset(BaseDataset):
                 data.append(img)
 
         if bg_masks:
-            for i, sample in enumerate(bg_masks):
-                if i % self.mask_every_frame == 0:
-                    img = Image.open(io.BytesIO(sample["image"])).convert("L")
-                    target["bg_seg"].append(img)
+            for sample in bg_masks:
+                img = Image.open(io.BytesIO(sample["image"])).convert("L")
+                target["bg_seg"].append(img)
 
-        if obj_masks:
+        if self.use_obj_mask and path.get("mask_obj_path"):
+            obj_env = self._get_lmdb_env(path["mask_obj_path"])
+            obj_masks = self.get_first_n_images_by_prefix(obj_env, path["obj_prefix"], num_images=self.sequence_len)
             for sample in obj_masks:
                 mask = self.get_obj_mask(sample)
                 target["obj_masks"].append(mask)
@@ -268,27 +397,3 @@ class ACTION_SLOT_LMDBDataset(BaseDataset):
         """Restore dataset state in worker processes."""
         self.__dict__.update(state)
         self.env_cache = {}
-
-
-if __name__ == "__main__":
-    data_roots = [r"D:/apps/Datasets/TACO/data"]
-    ds = ACTION_SLOT_LMDBDataset(data_root=data_roots, split="train")
-    print(f"Loaded {len(ds)} samples across roots: {data_roots}")
-    if len(ds) > 0:
-        for i in range(len(ds)):
-            sample = ds.get_data_info(i)
-            if "ap_Town07" in sample["targets"]["path"]["rgb_path"] and "t2" in sample["targets"]["path"]["rgb_prefix"] and "12" in sample["targets"]["path"]["rgb_prefix"]:
-                print(f"Sample {i} path:", sample["targets"]["path"]["rgb_path"])
-                print(f"Sample {i} rgb_prefix:", sample["targets"]["path"]["rgb_prefix"])
-                print("Num video frames:", len(sample["inputs"]))
-                # for x in sample["inputs"]:
-                #     x.show()
-                import matplotlib.pyplot as plt
-
-                fig, axes = plt.subplots(4, 4, figsize=(16, 6))
-                for i, ax in enumerate(axes.flat):
-                    ax.imshow(sample["inputs"][i])
-                    ax.axis('off')
-
-                plt.tight_layout()
-                plt.show()
