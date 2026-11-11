@@ -5,7 +5,7 @@ project_name: "action_slot"
 device: "cuda"  
 seed: 42
 tqdm: true
-accumulate: 3
+accumulate: 2
 
 custom_imports:
   - "action_slot.model"
@@ -38,7 +38,7 @@ data:
       seed: 42
       pipeline:
         - type: "Action_Slot_Transform"
-    batch_size: 8
+    batch_size: 12
     shuffle: true
     num_workers: 12
 
@@ -52,7 +52,7 @@ data:
       seed: 42
       pipeline:
         - type: "Action_Slot_Transform"
-    batch_size: 8
+    batch_size: 12
     shuffle: true
     num_workers: 12
 
