@@ -1,6 +1,7 @@
 # Configuration for Hand Digit Object Detection (Boxes + Labels) with Full Metrics & Gradient Tracking
 
 work_dir: "./work_dirs/action_slot"
+project_name: "action_slot"
 device: "cuda"  
 seed: 42
 tqdm: true

@@ -16,7 +16,7 @@ from PIL import Image
 import torch
 
 from BaseModel.core import DATASETS
-from BaseModel.dataset import BaseDataset, open_lmdb
+from BaseModel.dataset import BaseDataset, close_lmdb, open_lmdb
 
 
 @DATASETS.register_module()
@@ -96,7 +96,9 @@ class ACTION_SLOT_LMDBDataset(BaseDataset):
     def _get_lmdb_env(self, path: str):
         """Lazily initialize and cache LMDB environment for a path."""
         if path not in self.env_cache or self.env_cache[path] is None:
-            self.env_cache[path], _ = open_lmdb(path, readonly=True)
+            env, txn = open_lmdb(path, readonly=True)
+            txn.abort()
+            self.env_cache[path] = env
         return self.env_cache[path]
 
     @staticmethod
@@ -262,7 +264,8 @@ class ACTION_SLOT_LMDBDataset(BaseDataset):
             })
             self.label[k] = v
 
-        # Clear cached LMDB handles before DataLoader forks/spawns workers
+        # Close all LMDB handles in parent process before DataLoader forks worker processes
+        close_lmdb()
         self.env_cache.clear()
 
         total = len(self.videos_path)

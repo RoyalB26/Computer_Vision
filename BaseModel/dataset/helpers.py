@@ -115,6 +115,15 @@ def open_lmdb(
     cache_key = (pid, abs_path)
 
     if cache_key not in _LMDB_ENV_CACHE:
+        # Close any handle inherited across os.fork() from parent process for the same path
+        for (k_pid, k_path), old_env in list(_LMDB_ENV_CACHE.items()):
+            if k_path == abs_path and k_pid != pid:
+                try:
+                    old_env.close()
+                except Exception:
+                    pass
+                _LMDB_ENV_CACHE.pop((k_pid, k_path), None)
+
         _LMDB_ENV_CACHE[cache_key] = lmdb.open(
             abs_path,
             max_readers=max_readers,
