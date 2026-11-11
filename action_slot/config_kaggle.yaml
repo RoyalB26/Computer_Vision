@@ -32,13 +32,14 @@ data:
     dataset:
       type: "ACTION_SLOT_LMDBDataset"
       data_root:
-        - "/tmp/taco-lmdb-part1"
+        - "/kaggle/input/datasets/royalb26/taco-lmdb-part1"
+        - "/kaggle/input/datasets/royalb26/taco-lmdb-part2"
       split: "train"
       sequence_len: 16
       seed: 42
       pipeline:
         - type: "Action_Slot_Transform"
-    batch_size: 4
+    batch_size: 8
     shuffle: true
     num_workers: 4
     prefetch_factor: 2
@@ -48,7 +49,8 @@ data:
     dataset:
       type: "ACTION_SLOT_LMDBDataset"
       data_root:
-        - - "/tmp/taco-lmdb-part1"
+        - "/kaggle/input/datasets/royalb26/taco-lmdb-part1"
+        - "/kaggle/input/datasets/royalb26/taco-lmdb-part2"
       split: "val"
       sequence_len: 16
       seed: 42
