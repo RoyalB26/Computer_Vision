@@ -247,6 +247,97 @@ class ACTION_SLOT_LMDBDataset(BaseDataset):
         with open(data_path, "r", encoding="utf-8") as f:
             data = json.load(f)
 
+        # 0. Kiểm tra và nạp từ cache file nếu đã được tạo từ trước (load tức thì trong 0.05 giây)
+        cache_candidates = [
+            os.path.join("./work_dirs", f".cache_taco_{self.split}.pkl"),
+            os.path.join(os.path.dirname(data_path), f".cache_taco_{self.split}.pkl"),
+            f".cache_taco_{self.split}.pkl",
+        ]
+        for cp in cache_candidates:
+            if os.path.exists(cp):
+                try:
+                    with open(cp, "rb") as f:
+                        cached = pickle.load(f)
+                    if isinstance(cached, dict) and "videos_path" in cached and len(cached["videos_path"]) > 0:
+                        self.videos_path = cached["videos_path"]
+                        self.label = cached.get("label", {})
+                        case_counts = cached.get("case_counts", {"case1_ge50": len(self.videos_path), "case2_16to49": 0, "case3_lt16": 0})
+                        non_contiguous_count = cached.get("non_contiguous_count", 0)
+                        print(f"[{self.split.upper()} DATASET] Nạp siêu tốc {len(self.videos_path)} scenarios từ file cache: {cp}")
+                        total = len(self.videos_path)
+                        indices = list(range(total))
+                        rng = random.Random(self.seed)
+                        rng.shuffle(indices)
+                        if self.num_samples:
+                            indices = indices[:self.num_samples]
+                        return [{"lmdb_idx": idx} for idx in indices]
+                except Exception:
+                    pass
+
+        # 1. Khám phá toàn bộ các thư mục Town LMDB qua các data_roots (chỉ 1 pass duy nhất, tránh gọi os.path.exists hàng ngàn lần trên Kaggle)
+        town_info: Dict[str, Dict[str, Any]] = {}
+        for root in self.data_roots:
+            if not os.path.exists(root):
+                continue
+
+            root_rgb = os.path.join(root, "rgb_front")
+            root_bg = os.path.join(root, "mask_background")
+            root_obj = os.path.join(root, "mask_object")
+            if os.path.exists(root_rgb) and os.path.exists(root_bg):
+                base_name = os.path.basename(os.path.normpath(root))
+                norm_name = base_name.replace("_lmdb", "")
+                t_info = {
+                    "rgb": root_rgb,
+                    "bg": root_bg,
+                    "obj": root_obj if os.path.exists(root_obj) else None,
+                }
+                town_info[norm_name] = t_info
+                town_info[base_name] = t_info
+
+            if os.path.isdir(root):
+                try:
+                    for item in os.listdir(root):
+                        item_dir = os.path.join(root, item)
+                        if not os.path.isdir(item_dir):
+                            continue
+                        sub_rgb = os.path.join(item_dir, "rgb_front")
+                        sub_bg = os.path.join(item_dir, "mask_background")
+                        sub_obj = os.path.join(item_dir, "mask_object")
+                        if os.path.exists(sub_rgb) and os.path.exists(sub_bg):
+                            norm_name = item.replace("_lmdb", "")
+                            t_info = {
+                                "rgb": sub_rgb,
+                                "bg": sub_bg,
+                                "obj": sub_obj if os.path.exists(sub_obj) else None,
+                            }
+                            town_info[norm_name] = t_info
+                            town_info[item] = t_info
+                except Exception:
+                    pass
+
+        # 2. Cơ chế quét nhanh toàn bộ key trong LMDB (Key-Only Sweep) theo từng Town, lưu dictionary in-memory
+        from collections import defaultdict
+        town_key_index: Dict[str, Dict[str, List[str]]] = {}
+
+        def get_town_prefix_keys(lmdb_path: str, target_prefix: str) -> List[str]:
+            if lmdb_path not in town_key_index:
+                pdict = defaultdict(list)
+                try:
+                    env = self._get_lmdb_env(lmdb_path)
+                    with env.begin(write=False) as txn:
+                        cur = txn.cursor()
+                        if cur.first():
+                            while True:
+                                k_str = cur.key().decode("utf-8")
+                                pfx = "/".join(k_str.split("/")[:-1])
+                                pdict[pfx].append(k_str)
+                                if not cur.next():
+                                    break
+                except Exception:
+                    pass
+                town_key_index[lmdb_path] = pdict
+            return town_key_index[lmdb_path].get(target_prefix, [])
+
         self.videos_path = []
         self.label = {}
         case_counts = {"case1_ge50": 0, "case2_16to49": 0, "case3_lt16": 0}
@@ -254,6 +345,8 @@ class ACTION_SLOT_LMDBDataset(BaseDataset):
 
         for k, v in tqdm(data.items(), desc=f"[{self.split.upper()} DATASET] Loading scenarios", dynamic_ncols=True):
             split_path = k.split("/")
+            town_key = split_path[0]
+            norm_town = town_key.replace("_lmdb", "")
             folder_name = split_path[0] + "_lmdb"
             raw_folder = split_path[0]
 
@@ -270,43 +363,57 @@ class ACTION_SLOT_LMDBDataset(BaseDataset):
             rgb_keys: List[str] = []
             bg_keys: List[str] = []
 
-            # Search across all specified data roots
-            for root in self.data_roots:
-                candidates = [
-                    (
-                        os.path.join(root, folder_name, "rgb_front"),
-                        os.path.join(root, folder_name, "mask_background"),
-                        os.path.join(root, folder_name, "mask_object"),
-                    ),
-                    (
-                        os.path.join(root, raw_folder, "rgb_front"),
-                        os.path.join(root, raw_folder, "mask_background"),
-                        os.path.join(root, raw_folder, "mask_object"),
-                    ),
-                ]
-                if os.path.basename(os.path.normpath(root)) in (folder_name, raw_folder):
-                    candidates.insert(
-                        1,
-                        (
-                            os.path.join(root, "rgb_front"),
-                            os.path.join(root, "mask_background"),
-                            os.path.join(root, "mask_object"),
-                        ),
-                    )
+            # Tra cứu siêu tốc O(1) qua pre-discovered town_info
+            if norm_town in town_info:
+                info = town_info[norm_town]
+                r_keys = get_town_prefix_keys(info["rgb"], clean_rgb_prefix)
+                if r_keys:
+                    b_keys = get_town_prefix_keys(info["bg"], clean_bg_prefix)
+                    if b_keys:
+                        matched_rgb = info["rgb"]
+                        matched_bg = info["bg"]
+                        matched_obj = info["obj"]
+                        rgb_keys = r_keys
+                        bg_keys = b_keys
 
-                for c_rgb, c_bg, c_obj in candidates:
-                    if os.path.exists(c_rgb) and os.path.exists(c_bg):
-                        rgb_env = self._get_lmdb_env(c_rgb)
-                        r_keys = self._get_prefix_keys(rgb_env, clean_rgb_prefix)
-                        if r_keys:
-                            bg_env = self._get_lmdb_env(c_bg)
-                            b_keys = self._get_prefix_keys(bg_env, clean_bg_prefix)
-                            if b_keys:
-                                matched_rgb, matched_bg, matched_obj = c_rgb, c_bg, c_obj
-                                rgb_keys, bg_keys = r_keys, b_keys
-                                break
-                if matched_rgb is not None:
-                    break
+            # Fallback tra cứu truyền thống nếu town chưa có trong pre-discovery
+            if matched_rgb is None:
+                for root in self.data_roots:
+                    candidates = [
+                        (
+                            os.path.join(root, folder_name, "rgb_front"),
+                            os.path.join(root, folder_name, "mask_background"),
+                            os.path.join(root, folder_name, "mask_object"),
+                        ),
+                        (
+                            os.path.join(root, raw_folder, "rgb_front"),
+                            os.path.join(root, raw_folder, "mask_background"),
+                            os.path.join(root, raw_folder, "mask_object"),
+                        ),
+                    ]
+                    if os.path.basename(os.path.normpath(root)) in (folder_name, raw_folder):
+                        candidates.insert(
+                            1,
+                            (
+                                os.path.join(root, "rgb_front"),
+                                os.path.join(root, "mask_background"),
+                                os.path.join(root, "mask_object"),
+                            ),
+                        )
+
+                    for c_rgb, c_bg, c_obj in candidates:
+                        if os.path.exists(c_rgb) and os.path.exists(c_bg):
+                            rgb_env = self._get_lmdb_env(c_rgb)
+                            r_keys = self._get_prefix_keys(rgb_env, clean_rgb_prefix)
+                            if r_keys:
+                                bg_env = self._get_lmdb_env(c_bg)
+                                b_keys = self._get_prefix_keys(bg_env, clean_bg_prefix)
+                                if b_keys:
+                                    matched_rgb, matched_bg, matched_obj = c_rgb, c_bg, c_obj
+                                    rgb_keys, bg_keys = r_keys, b_keys
+                                    break
+                    if matched_rgb is not None:
+                        break
 
             if matched_rgb is None or len(rgb_keys) < self.min_frames or not bg_keys:
                 continue
@@ -356,6 +463,24 @@ class ACTION_SLOT_LMDBDataset(BaseDataset):
         # Close all LMDB handles in parent process before DataLoader forks worker processes
         close_lmdb()
         self.env_cache.clear()
+
+        # Tự động lưu cache index để tái sử dụng ngay lập tức ở lần chạy sau (chỉ mất 0.05 giây)
+        if len(self.videos_path) > 0:
+            for save_dir in ["./work_dirs", os.path.dirname(data_path)]:
+                try:
+                    os.makedirs(save_dir, exist_ok=True)
+                    cache_file = os.path.join(save_dir, f".cache_taco_{self.split}.pkl")
+                    with open(cache_file, "wb") as f:
+                        pickle.dump({
+                            "videos_path": self.videos_path,
+                            "label": self.label,
+                            "case_counts": case_counts,
+                            "non_contiguous_count": non_contiguous_count,
+                        }, f)
+                    print(f"[{self.split.upper()} DATASET] Đã lưu file cache: {cache_file}")
+                    break
+                except Exception:
+                    pass
 
         # In thống kê số lượng video thuộc mỗi trường hợp ra terminal
         total = len(self.videos_path)
