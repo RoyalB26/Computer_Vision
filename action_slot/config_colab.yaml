@@ -5,7 +5,7 @@ project_name: "action_slot"
 device: "cuda"  
 seed: 42
 tqdm: true
-accumulate: 3
+accumulate: 2
 
 custom_imports:
   - "action_slot.model"
@@ -39,9 +39,11 @@ data:
       seed: 42
       pipeline:
         - type: "Action_Slot_Transform"
-    batch_size: 8
+    batch_size: 12
     shuffle: true
     num_workers: 12
+    prefetch_factor: 4
+    persistent_workers: True
 
   val:
     dataset:
@@ -53,9 +55,9 @@ data:
       seed: 42
       pipeline:
         - type: "Action_Slot_Transform"
-    batch_size: 8
+    batch_size: 12
     shuffle: true
-    num_workers: 12
+    num_workers: 6
 
 # 3. Optimizer Configuration (đồng bộ với D:\v7\Action-slot: lr=5e-4, wd=0.07)
 optimizer:
@@ -63,9 +65,6 @@ optimizer:
   lr: 0.0005
   weight_decay: 0.07
 
-# 4. Learning Rate Scheduler Configuration (Đồng bộ chuẩn xác với D:\v7\Action-slot: tăng x1.1 mỗi epoch trong 11 epoch đầu, sau đó giảm theo 0.7^(epoch//3))
-lr_scheduler:
-  type: "TACOLRScheduler"
 
 # 5. Evaluation Metrics Configuration
 metrics:
