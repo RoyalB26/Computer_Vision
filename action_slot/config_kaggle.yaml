@@ -12,13 +12,14 @@ custom_imports:
   - "action_slot.transform"
   - "action_slot.metrics"
   - "action_slot.scheduler"
+  - "action_slot.hooks"
 
 # 1. Model Configuration: Hand Digit Detector with Deformable Slot Attention Head
 model:
   type: "ActionSlotModel"
   num_ego_class: 4
   num_actor_class: 64
-  num_slots: 64
+  num_slots: 32
   slot_dim: 256
   ego_c: 128
   bg_slot: true
@@ -79,6 +80,9 @@ metrics:
 
 # 6. Comprehensive Tracking & Lifecycle Hooks
 hooks:
+  # Train Actor mAP Hook: Tính toán và log (train) mAP of the actor sau mỗi epoch
+  - type: "TrainActorMAPHook"
+
   # Excel Tracker: Ghi nhận toàn bộ thông số chi tiết qua các sheets:
   # - 'Epoch_Overview': Train/Val Loss, mAP, mAP_50, sub-group mAPs (c, b, p, c+, b+, p+), LR, thời gian
   # - 'Gradients_Detail': Chuẩn Gradient Norm tổng và riêng biệt cho từng submodule kiến trúc

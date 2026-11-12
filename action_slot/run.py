@@ -12,6 +12,7 @@ import action_slot.dataset
 import action_slot.model
 import action_slot.transform
 import action_slot.metrics
+import action_slot.hooks
 
 from BaseModel.scripts.train import main
 

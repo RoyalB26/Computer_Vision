@@ -8,7 +8,7 @@ import torch.nn.functional as F
 import torchvision.ops
 from torch import Tensor
 from model_parts.backbones import X3DBackbone
-from model_parts.heads import Allocated_Head
+from model_parts.heads import Allocated_Head, ReduceAllocatedHead
 from model_parts.slot_attention import SlotAttention
 from model_parts.x3d_baseline import X3D_Baseline
 from loss import ActionSlotLoss
@@ -101,12 +101,15 @@ class ActionSlotModel(BaseModel):
         )
 
         # 5. Modular Classification Head
-        self.head = Allocated_Head(
+        self.head = ReduceAllocatedHead(
         in_channel= slot_dim, 
         num_ego_classes= num_ego_class,
         num_actor_classes=num_actor_class,
-        ego_channel= ego_c
+        ego_channel= ego_c,
+        num_slots= self.num_slots
         )
+
+
 
         self.drop = nn.Dropout(p=dropout)
 
@@ -164,6 +167,31 @@ class ActionSlotModel(BaseModel):
 
         return slots, ego_x, attn_masks
 
+
+
+    def _process_output(
+        self,
+        pred: Tensor
+    ) -> Tensor:
+  
+        """
+        pred: shape (B, 32, 3) - raw logits
+        return: shape (B, 64) - logits đã hiệu chỉnh theo background, đúng thứ tự gốc
+        """
+        B = pred.shape[0]
+        
+        # 1. Hiệu chỉnh logits 2 lớp đầu dựa trên lớp background (index 2)
+        fg_logits = pred[:, :, :2] - pred[:, :, 2:3]  # shape: (B, 32, 2)
+        
+        # 2. Tách thành 3 cụm (12, 12, 8) và đảo ngược transpose + reshape
+        p1 = fg_logits[:, 0:12, :].transpose(1, 2).reshape(B, 24)   # khôi phục index 0..23
+        p2 = fg_logits[:, 12:24, :].transpose(1, 2).reshape(B, 24)  # khôi phục index 24..47
+        p3 = fg_logits[:, 24:32, :].transpose(1, 2).reshape(B, 16)  # khôi phục index 48..63
+        
+        # 3. Ghép lại thành (B, 64)
+        logits_64 = torch.cat([p1, p2, p3], dim=1)
+        return logits_64
+
     def _compute_losses(
         self, 
         pred, 
@@ -183,7 +211,8 @@ class ActionSlotModel(BaseModel):
         # Attach predictions and ground truth for metric evaluation (e.g., train actor mAP)
         if isinstance(loss, dict):
             if "actor" in pred:
-                loss["pred_actor"] = pred["actor"].detach()
+                pred = self._process_output(pred['actor'])
+                loss["pred_actor"] = pred.detach()
             if "actor" in label and isinstance(label["actor"], torch.Tensor):
                 loss["target_actor"] = label["actor"].detach()
         
@@ -192,6 +221,7 @@ class ActionSlotModel(BaseModel):
     def _post_process(self, pred: Optional[Dict[str, Any]] = None):
         if pred is None:
             return None
+        pred['actor'] = self._process_output(pred['actor'])
         return pred
 
     def forward_train(
@@ -206,6 +236,7 @@ class ActionSlotModel(BaseModel):
         # print(targets['actor'].shape)
         """Tính toán Detection Loss trong quá trình huấn luyện với FPN và Deformable Sampling Loss."""
         slots, ego_x, attn_masks = self.extract_features(inputs)
+
         pred_ego, pred_actor = self.head(slots, ego_x=ego_x)
 
         pred = {

@@ -29,7 +29,7 @@ class ActionSlotLoss(nn.Module):
         self.bg_mask = True
         self.bg_slot = True
         self.obj_mask = False
-        self.action_attn_weight = 1
+        self.action_attn_weight = 0
         self.bg_attn_weight = 0.5
 
         self.seq_len = 16
@@ -46,6 +46,20 @@ class ActionSlotLoss(nn.Module):
     def _parse_actor_loss(self):
         pos_weight = torch.ones([self.num_actor_class])*self.bce_pos_weight
         self.bce = nn.BCEWithLogitsLoss(reduction='mean', pos_weight=pos_weight)
+
+        weight_matrix = weight_matrix = torch.tensor([
+            [10.0, 35.0, 1.0], [9.0, 32.0, 1.0],  [11.0, 44.0, 1.0], [13.0, 16.0, 1.0],
+            [15.0, 28.0, 1.0], [11.0, 29.0, 1.0], [11.0, 21.0, 1.0], [11.0, 14.0, 1.0],
+            [12.0, 26.0, 1.0], [11.0, 23.0, 1.0], [12.0, 28.0, 1.0], [10.0, 16.0, 1.0],
+            [9.0, 26.0, 1.0],  [9.0, 160.0, 1.0], [11.0, 19.0, 1.0], [15.0, 18.0, 1.0],
+            [19.0, 28.0, 1.0], [17.0, 24.0, 1.0], [12.0, 20.0, 1.0], [15.0, 17.0, 1.0],
+            [17.0, 23.0, 1.0], [20.0, 32.0, 1.0], [16.0, 16.0, 1.0], [20.0, 14.0, 1.0],
+            [10.0, 35.0, 1.0], [11.0, 33.0, 1.0], [9.0, 18.0, 1.0],  [10.0, 23.0, 1.0],
+            [8.0, 23.0, 1.0],  [8.0, 19.0, 1.0],  [11.0, 37.0, 1.0], [10.0, 35.0, 1.0]
+        ], device=self.device)
+
+        self.register_buffer('weight_matrix', weight_matrix)  # Tự động chuyển device theo model
+        self.criterion = nn.CrossEntropyLoss(reduction='none')
         return 0
 
     def _parse_attn_loss(self):
@@ -192,8 +206,11 @@ class ActionSlotLoss(nn.Module):
 
             bg_attn = attn[:, ::self.mask_every_frame, -1, :, :].reshape(b, l//self.mask_every_frame, h, w)
             bg_attn_loss = self.obj_bce(bg_attn, bg_seg)
+            loss = {'bg_attn_loss': 0.5 * bg_attn_loss}
+            return loss
 
         loss = {'attn_loss':attn_loss,'bg_attn_loss': 0.5 * bg_attn_loss}
+
         if validate:
             loss['action_inter'] = None
             loss['action_union'] = None
@@ -213,12 +230,44 @@ class ActionSlotLoss(nn.Module):
 
         return loss
 
+    def actor_loss_reduce(self, pred, label):
+        # logits: (B, 32, 3), targets: (B, 32)
+        raw_loss = self.criterion(pred.reshape(-1, 3), label.reshape(-1)).view(-1, 32)  # shape: (B, 32)
+
+        # Tra cứu trọng số tương ứng cho từng slot (0..31) và từng target (0, 1, 2)
+        slot_indices = torch.arange(32, device=pred.device).unsqueeze(0)  # shape: (1, 32)
+        sample_weights = self.weight_matrix[slot_indices, label]          # shape: (B, 32)
+
+        # Nhân trọng số và chuẩn hóa (nên chia cho tổng trọng số để learning rate không bị biến động mạnh)
+        loss = (raw_loss * sample_weights).sum() / sample_weights.sum()
+        return loss
+
     def forward(self, pred, label, validate=False):
 
+        actor = label['actor']  # shape: (B, 64)
+        B = actor.shape[0]
+
+        # Gom thành (B, 32, 2)
+        part1 = actor[:, 0:24].reshape(B, 2, 12).transpose(1, 2)
+        part2 = actor[:, 24:48].reshape(B, 2, 12).transpose(1, 2)
+        part3 = actor[:, 48:64].reshape(B, 2, 8).transpose(1, 2)
+        fg = torch.cat([part1, part2, part3], dim=1)  # shape: (B, 32, 2)
+
+        # Chuyển thẳng thành index {0, 1, 2} kiểu torch.long:
+        # [1, 0] -> 0 | [0, 1] -> 1 | [0, 0] -> 2
+        targets = torch.where(
+            fg.sum(dim=-1) == 0,
+            2,
+            fg.argmax(dim=-1)
+        ).long()  # shape: (B, 32), dtype: torch.long
+
+
+
         ego_loss = self.ego_loss(pred['ego'],label['ego'])
-        actor_loss = self.actor_loss(pred['actor'],label['actor'])
+        actor_loss = self.actor_loss_reduce(pred['actor'],targets)
         attention_loss = self.attn_loss(pred['attn'],label,validate)
 
         loss = {"loss_ego": 0.5 * ego_loss, "loss_actor": actor_loss} 
         loss |= attention_loss
+
         return loss

@@ -5,7 +5,6 @@ from typing import TYPE_CHECKING, Any, Dict, List, Optional
 import numpy as np
 import torch
 from ..registrar import HOOKS
-from ...utils.device import all_gather_numpy
 from .base_hook import BaseHook
 
 if TYPE_CHECKING:
@@ -45,35 +44,13 @@ class LoggerHook(BaseHook):
         self.start_time = 0.0
         self.running_loss: Dict[str, float] = {}
         self.running_count = 0
-        self._train_pred_actors: List[Any] = []
-        self._train_target_actors: List[Any] = []
 
     def before_epoch(self, trainer: "BaseTrainer") -> None:
         self.start_time = time.time()
         self.running_loss.clear()
         self.running_count = 0
-        self._train_pred_actors.clear()
-        self._train_target_actors.clear()
 
     def after_train_iter(self, trainer: "BaseTrainer", batch_idx: int, outputs: Dict[str, Any]) -> None:
-        # Collect train actor predictions & targets for epoch-level mAP calculation
-        if "pred_actor" in outputs and "target_actor" in outputs:
-            pred_act = outputs["pred_actor"]
-            tgt_act = outputs["target_actor"]
-            if pred_act is not None and tgt_act is not None:
-                if hasattr(pred_act, "detach"):
-                    scores = torch.sigmoid(pred_act.detach().float()).contiguous().cpu().numpy()
-                else:
-                    scores = np.ascontiguousarray(pred_act, dtype=np.float32)
-
-                if hasattr(tgt_act, "detach"):
-                    targets = tgt_act.detach().float().contiguous().cpu().numpy()
-                else:
-                    targets = np.ascontiguousarray(tgt_act, dtype=np.float32)
-
-                self._train_pred_actors.append(scores)
-                self._train_target_actors.append(targets)
-
         # Aggregate batch metrics
         for k, v in outputs.items():
             if k in self.ignore_keys:
@@ -129,45 +106,4 @@ class LoggerHook(BaseHook):
         if trainer.logger:
             trainer.logger.info(msg)
 
-    def after_train_epoch(self, trainer: "BaseTrainer") -> None:
-        """Invoked immediately after train_epoch() finishes (before validation)."""
-        self._log_train_actor_map(trainer)
-
-    def after_epoch(self, trainer: "BaseTrainer") -> None:
-        """Invoked after the entire epoch cycle (train + val if scheduled) finishes."""
-        self._log_train_actor_map(trainer)
-
-    def _log_train_actor_map(self, trainer: "BaseTrainer") -> None:
-        """Compute and display (train) mAP of the actor rounded to 6 decimal places."""
-        if not self._train_pred_actors or not self._train_target_actors:
-            return
-
-        scores_arr = np.concatenate(self._train_pred_actors, axis=0)
-        targets_arr = np.concatenate(self._train_target_actors, axis=0)
-        self._train_pred_actors.clear()
-        self._train_target_actors.clear()
-
-        # Multi-GPU Distributed Synchronization if applicable
-        trainer_dev = getattr(trainer, "device", None)
-        scores_arr = all_gather_numpy(scores_arr, device=trainer_dev)
-        targets_arr = all_gather_numpy(targets_arr, device=trainer_dev)
-
-        try:
-            from sklearn.metrics import average_precision_score
-            with warnings.catch_warnings():
-                warnings.simplefilter("ignore")
-                mAP = average_precision_score(targets_arr, scores_arr.astype(np.float32))
-                train_map = float(mAP)
-        except Exception:
-            train_map = 0.0
-
-        # Store on trainer for downstream hooks (ExcelTracker, WandbHook)
-        trainer.train_actor_map = train_map
-
-        is_main = getattr(trainer, "is_main_process", True)
-        if is_main:
-            msg = f"(train) mAP of the actor: {train_map:.6f}"
-            print(msg)
-            if trainer.logger:
-                trainer.logger.info(msg)
 
