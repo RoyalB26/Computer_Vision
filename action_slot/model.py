@@ -54,9 +54,11 @@ class ActionSlotModel(BaseModel):
         unfreeze_all = kwargs.get('unfreeze_all', False)
         freeze_bn = kwargs.get('freeze_bn', True)
         pretrained_backbone = kwargs.get('pretrained_backbone', True)
+        pretrained_backbone_path = kwargs.get('pretrained_backbone_path', None)
 
         self.backbone = X3DBackbone(
             pretrained=pretrained_backbone,
+            pretrained_path=pretrained_backbone_path,
             finetune_last_n_stages=finetune_last_n_stages,
             freeze_stages=freeze_stages,
             freeze_all=freeze_all,

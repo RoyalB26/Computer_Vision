@@ -19,11 +19,11 @@ class X3D_Baseline(nn.Module):
         self.num_ego_class = num_ego_class
         self.num_actor_class = num_actor_class
 
-        try:
-            from pytorchvideo.models.hub import x3d_m
-            x3d_hub = x3d_m(pretrained=pretrained if 'pretrained' in locals() else True)
-        except Exception:
-            x3d_hub = torch.hub.load('facebookresearch/pytorchvideo:main', 'x3d_m', pretrained=True)
+        from .backbones import load_x3d_m_backbone
+
+        pretrained = kwargs.get("pretrained", True)
+        pretrained_path = kwargs.get("pretrained_path", None)
+        x3d_hub = load_x3d_m_backbone(pretrained=pretrained, pretrained_path=pretrained_path)
         self.blocks = x3d_hub.blocks
         in_feat = 2048
 
