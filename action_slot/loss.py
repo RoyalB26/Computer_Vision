@@ -20,16 +20,17 @@ def inter_and_union(pred, mask, num_class=1, start_class=0):
 
 
 class ActionSlotLoss(nn.Module):
-    def __init__(self, num_actor_class, attention_res=None, bce_pos_weight = 10, device = None):
+    def __init__(self, num_actor_class, attention_res=None, bce_pos_weight = 10, num_slots: int= 32, device = None):
         super(ActionSlotLoss, self).__init__()
         self.num_actor_class = num_actor_class
+        self.num_slots = num_slots
         self.attention_res = attention_res
         self.bce_pos_weight = bce_pos_weight
 
         self.bg_mask = True
         self.bg_slot = True
         self.obj_mask = False
-        self.action_attn_weight = 0
+        self.action_attn_weight = 1
         self.bg_attn_weight = 0.5
 
         self.seq_len = 16
@@ -182,18 +183,26 @@ class ActionSlotLoss(nn.Module):
                 _, _, h, w = attn.shape
                 attn = attn.reshape(b, l, n, h, w)
 
-            action_attn = attn[:, :, :self.num_actor_class, :, :]
+            action_attn = attn[:, :, :self.num_slots, :, :]
             bg_attn = attn[:, ::self.mask_every_frame, -1, :, :].reshape(b, -1, h, w)
 
-            class_idx = label['actor'] == 0.0
-            class_idx = class_idx.view(b, self.num_actor_class, 1, 1, 1).repeat(1, 1, l, h, w)
+            mask_64 = (label['actor'] == 0.0)  # shape: (B, 64), dtype: torch.bool
+            B = mask_64.shape[0]
+
+            
+            p1 = mask_64[:, 0:24].reshape(B, 2, 12).transpose(1, 2)
+            p2 = mask_64[:, 24:48].reshape(B, 2, 12).transpose(1, 2)
+            p3 = mask_64[:, 48:64].reshape(B, 2, 8).transpose(1, 2)
+            fg_mask = torch.cat([p1, p2, p3], dim=1)  # shape: (B, 32, 2)
+
+            class_idx = fg_mask.all(dim=-1)     # shape: (B, 32), dtype: torch.bool
+            class_idx = class_idx.view(b, self.num_slots, 1, 1, 1).repeat(1, 1, l, h, w)
             class_idx = torch.permute(class_idx, (0, 2, 1, 3, 4))
 
-            attn_gt = torch.zeros([b, l, self.num_actor_class, h, w], dtype=torch.float32, device=action_attn.device)
-
+            attn_gt = torch.zeros([b, l, self.num_slots, h, w], dtype=torch.float32, device=action_attn.device)
+            
             attn_loss = self.obj_bce(action_attn[class_idx], attn_gt[class_idx])
             bg_attn_loss = self.obj_bce(bg_attn, bg_seg)
-
         # background mask only
         elif self.attn_loss_type == 4:
             b, l, n, h, w = attn.shape

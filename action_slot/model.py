@@ -113,7 +113,7 @@ class ActionSlotModel(BaseModel):
 
         self.drop = nn.Dropout(p=dropout)
 
-        self.loss_fn = ActionSlotLoss(num_actor_class = num_actor_class, attention_res=(resolution3d[1],resolution3d[2]), bce_pos_weight = 10)
+        self.loss_fn = ActionSlotLoss(num_actor_class = num_actor_class, attention_res=(resolution3d[1],resolution3d[2]), bce_pos_weight = 10, num_slots= self.num_slots)
 
     def extract_features(
         self,
