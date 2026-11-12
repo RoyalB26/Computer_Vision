@@ -69,9 +69,6 @@ optimizer:
   lr: 0.0005
   weight_decay: 0.07
 
-# 4. Learning Rate Scheduler Configuration (Đồng bộ chuẩn xác với D:\v7\Action-slot: tăng x1.1 mỗi epoch trong 11 epoch đầu, sau đó giảm theo 0.7^(epoch//3))
-lr_scheduler:
-  type: "TACOLRScheduler"
 
 # 5. Evaluation Metrics Configuration
 metrics:
