@@ -67,8 +67,9 @@ class ReduceAllocatedHead(nn.Module):
 		self.fc_actor = nn.ModuleList()
 		for i in range(num_slots):
 			self.fc_actor.append(nn.Sequential(
+					nn.Linear(in_channel, 2 * in_channel),
 	                nn.ReLU(inplace=False),
-	                nn.Linear(in_channel, 3),
+	                nn.Linear(2 * in_channel, 3),
 	                )
 				)
 
