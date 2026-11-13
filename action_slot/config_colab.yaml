@@ -40,7 +40,7 @@ data:
       seed: 42
       pipeline:
         - type: "Action_Slot_Transform"
-    batch_size: 8
+    batch_size: 4
     shuffle: true
     num_workers: 12
 
@@ -54,7 +54,7 @@ data:
       seed: 42
       pipeline:
         - type: "Action_Slot_Transform"
-    batch_size: 8
+    batch_size: 4
     shuffle: true
     num_workers: 12
 
@@ -105,4 +105,4 @@ train_cfg:
   log_interval: 2500                        # In log tiến trình mỗi 2500 batches
   grad_clip: null                           # Không clip gradient (đồng bộ với D:\v7\Action-slot)
   use_amp: false                            # Chạy FP32 chính xác cao
-  accumulate: 3                             # Tích lũy gradient (8 * 3 = 24 samples tương đương batch_size=24 của v7)
+  accumulate: 4                             # Tích lũy gradient (8 * 3 = 24 samples tương đương batch_size=24 của v7)
