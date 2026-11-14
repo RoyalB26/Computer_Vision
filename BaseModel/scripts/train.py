@@ -70,6 +70,19 @@ def main():
     if hasattr(model, "init_weights") and getattr(cfg, "init_weights", True):
         model.init_weights()
 
+    # If --show is specified, analyze and save model configuration/profile, then exit
+    if getattr(args, "show", False):
+        from BaseModel.utils import show_model_summary
+
+        show_model_summary(
+            model=model,
+            cfg=cfg,
+            device=device,
+            work_dir=work_dir,
+            logger=logger,
+        )
+        return
+
     # Thống kê tham số mô hình
     total_params = sum(p.numel() for p in model.parameters())
     trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
@@ -226,7 +239,6 @@ def main():
         logger.info(f"Final Evaluation Metrics: {val_metrics}")
     else:
         trainer.train()
-
 
 
 if __name__ == "__main__":

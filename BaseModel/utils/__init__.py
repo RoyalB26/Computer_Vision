@@ -5,6 +5,7 @@ from .device import get_device, to_device
 from .logger import get_logger
 from .math_tools import bbox_iou, one_hot_encoding, xywh2xyxy, xyxy2xywh
 from .metrics import Accuracy, BaseMetric, MeanIoU, MeanAveragePrecision, build_metric
+from .model_summary import show_model_summary
 from .seed import set_random_seed
 from .tracker import ExcelTracker, ExcelTrackerHook, compute_gradient_norms
 
@@ -29,4 +30,5 @@ __all__ = [
     "ExcelTracker",
     "ExcelTrackerHook",
     "compute_gradient_norms",
+    "show_model_summary",
 ]

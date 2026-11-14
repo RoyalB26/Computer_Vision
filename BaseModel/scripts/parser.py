@@ -11,7 +11,7 @@ def parse_args(description: str = "Computer Vision Pipeline") -> argparse.Namesp
         "--config",
         type=str,
         required=True,
-        help="Path to YAML or JSON configuration file.",
+        help="Path to YAML, JSON, or Python configuration file.",
     )
     parser.add_argument(
         "--work-dir",
@@ -41,6 +41,11 @@ def parse_args(description: str = "Computer Vision Pipeline") -> argparse.Namesp
         "--eval-only",
         action="store_true",
         help="Whether to run evaluation only without training.",
+    )
+    parser.add_argument(
+        "--show",
+        action="store_true",
+        help="Inspect model architecture, parameters, size, FLOPs, RAM and VRAM usage, save to model_configuration.txt, and exit.",
     )
     parser.add_argument(
         "--accumulate",

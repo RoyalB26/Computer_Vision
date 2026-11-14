@@ -45,18 +45,41 @@ class Config:
 
     @classmethod
     def fromfile(cls, filename: str) -> "Config":
-        """Load configuration from a YAML or JSON file."""
+        """Load configuration from a YAML, JSON, or Python file."""
         if not os.path.isfile(filename):
-            raise FileNotFoundError(f"Config file not found: {filename}")
+            # Graceful fallback: if user specified a .py config name that does not exist, check .yaml / .yml
+            if filename.endswith(".py"):
+                for alt_ext in [".yaml", ".yml", ".json"]:
+                    alt_path = filename[:-3] + alt_ext
+                    if os.path.isfile(alt_path):
+                        filename = alt_path
+                        break
+            elif not os.path.splitext(filename)[1]:
+                for alt_ext in [".yaml", ".yml", ".json", ".py"]:
+                    alt_path = filename + alt_ext
+                    if os.path.isfile(alt_path):
+                        filename = alt_path
+                        break
+
+            if not os.path.isfile(filename):
+                raise FileNotFoundError(f"Config file not found: {filename}")
 
         ext = os.path.splitext(filename)[1].lower()
-        with open(filename, "r", encoding="utf-8") as f:
-            if ext in [".yaml", ".yml"]:
+        if ext == ".py":
+            # Load Python config file by executing it into a dictionary
+            cfg_dict: Dict[str, Any] = {}
+            with open(filename, "r", encoding="utf-8") as f:
+                code = compile(f.read(), filename, "exec")
+                exec(code, cfg_dict)
+            cfg_dict = {k: v for k, v in cfg_dict.items() if not k.startswith("__")}
+        elif ext in [".yaml", ".yml"]:
+            with open(filename, "r", encoding="utf-8") as f:
                 cfg_dict = yaml.safe_load(f) or {}
-            elif ext == ".json":
+        elif ext == ".json":
+            with open(filename, "r", encoding="utf-8") as f:
                 cfg_dict = json.load(f)
-            else:
-                raise ValueError(f"Unsupported config file extension: {ext}. Expected .yaml or .json")
+        else:
+            raise ValueError(f"Unsupported config file extension: {ext}. Expected .yaml, .yml, .json, or .py")
 
         return cls(cfg_dict=cfg_dict, filename=filename)
 

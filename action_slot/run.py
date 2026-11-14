@@ -17,7 +17,7 @@ import action_slot.hooks
 from BaseModel.scripts.train import main
 
 if __name__ == "__main__":
-    if len(sys.argv) == 1:
+    if "--config" not in sys.argv and "-c" not in sys.argv:
         config_path = os.path.join(os.path.dirname(__file__), "config.yaml")
         sys.argv.extend(["--config", config_path])
 
