@@ -26,8 +26,7 @@ model:
   ego_c: 128
   bg_slot: true
   dropout: 0.5
-  finetune_last_n_stages: 2  # Chỉ fine-tune 2 stage cuối của backbone (đặt unfreeze_all: true nếu muốn mở toàn bộ như v7)
-
+  unfreeze_all: true
 # 2. Dataset Configuration
 # Hỗ trợ cấu hình nhiều data_root dưới dạng danh sách (list) hoặc đường dẫn đơn (str)
 data:
@@ -42,7 +41,7 @@ data:
       seed: 42
       pipeline:
         - type: "Action_Slot_Transform"
-    batch_size: 32
+    batch_size: 16
     shuffle: true
     num_workers: 2          # Kaggle có 4 vCPU; accelerate chạy 2 rank -> 2 worker/rank = 4 worker tổng (tránh tranh chấp CPU)
     prefetch_factor: 2
@@ -59,7 +58,7 @@ data:
       seed: 42
       pipeline:
         - type: "Action_Slot_Transform"
-    batch_size: 32
+    batch_size: 16
     shuffle: true
     num_workers: 2
     prefetch_factor: 2
@@ -68,8 +67,7 @@ data:
 # 3. Optimizer Configuration (đồng bộ với D:\v7\Action-slot: lr=5e-4, wd=0.07)
 optimizer:
   type: "AdamW"
-  lr: 0.0005
-  weight_decay: 0.07
+  lr: 0.001
 
 
 # 5. Evaluation Metrics Configuration
@@ -112,4 +110,3 @@ train_cfg:
   log_interval: 2500                        # In log tiến trình mỗi 2500 batches
   grad_clip: null                           # Không clip gradient (đồng bộ với D:\v7\Action-slot)
   use_amp: false                            # Chạy FP32 chính xác cao
-  accumulate: 3                             # Tích lũy gradient (8 * 3 = 24 samples tương đương batch_size=24 của v7)
