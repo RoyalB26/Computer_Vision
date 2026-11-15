@@ -5,7 +5,7 @@ project_name: "action_slot"
 device: "cuda"  
 seed: 42
 tqdm: true
-accumulate: 2
+accumulate: 1
 
 custom_imports:
   - "action_slot.model"
