@@ -1,0 +1,98 @@
+# ==============================================================================
+# Configuration for Toy Action Slot Model (BaseModel Framework)
+# ==============================================================================
+
+work_dir: "./work_dirs/toy_action_slot_exp"
+project_name: "toy_action_slot"
+device: "cuda"
+seed: 42
+tqdm: true
+accumulate: 4
+# 1. Custom modules to register into BaseModel registries
+custom_imports:
+  - "toy_action.dataset"
+  - "toy_action.model"
+  - "toy_action.hooks"
+  - "toy_action.metrics"
+
+# 2. Model Architecture: ActionSlotModel (X3D-M + Slot Attention + ReduceAllocatedHead)
+model:
+  type: "ActionSlotModel"
+  num_actor_class: 48
+  num_slots: 24
+  num_ego_class: 0
+  slot_dim: 256
+  bg_slot: true
+  dropout: 0.5
+  resolution3d: [16, 7, 7]
+  pretrained_backbone: true
+  # ============================================================================
+  # Backbone Freezing Strategy:
+  # X3D-M có 5 blocks [0: Stem, 1: Stage1, 2: Stage2, 3: Stage3, 4: Stage4].
+  # finetune_last_n_stages: 2 -> Đóng băng 3 block đầu (Stem, Stage1, Stage2)
+  # và chỉ mở (unfreeze / train) 2 stage cuối (Stage3, Stage4).
+  # ============================================================================
+  freeze_bn: true
+  finetune_last_n_stages: 2
+
+# 3. Data Loaders & LMDB Datasets
+data:
+  train:
+    dataset:
+      type: "ToyActionLMDBDataset"
+      lmdb_path: "toy_action/data/train_lmdb"
+      channel_first: true
+    batch_size: 4
+    shuffle: true
+    num_workers: 2
+    drop_last: true
+
+  val:
+    dataset:
+      type: "ToyActionLMDBDataset"
+      lmdb_path: "toy_action/data/val_lmdb"
+      channel_first: true
+    batch_size: 4
+    shuffle: false
+    num_workers: 0
+    drop_last: false
+
+# 4. Optimization
+optimizer:
+  type: "AdamW"
+  lr: 0.0005
+
+# # lr_scheduler:
+#   type: "CosineAnnealingLR"
+#   T_max: 10
+#   eta_min: 0.00001
+
+# 5. Evaluation Metrics
+metrics:
+  action_metric:
+    type: "ToyActionMetric"
+    threshold: 0.5
+  multi_label:
+    type: "MultiLabelMetric"
+    threshold: 0.5
+
+# 6. Custom Hooks (Train Action mAP tracker across epoch)
+hooks:
+  - type: "TrainToyActionMAPHook"
+  - type: "ExcelTracker"
+    filename: "training_metrics.xlsx"       # Lưu trực tiếp vào thư mục work_dir
+    track_gradients: true                   # Bật tracking gradient chi tiết
+    grad_interval: 1                        # Chu kỳ lấy mẫu gradient (mỗi 1 batch)
+    track_detection: true                   # Bật tracking tab Detection phân tích động lực học mô hình
+    detection_interval: 5                   # Chu kỳ lấy mẫu phân tích detection (mỗi 5 batch)
+    auto_save: true                         # Tự động ghi ra file Excel sau mỗi epoch
+    resume: true                            # Tự động tiếp tục ghi tiếp vào sheet nếu file đã tồn tại
+    submodules: null
+# 7. Training Pipeline Configuration
+train_cfg:
+  max_epochs: 100
+  val_interval: 10
+  log_interval: 1000
+  grad_clip: 1.0
+  use_amp: false
+  

@@ -12,6 +12,27 @@ from .modules import Conv, C3k2, SPPF, C2PSA
 
 def _extract_state_dict(weights_path: Union[str, Path]) -> Dict[str, torch.Tensor]:
     """Helper to extract clean state_dict from a .pt checkpoint or raw state_dict file."""
+    # Ensure ultralytics unpickler compatibility if ultralytics package is installed but missing submodules
+    import sys
+    import types
+    try:
+        import ultralytics.nn.modules as mod
+        from . import modules as yolo_mods
+
+        for attr in dir(yolo_mods):
+            if not attr.startswith("_"):
+                setattr(mod, attr, getattr(yolo_mods, attr))
+
+        for submod in ["conv", "block", "head"]:
+            name = f"ultralytics.nn.modules.{submod}"
+            if name not in sys.modules:
+                m = types.ModuleType(name)
+                for attr in dir(mod):
+                    setattr(m, attr, getattr(mod, attr))
+                sys.modules[name] = m
+    except Exception:
+        pass
+
     ckpt = torch.load(str(weights_path), map_location="cpu", weights_only=False)
     if isinstance(ckpt, dict):
         if "model" in ckpt:

@@ -11,12 +11,43 @@ from model_parts.backbones import X3DBackbone
 from model_parts.heads import Allocated_Head, ReduceAllocatedHead
 from model_parts.slot_attention import SlotAttention
 from model_parts.x3d_baseline import X3D_Baseline
+from model_parts.Mamba.model import Mamba, MambaConfig
 from loss import ActionSlotLoss
 from typing import Dict, List, Optional, Union
 
 from BaseModel.core import MODELS
 from BaseModel.model import BaseModel
 
+
+def build_2d_sincos_position_embedding(H: int, W: int, embed_dim: int, device=None, dtype=torch.float32) -> Tensor:
+    """
+    Tạo 2D Sin-Cos Positional Encoding hoàn toàn bằng PyTorch trên device thích hợp.
+    Output shape: [1, embed_dim, H, W]
+    """
+    assert embed_dim % 4 == 0, f"embed_dim ({embed_dim}) phải chia hết cho 4."
+    dim_per_axis = embed_dim // 2
+    # Tọa độ lưới
+    grid_y, grid_x = torch.meshgrid(
+        torch.arange(H, device=device, dtype=dtype),
+        torch.arange(W, device=device, dtype=dtype),
+        indexing='ij'
+    )
+    grid_x = grid_x.reshape(-1)  # [H * W]
+    grid_y = grid_y.reshape(-1)  # [H * W]
+
+    def get_1d_sincos(grid: Tensor, dim: int) -> Tensor:
+        omega = torch.arange(dim // 2, device=device, dtype=dtype)
+        omega /= (dim / 2.0)
+        omega = 1.0 / (10000.0 ** omega)  # [dim // 2]
+        out = torch.einsum('n, d -> nd', grid, omega)  # [H * W, dim // 2]
+        return torch.cat([torch.sin(out), torch.cos(out)], dim=-1)  # [H * W, dim]
+
+    emb_x = get_1d_sincos(grid_x, dim_per_axis)  # [H * W, dim_per_axis]
+    emb_y = get_1d_sincos(grid_y, dim_per_axis)  # [H * W, dim_per_axis]
+    pos_emb = torch.cat([emb_x, emb_y], dim=-1)  # [H * W, embed_dim]
+    # Đổi về format chuẩn ảnh: [1, embed_dim, H, W]
+    pos_emb = pos_emb.view(H, W, embed_dim).permute(2, 0, 1).unsqueeze(0)
+    return pos_emb
 
 @MODELS.register_module(name="ActionSlotModel")
 class ActionSlotModel(BaseModel):
@@ -115,6 +146,12 @@ class ActionSlotModel(BaseModel):
 
         self.loss_fn = ActionSlotLoss(num_actor_class = num_actor_class, attention_res=(resolution3d[1],resolution3d[2]), bce_pos_weight = 10, num_slots= self.num_slots)
 
+        mambaCfg = MambaConfig(d_model= self.slot_dim, n_layer= 1, d_state= 8, num_slot= 192)
+        self.mamba = Mamba(mambaCfg)
+        self.mamba_grad_scale = float(kwargs.get("mamba_grad_scale", 10.0))
+        self.backbone_grad_scale = float(kwargs.get("backbone_grad_scale", 1.0))
+
+
     def extract_features(
         self,
         videos: Union[List[torch.Tensor], torch.Tensor],
@@ -130,7 +167,7 @@ class ActionSlotModel(BaseModel):
 
         # 1. Backbone feature extraction: (B, C, T_feat, H_feat, W_feat)
         feats = self.backbone(videos)
-        feats = self.drop(feats)
+
 
         # 2. Ego feature branch
         ego_x = None
@@ -144,8 +181,23 @@ class ActionSlotModel(BaseModel):
 
         # 3. Project to slot dimension: (B, T_feat, H_feat, W_feat, slot_dim)
         x = self.conv3d(feats)
-        x = x.permute((0, 2, 3, 4, 1))
+        x = x + build_2d_sincos_position_embedding(new_h, new_w, self.slot_dim, device= x.device, dtype= x.dtype).unsqueeze(2)
+        x = x.permute(0, 2, 3, 4, 1)
         x = torch.reshape(x, (batch_size, new_seq_len, new_h, new_w, -1))
+        B,T,H,W,dim = x.shape
+        x = x.view(B, T, H*W, dim)
+
+        if self.training and x.requires_grad and self.mamba_grad_scale != 1.0:
+            scale = self.mamba_grad_scale
+            x.register_hook(lambda grad: grad / scale)
+
+        x = self.mamba(x)
+        if self.training and x.requires_grad and self.mamba_grad_scale != 1.0:
+            scale = self.mamba_grad_scale
+            x.register_hook(lambda grad: grad * scale)
+
+        x = x.view(B, T, H, W, dim)
+        
 
         # 4. Slot Attention
         slots, attn_masks = self.slot_attention(x)

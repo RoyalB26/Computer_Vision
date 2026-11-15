@@ -1,0 +1,5 @@
+Label: O:gobottom, o:gobottom
+Mask explanation: 255 = Background, 0 = Foreground Object
+Objects:
+  - {'symbol': 'o', 'action': 'gobottom', 'size': 25, 'start_frame': 0, 'speed': 9.540964072923668, 'start_pos': (175, 19)}
+  - {'symbol': 'O', 'action': 'gobottom', 'size': 16, 'start_frame': 0, 'speed': 7.362407142451399, 'start_pos': (144, 50)}
