@@ -42,7 +42,7 @@ data:
       seed: 42
       pipeline:
         - type: "Action_Slot_Transform"
-    batch_size: 8
+    batch_size: 32
     shuffle: true
     num_workers: 2          # Kaggle có 4 vCPU; accelerate chạy 2 rank -> 2 worker/rank = 4 worker tổng (tránh tranh chấp CPU)
     prefetch_factor: 2
@@ -59,9 +59,9 @@ data:
       seed: 42
       pipeline:
         - type: "Action_Slot_Transform"
-    batch_size: 1
+    batch_size: 32
     shuffle: true
-    num_workers: 0
+    num_workers: 2
     prefetch_factor: 2
     persistent_workers: True
 
