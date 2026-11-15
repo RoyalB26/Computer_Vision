@@ -15,14 +15,24 @@ custom_imports:
   - "toy_action.hooks"
   - "toy_action.metrics"
 
-# 2. Model Architecture: ActionSlotModel (X3D-M + Slot Attention + ReduceAllocatedHead)
+# 2. Model Architecture: ActionSlotModel (Object Slots + Mamba + ObjectActionHead + CountHead)
 model:
   type: "ActionSlotModel"
   num_actor_class: 48
-  num_slots: 24
+  num_slots: 6
   num_ego_class: 0
   slot_dim: 256
   bg_slot: true
+  mamba_layers: 2
+  actor_loss_type: "bce"
+  temporal_pool: "last_mean"
+  bce_pos_weight: 5.0
+  use_obj_count_loss: false
+  obj_count_weight: 0.0
+  obj_cls_weight: 0.0
+  obj_cls_pos_weight: 3.0
+  action_attn_weight: 1.0
+  bg_attn_weight: 0.5
   dropout: 0.5
   resolution3d: [16, 7, 7]
   pretrained_backbone: true
@@ -32,8 +42,7 @@ model:
   # finetune_last_n_stages: 2 -> Đóng băng 3 block đầu (Stem, Stage1, Stage2)
   # và chỉ mở (unfreeze / train) 2 stage cuối (Stage3, Stage4).
   # ============================================================================
-  freeze_bn: true
-  finetune_last_n_stages: 2
+  backbone_type: "yolo"
 
 # 3. Data Loaders & LMDB Datasets
 data:
@@ -91,8 +100,7 @@ hooks:
 # 7. Training Pipeline Configuration
 train_cfg:
   max_epochs: 100
-  val_interval: 10
+  val_interval: 5
   log_interval: 1000
-  grad_clip: 1.0
   use_amp: false
   

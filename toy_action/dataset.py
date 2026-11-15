@@ -192,7 +192,27 @@ class ToyActionLMDBDataset(BaseDataset):
                 # (16, 1, 224, 224) (T, C, H, W)
                 data_info["bg_mask"] = mask_t.unsqueeze(1).contiguous()
 
+        # Check and decode per-frame object counts (16, 6) if stored in LMDB
+        counts_key = f"obj_counts-{idx:09d}"
+        counts_bytes = read_lmdb_bytes(txn, counts_key)
+        if counts_bytes is not None:
+            counts_np = np.asarray(pickle.loads(counts_bytes), dtype=np.float32)
+            data_info["obj_counts"] = torch.from_numpy(counts_np)
+
         return data_info
+
+    @staticmethod
+    def collate_fn(batch: List[Dict[str, Any]]) -> Dict[str, Any]:
+        """Collate sample dicts while bundling auxiliary supervision targets under `target`."""
+        collated = BaseDataset.collate_fn(batch)
+        if "target" in collated and isinstance(collated["target"], torch.Tensor):
+            target_dict: Dict[str, Any] = {"actor": collated["target"]}
+            if "bg_mask" in collated:
+                target_dict["bg_mask"] = collated["bg_mask"]
+            if "obj_counts" in collated:
+                target_dict["obj_counts"] = collated["obj_counts"]
+            collated["target"] = target_dict
+        return collated
 
 if __name__ == "__main__":
     toy_dataset= ToyActionLMDBDataset("toy_action/data/train_lmdb")

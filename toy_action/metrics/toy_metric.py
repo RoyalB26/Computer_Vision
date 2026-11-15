@@ -117,7 +117,7 @@ class ToyActionMetric(BaseMetric):
 
         target_tensor = None
         if isinstance(targets, dict):
-            for k in ("target", "targets", "target_actor"):
+            for k in ("actor", "target", "targets", "target_actor"):
                 if k in targets and targets[k] is not None:
                     target_tensor = targets[k]
                     break

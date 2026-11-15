@@ -7,16 +7,27 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torchvision.ops
 from torch import Tensor
-from model_parts.backbones import X3DBackbone
-from model_parts.heads import Allocated_Head, ReduceAllocatedHead
+from model_parts.backbones import X3DBackbone, YoloV11Backbone
+from model_parts.heads import Allocated_Head, ReduceAllocatedHead, VideoObjectClassHead, ObjectActionHead
 from model_parts.slot_attention import SlotAttention
-from model_parts.x3d_baseline import X3D_Baseline
 from model_parts.Mamba.model import Mamba, MambaConfig
 from loss import ActionSlotLoss
 from typing import Dict, List, Optional, Union
 
 from BaseModel.core import MODELS
 from BaseModel.model import BaseModel
+
+class _ScaleGrad(torch.autograd.Function):
+    """Identity in forward pass; scales backward gradients by `scale`."""
+
+    @staticmethod
+    def forward(ctx, x: Tensor, scale: float) -> Tensor:
+        ctx.scale = float(scale)
+        return x.view_as(x)
+
+    @staticmethod
+    def backward(ctx, grad_output: Tensor):
+        return grad_output * ctx.scale, None
 
 
 def build_2d_sincos_position_embedding(H: int, W: int, embed_dim: int, device=None, dtype=torch.float32) -> Tensor:
@@ -87,7 +98,7 @@ class ActionSlotModel(BaseModel):
         pretrained_backbone = kwargs.get('pretrained_backbone', True)
         pretrained_backbone_path = kwargs.get('pretrained_backbone_path', None)
 
-        self.backbone = X3DBackbone(
+        self.backbone = YoloV11Backbone(
             pretrained=pretrained_backbone,
             pretrained_path=pretrained_backbone_path,
             finetune_last_n_stages=finetune_last_n_stages,
@@ -131,23 +142,36 @@ class ActionSlotModel(BaseModel):
             slot_dropout=kwargs.get('slot_dropout', 0.0),
         )
 
+        # self.obj_cls_head = VideoObjectClassHead(
+        #     in_channel=slot_dim,
+        #     num_slots=actual_slots,
+        #     num_obj_classes=num_actor_class,
+        #     hidden_dim=int(kwargs.get("obj_cls_hidden_dim", 256)),
+        #     dropout=float(kwargs.get("obj_cls_dropout", 0.2)),
+        # )
+
         # 5. Modular Classification Head
-        self.head = ReduceAllocatedHead(
+        self.head = ObjectActionHead(
         in_channel= slot_dim, 
         num_ego_classes= num_ego_class,
         num_actor_classes=num_actor_class,
         ego_channel= ego_c,
-        num_slots= self.num_slots
+        num_slots= self.num_slots,
+        actions_per_slot= [24,24,16]
         )
-
-
-
         self.drop = nn.Dropout(p=dropout)
 
         self.loss_fn = ActionSlotLoss(num_actor_class = num_actor_class, attention_res=(resolution3d[1],resolution3d[2]), bce_pos_weight = 10, num_slots= self.num_slots)
 
-        mambaCfg = MambaConfig(d_model= self.slot_dim, n_layer= 1, d_state= 8, num_slot= 192)
+        # Mamba operates strictly over the S object slots (excluding bg_slot)
+        mambaCfg = MambaConfig(
+            d_model=self.slot_dim,
+            n_layer=int(kwargs.get("mamba_layers", 1)),
+            d_state=int(kwargs.get("mamba_d_state", 16)),
+            num_slot=self.num_slots,
+        )
         self.mamba = Mamba(mambaCfg)
+        self.temporal_pool = str(kwargs.get("temporal_pool", "last_mean")).lower()
         self.mamba_grad_scale = float(kwargs.get("mamba_grad_scale", 10.0))
         self.backbone_grad_scale = float(kwargs.get("backbone_grad_scale", 1.0))
 
@@ -181,42 +205,42 @@ class ActionSlotModel(BaseModel):
 
         # 3. Project to slot dimension: (B, T_feat, H_feat, W_feat, slot_dim)
         x = self.conv3d(feats)
-        
-        x = x + build_2d_sincos_position_embedding(new_h, new_w, self.slot_dim, device= x.device, dtype= x.dtype).unsqueeze(2)
-        x = x.permute(0, 2, 3, 4, 1)
-        x = torch.reshape(x, (batch_size, new_seq_len, new_h, new_w, -1))
-        B,T,H,W,dim = x.shape
-        x = x.view(B, T, H*W, dim)
+        x = x + build_2d_sincos_position_embedding(
+            new_h, new_w, self.slot_dim, device=x.device, dtype=x.dtype
+        ).unsqueeze(2)
+        x = x.permute(0, 2, 3, 4, 1).contiguous()  # (B, T, H, W, slot_dim)
 
-        if self.training and x.requires_grad and self.mamba_grad_scale != 1.0:
-            scale = self.mamba_grad_scale
-            x.register_hook(lambda grad: grad / scale)
+        # 4. Per-frame Slot Attention -> (B, T, actual_slots, slot_dim)
+        slots_seq_all, attn_masks = self.slot_attention(x, return_temporal_slots=True)
+        obj_slots = slots_seq_all[:, :, :self.num_slots, :]  # (B, T, S, slot_dim)
 
-        x = x + self.mamba(x)
-        if self.training and x.requires_grad and self.mamba_grad_scale != 1.0:
-            scale = self.mamba_grad_scale
-            x.register_hook(lambda grad: grad * scale)
+        # 5. Mamba temporal modeling over object slots: (B, T, S, slot_dim)
+        if self.training and obj_slots.requires_grad and self.mamba_grad_scale != 1.0:
+            mamba_in = _ScaleGrad.apply(obj_slots, 1.0 / self.mamba_grad_scale)
+            mamba_out = _ScaleGrad.apply(self.mamba(mamba_in), self.mamba_grad_scale)
+        else:
+            mamba_out = self.mamba(obj_slots)
 
-        x = x.view(B, T, H, W, dim)
-        
+        slots_seq = obj_slots + mamba_out  # (B, T, S, slot_dim)
 
-        # 4. Slot Attention
-        slots, attn_masks = self.slot_attention(x)
+        # Temporal aggregation -> (B, S, slot_dim)
+        if self.temporal_pool == "last":
+            slots = slots_seq[:, -1, :, :]
+        elif self.temporal_pool == "mean":
+            slots = slots_seq.mean(dim=1)
+        else:
+            slots = 0.5 * (slots_seq[:, -1, :, :] + slots_seq.mean(dim=1))
 
-        # 5. Attention map upsampling back to input frame count
-        b, n, _ = attn_masks.shape
-        attn_masks = attn_masks.view(b * n, 1, new_seq_len, new_h, new_w)
+        # 6. Reshape attention masks: (B, T, actual_slots, H, W)
+        b, actual_slots, _ = attn_masks.shape
+        attn_masks = attn_masks.view(b, actual_slots, new_seq_len, new_h, new_w) # (B, actual_slots, T, H, W)
+        attn_masks = attn_masks.permute(0, 2, 1, 3, 4)  # (B, T, actual_slots, H, W)
+
         if seq_len > new_seq_len:
-            attn_masks = F.interpolate(attn_masks, size=(seq_len, new_h, new_w), mode='trilinear')
-        attn_masks = torch.reshape(attn_masks, (b, n, seq_len, new_h, new_w))
-        attn_masks = attn_masks.permute((0, 2, 1, 3, 4))  # (B, T, num_slots, H, W)
+            attn_flat = attn_masks.permute(0, 2, 1, 3, 4).reshape(b * actual_slots, 1, new_seq_len, new_h, new_w)
+            attn_up = F.interpolate(attn_flat, size=(seq_len, new_h, new_w), mode="trilinear", align_corners=False)
+            attn_masks = attn_up.view(b, actual_slots, seq_len, new_h, new_w).permute(0, 2, 1, 3, 4)
 
-        # 6. Apply Dropout & Head
-        slots = self.drop(slots)
-        if ego_x is not None:
-            ego_x = self.drop(ego_x)
-
-        slots = slots[:, :self.num_actor_class]
 
         return slots, ego_x, attn_masks
 
@@ -264,8 +288,7 @@ class ActionSlotModel(BaseModel):
         # Attach predictions and ground truth for metric evaluation (e.g., train actor mAP)
         if isinstance(loss, dict):
             if "actor" in pred:
-                pred = self._process_output(pred['actor'])
-                loss["pred_actor"] = pred.detach()
+                loss["pred_actor"] = pred['actor'].detach()
             if "actor" in label and isinstance(label["actor"], torch.Tensor):
                 loss["target_actor"] = label["actor"].detach()
         
@@ -274,7 +297,6 @@ class ActionSlotModel(BaseModel):
     def _post_process(self, pred: Optional[Dict[str, Any]] = None):
         if pred is None:
             return None
-        pred['actor'] = self._process_output(pred['actor'])
         return pred
 
     def forward_train(
@@ -296,6 +318,7 @@ class ActionSlotModel(BaseModel):
             "actor": pred_actor,
             "ego": pred_ego,
             "attn": attn_masks,
+            # "cls_pred": cls_pred
         }
 
         return self._compute_losses(pred, targets)

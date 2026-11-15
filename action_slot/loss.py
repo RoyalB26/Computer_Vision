@@ -30,8 +30,8 @@ class ActionSlotLoss(nn.Module):
         self.bg_mask = True
         self.bg_slot = True
         self.obj_mask = False
-        self.action_attn_weight = 1
-        self.bg_attn_weight = 0.5
+        self.action_attn_weight = 0
+        self.bg_attn_weight = 0
 
         self.seq_len = 16
         self.mask_every_frame = 4
@@ -255,30 +255,30 @@ class ActionSlotLoss(nn.Module):
 
     def forward(self, pred, label, validate=False):
 
-        actor = label['actor']  # shape: (B, 64)
-        B = actor.shape[0]
+        # actor = label['actor']  # shape: (B, 64)
+        # B = actor.shape[0]
 
-        # Gom thành (B, 32, 2)
-        part1 = actor[:, 0:24].reshape(B, 2, 12).transpose(1, 2)
-        part2 = actor[:, 24:48].reshape(B, 2, 12).transpose(1, 2)
-        part3 = actor[:, 48:64].reshape(B, 2, 8).transpose(1, 2)
-        fg = torch.cat([part1, part2, part3], dim=1)  # shape: (B, 32, 2)
+        # # Gom thành (B, 32, 2)
+        # part1 = actor[:, 0:24].reshape(B, 2, 12).transpose(1, 2)
+        # part2 = actor[:, 24:48].reshape(B, 2, 12).transpose(1, 2)
+        # part3 = actor[:, 48:64].reshape(B, 2, 8).transpose(1, 2)
+        # fg = torch.cat([part1, part2, part3], dim=1)  # shape: (B, 32, 2)
 
-        # Chuyển thẳng thành index {0, 1, 2} kiểu torch.long:
-        # [1, 0] -> 0 | [0, 1] -> 1 | [0, 0] -> 2
-        targets = torch.where(
-            fg.sum(dim=-1) == 0,
-            2,
-            fg.argmax(dim=-1)
-        ).long()  # shape: (B, 32), dtype: torch.long
+        # # Chuyển thẳng thành index {0, 1, 2} kiểu torch.long:
+        # # [1, 0] -> 0 | [0, 1] -> 1 | [0, 0] -> 2
+        # targets = torch.where(
+        #     fg.sum(dim=-1) == 0,
+        #     2,
+        #     fg.argmax(dim=-1)
+        # ).long()  # shape: (B, 32), dtype: torch.long
 
 
 
         ego_loss = self.ego_loss(pred['ego'],label['ego'])
-        actor_loss = self.actor_loss_reduce(pred['actor'],targets)
-        attention_loss = self.attn_loss(pred['attn'],label,validate)
+        actor_loss = self.actor_loss(pred['actor'],label['actor'])
+        # attention_loss = self.attn_loss(pred['attn'],label,validate)
 
         loss = {"loss_ego": 0.5 * ego_loss, "loss_actor": actor_loss} 
-        loss |= attention_loss
+        # loss |= attention_loss
 
         return loss

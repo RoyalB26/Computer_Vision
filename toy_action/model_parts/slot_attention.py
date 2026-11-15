@@ -86,7 +86,7 @@ class SlotAttention(nn.Module):
         self.pool = nn.AdaptiveAvgPool1d(1)
         self.pe = SoftPositionEmbed3D(dim, list(resolution))
 
-    def get_3d_slot(self, slots, inputs):
+    def get_3d_slot(self, slots, inputs, return_temporal_slots: bool = False):
         b, l, h, w, d = inputs.shape
         inputs = self.pe(inputs)
         inputs = torch.reshape(inputs, (b, -1, d))
@@ -99,6 +99,17 @@ class SlotAttention(nn.Module):
         q = self.to_q(slots)
         dots = torch.einsum("bid,bjd->bij", q, k) * self.scale
         attn_ori = dots.softmax(dim=1) + self.eps
+
+        if return_temporal_slots:
+            s = attn_ori.shape[1]
+            hw = h * w
+            attn_t = attn_ori.view(b, s, l, hw)
+            attn_t = attn_t / attn_t.sum(dim=-1, keepdim=True)
+            v_t = v.view(b, l, hw, d)
+            slots = torch.einsum("bljd,bilj->blid", v_t, attn_t)
+            slots = slots + self.fc2(F.relu(self.fc1(self.norm_pre_ff(slots))))
+            return slots, attn_ori
+
         attn = attn_ori / attn_ori.sum(dim=-1, keepdim=True)
         slots = torch.einsum("bjd,bij->bid", v, attn)
 
@@ -106,10 +117,12 @@ class SlotAttention(nn.Module):
         slots = slots + self.fc2(F.relu(self.fc1(self.norm_pre_ff(slots))))
         return slots, attn_ori
 
-    def forward(self, inputs, num_slots=None):
+    def forward(self, inputs, num_slots=None, return_temporal_slots: bool = False):
         b, nf, h, w, d = inputs.shape
         mu = self.slots_mu.expand(1, self.num_slots, -1)
         sigma = self.slots_sigma.expand(1, self.num_slots, -1)
         slots = (mu + sigma * self.slots_eps).expand(b, -1, -1)
-        slots_out, attns = self.get_3d_slot(slots, inputs)
+        slots_out, attns = self.get_3d_slot(
+            slots, inputs, return_temporal_slots=return_temporal_slots
+        )
         return slots_out, attns

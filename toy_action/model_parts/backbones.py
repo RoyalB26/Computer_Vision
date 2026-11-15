@@ -431,6 +431,7 @@ class YoloV11Backbone(BaseBackbone):
         if mode and self.freeze_bn and self.freeze_stages > 0:
             for stage in self.stages[:self.freeze_stages]:
                 stage.eval()
+        return self
 
     @property
     def out_channels(self) -> int:

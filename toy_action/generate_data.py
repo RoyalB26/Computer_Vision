@@ -45,6 +45,7 @@ MIN_OBJ_SIZE = 8
 MAX_OBJ_SIZE = 32
 
 SYMBOLS = ["x", "y", "o", "T", "8", "O"]
+SYMBOL_TO_IDX = {s: i for i, s in enumerate(SYMBOLS)}
 ACTIONS = ["gotop", "gobottom", "goleft", "goright"]
 
 # 12 symbol variants (single and group '+')
@@ -281,7 +282,7 @@ def paste_sprite_rgba(
     sprite: Image.Image,
     x: int,
     y: int,
-) -> None:
+) -> bool:
     """Alpha-blend an RGBA sprite onto canvas and update bg_mask in-place.
 
     Args:
@@ -290,6 +291,9 @@ def paste_sprite_rgba(
                  255 represents background, 0 represents foreground object.
         sprite: RGBA PIL sprite image of shape (sw, sh).
         x, y: Canvas coordinates where sprite top-left corner is positioned.
+
+    Returns:
+        True if at least part of the sprite was rendered inside the canvas, False otherwise.
     """
     h, w, _ = canvas.shape
     sw, sh = sprite.size
@@ -302,7 +306,7 @@ def paste_sprite_rgba(
     y2 = min(h, y + sh)
 
     if x1 >= x2 or y1 >= y2:
-        return
+        return False
 
     # Sprite slice
     sx1 = max(0, -x)
@@ -324,16 +328,18 @@ def paste_sprite_rgba(
     mask_slice = bg_mask[y1:y2, x1:x2]
     mask_slice[fg_mask_region] = 0
     bg_mask[y1:y2, x1:x2] = mask_slice
+    return True
 
 
-def generate_single_sample() -> Tuple[List[np.ndarray], List[np.ndarray], str, List[Dict]]:
-    """Generate a 16-frame clip, 16 background masks, and ground-truth label.
+def generate_single_sample() -> Tuple[List[np.ndarray], List[np.ndarray], str, List[Dict], np.ndarray]:
+    """Generate a 16-frame clip, 16 background masks, ground-truth label, and per-frame object counts.
 
     Returns:
         frames: List of 16 RGB numpy arrays of shape (224, 224, 3)
         bg_masks: List of 16 uint8 numpy arrays of shape (224, 224) (255: background, 0: object)
         label_str: Ground-truth label string (e.g. 'x+:gotop, y:gobottom')
         objects_meta: List of object metadata dicts
+        obj_counts: Float32 numpy array of shape (16, 6) giving visible object counts per symbol per frame
     """
     # 1. Background
     bg = generate_multi_region_background(CANVAS_SIZE, CANVAS_SIZE)
@@ -420,9 +426,10 @@ def generate_single_sample() -> Tuple[List[np.ndarray], List[np.ndarray], str, L
     labels.sort()
     label_str = ", ".join(labels)
 
-    # 4. Render 16 frames and corresponding 16 bg_masks
+    # 4. Render 16 frames, corresponding 16 bg_masks, and per-frame object counts (16, 6)
     frames: List[np.ndarray] = []
     bg_masks: List[np.ndarray] = []
+    obj_counts = np.zeros((NUM_FRAMES, len(SYMBOLS)), dtype=np.float32)
 
     for t in range(NUM_FRAMES):
         frame = bg.copy()
@@ -432,12 +439,14 @@ def generate_single_sample() -> Tuple[List[np.ndarray], List[np.ndarray], str, L
         for obj in objects:
             if obj.is_active(t):
                 x, y = obj.get_position(t)
-                paste_sprite_rgba(frame, bg_mask, obj.sprite, int(round(x)), int(round(y)))
+                rendered = paste_sprite_rgba(frame, bg_mask, obj.sprite, int(round(x)), int(round(y)))
+                if rendered:
+                    obj_counts[t, SYMBOL_TO_IDX[obj.symbol]] += 1.0
 
         frames.append(frame)
         bg_masks.append(bg_mask)
 
-    return frames, bg_masks, label_str, objects_meta
+    return frames, bg_masks, label_str, objects_meta, obj_counts
 
 
 def export_sample(
@@ -448,7 +457,7 @@ def export_sample(
 ) -> Tuple[str, str]:
     """Generate 1 sample and write .mp4 video, 16 frame images, and 16 bg_mask images."""
     os.makedirs(output_dir, exist_ok=True)
-    frames, bg_masks, label_str, meta = generate_single_sample()
+    frames, bg_masks, label_str, meta, obj_counts = generate_single_sample()
 
     # 1. Write RGB video
     video_path = os.path.join(output_dir, video_name)
@@ -513,7 +522,7 @@ def export_lmdb(
     print(f"Generating {num_samples} samples into LMDB: {lmdb_path} ...")
     with env.begin(write=True) as txn:
         for idx in range(num_samples):
-            frames, bg_masks, label_str, _ = generate_single_sample()
+            frames, bg_masks, label_str, _, obj_counts = generate_single_sample()
 
             # Encode 16 frames as high-quality JPEGs
             encoded_frames = [
@@ -529,10 +538,12 @@ def export_lmdb(
 
             video_payload = pickle.dumps(encoded_frames)
             mask_payload = pickle.dumps(encoded_masks)
+            counts_payload = pickle.dumps(obj_counts)
 
             txn.put(f"video-{idx:09d}".encode("utf-8"), video_payload)
             txn.put(f"bg_mask-{idx:09d}".encode("utf-8"), mask_payload)
             txn.put(f"label-{idx:09d}".encode("utf-8"), label_str.encode("utf-8"))
+            txn.put(f"obj_counts-{idx:09d}".encode("utf-8"), counts_payload)
 
             if (idx + 1) % 100 == 0 or idx == num_samples - 1:
                 print(f"  Processed [{idx + 1}/{num_samples}] samples...")

@@ -18,12 +18,31 @@ from BaseModel.core import METRICS, MODELS
 from BaseModel.model import BaseModel
 from BaseModel.utils.metrics.base_metric import BaseMetric
 
-from .dataset import ALL_CLASSES, CLASS_TO_IDX, IDX_TO_CLASS, NUM_CLASSES, decode_target
+from .dataset import ALL_CLASSES, CLASS_TO_IDX, IDX_TO_CLASS, NUM_CLASSES, SYMBOL_VARIANTS, decode_target
 from .loss import ActionSlotLoss
 from .model_parts.backbones import MoViNetA0Backbone, X3DBackbone, YoloV11Backbone
-from .model_parts.heads import Allocated_Head, ReduceAllocatedHead
+from .model_parts.heads import (
+    Allocated_Head,
+    FrameObjectCountHead,
+    ObjectActionHead,
+    ReduceAllocatedHead,
+    VideoObjectClassHead,
+)
 from .model_parts.slot_attention import SlotAttention
 from .model_parts.Mamba.model import Mamba, MambaConfig
+
+
+class _ScaleGrad(torch.autograd.Function):
+    """Identity in forward pass; scales backward gradients by `scale`."""
+
+    @staticmethod
+    def forward(ctx, x: Tensor, scale: float) -> Tensor:
+        ctx.scale = float(scale)
+        return x.view_as(x)
+
+    @staticmethod
+    def backward(ctx, grad_output: Tensor):
+        return grad_output * ctx.scale, None
 
 
 
@@ -84,7 +103,7 @@ class ActionSlotModel(BaseModel):
     def __init__(
         self,
         num_actor_class: int = 48,
-        num_slots: int = 24,
+        num_slots: int = 6,
         num_ego_class: int = 0,
         slot_dim: int = 256,
         ego_c: int = 128,
@@ -180,14 +199,43 @@ class ActionSlotModel(BaseModel):
             slot_dropout=kwargs.get("slot_dropout", 0.0),
         )
 
-        # 5. Classification Head
-        self.head = ReduceAllocatedHead(
-            in_channel=slot_dim,
-            num_actor_classes=num_actor_class,
-            num_slots=self.num_slots,
-            num_ego_classes=num_ego_class,
-            ego_channel=ego_c,
-        )
+        # 5. Classification Head & Per-Frame Object Count Head
+        self.actor_loss_type = str(kwargs.get("actor_loss_type", "bce")).lower()
+        if self.actor_loss_type == "bce" and self.num_slots < num_actor_class:
+            self.head = ObjectActionHead(
+                in_channel=slot_dim,
+                num_actor_classes=num_actor_class,
+                num_slots=self.num_slots,
+                num_ego_classes=num_ego_class,
+                ego_channel=ego_c,
+            )
+        else:
+            self.head = ReduceAllocatedHead(
+                in_channel=slot_dim,
+                num_actor_classes=num_actor_class,
+                num_slots=self.num_slots,
+                num_ego_classes=num_ego_class,
+                ego_channel=ego_c,
+            )
+
+        self.use_obj_count_loss = bool(kwargs.get("use_obj_count_loss", True))
+        num_obj_classes = int(kwargs.get("num_obj_classes", len(SYMBOL_VARIANTS)))
+        if self.use_obj_count_loss:
+            self.count_head = FrameObjectCountHead(
+                in_channel=slot_dim,
+                num_slots=self.num_slots,
+                hidden_dim=int(kwargs.get("count_hidden_dim", 64)),
+            )
+            self.obj_cls_head = None
+        else:
+            self.count_head = None
+            self.obj_cls_head = VideoObjectClassHead(
+                in_channel=slot_dim,
+                num_slots=actual_slots,
+                num_obj_classes=num_obj_classes,
+                hidden_dim=int(kwargs.get("obj_cls_hidden_dim", 256)),
+                dropout=float(kwargs.get("obj_cls_dropout", 0.2)),
+            )
 
         self.drop = nn.Dropout(p=dropout)
 
@@ -196,14 +244,41 @@ class ActionSlotModel(BaseModel):
             num_actor_class=num_actor_class,
             num_slots=self.num_slots,
             attention_res=(resolution3d[1], resolution3d[2]),
+            bce_pos_weight=float(kwargs.get("bce_pos_weight", 5.0)),
+            actor_loss_type=self.actor_loss_type,
+            use_obj_count_loss=self.use_obj_count_loss,
+            obj_count_weight=float(kwargs.get("obj_count_weight", 1.0)),
+            obj_cls_weight=float(kwargs.get("obj_cls_weight", 1.0)),
+            obj_cls_pos_weight=float(kwargs.get("obj_cls_pos_weight", 3.0)),
+            num_obj_classes=num_obj_classes,
+            action_attn_weight=float(kwargs.get("action_attn_weight", 1.0)),
+            bg_attn_weight=float(kwargs.get("bg_attn_weight", 0.5)),
             bg_mask=True,
             bg_slot=bg_slot,
         )
 
-        mambaCfg = MambaConfig(d_model= self.slot_dim, n_layer= 1, d_state= 16, num_slot= 49)
+        # Mamba operates strictly over the S object slots (excluding bg_slot)
+        mambaCfg = MambaConfig(
+            d_model=self.slot_dim,
+            n_layer=int(kwargs.get("mamba_layers", 1)),
+            d_state=int(kwargs.get("mamba_d_state", 16)),
+            num_slot=self.num_slots,
+        )
         self.mamba = Mamba(mambaCfg)
+        self.temporal_pool = str(kwargs.get("temporal_pool", "last_mean")).lower()
         self.mamba_grad_scale = float(kwargs.get("mamba_grad_scale", 10.0))
         self.backbone_grad_scale = float(kwargs.get("backbone_grad_scale", 2.0))
+
+    def init_weights(self) -> None:
+        """Preserve pretrained backbone weights and submodule-specific initializations.
+
+        BaseModel.scripts.train invokes `model.init_weights()` after `build_model()`,
+        whose default implementation in `BaseModel` overwrites all Conv2d/BatchNorm2d/Linear
+        parameters (wiping pretrained backbones while leaving pretrained BN running stats
+        intact, causing activation explosion in frozen BN layers, and clobbering Mamba/Slot
+        initializations). Each submodule already initializes itself during `__init__`.
+        """
+        return None
 
     def _normalize_input(self, inputs: torch.Tensor) -> torch.Tensor:
         """Ensure input tensor is of shape (B, C=3, T=16, H=224, W=224)."""
@@ -219,11 +294,11 @@ class ActionSlotModel(BaseModel):
 
         return inputs.contiguous()
 
-    def extract_features(
+    def _extract_all_features(
         self,
         videos: torch.Tensor,
-    ) -> Tuple[torch.Tensor, Optional[torch.Tensor], torch.Tensor]:
-        """Extract slot representations and attention masks."""
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor], torch.Tensor, Dict[str, Optional[torch.Tensor]]]:
+        """Extract object action slots, ego features, attention masks, and auxiliary predictions."""
         videos = self._normalize_input(videos)
         batch_size, _, seq_len, _, _ = videos.shape
 
@@ -247,29 +322,39 @@ class ActionSlotModel(BaseModel):
 
         # 3. Project to slot dimension: (B, T, H, W, slot_dim)
         x = self.conv3d(feats)
+        x = x + build_2d_sincos_position_embedding(
+            new_h, new_w, self.slot_dim, device=x.device, dtype=x.dtype
+        ).unsqueeze(2)
+        x = x.permute(0, 2, 3, 4, 1).contiguous()  # (B, T, H, W, slot_dim)
 
-        x = x + build_2d_sincos_position_embedding(new_h, new_w, self.slot_dim, device= x.device, dtype= x.dtype).unsqueeze(2)
-        x = x.permute(0, 2, 3, 4, 1)
-        B,T,H,W,dim = x.shape
-        x = x.view(B, T, H*W, dim)
+        # 4. Per-frame Slot Attention -> (B, T, actual_slots, slot_dim)
+        slots_seq_all, attn_masks = self.slot_attention(x, return_temporal_slots=True)
+        obj_slots = slots_seq_all[:, :, :self.num_slots, :]  # (B, T, S, slot_dim)
 
-        if self.training and x.requires_grad and self.mamba_grad_scale != 1.0:
-            scale = self.mamba_grad_scale
-            x.register_hook(lambda grad: grad / scale)
+        # 4b. Auxiliary head: either per-frame object counts (from obj_slots) or video-level object classes (from all slots)
+        pred_counts = self.count_head(obj_slots) if self.count_head is not None else None
+        pred_obj_cls = self.obj_cls_head(slots_seq_all) if self.obj_cls_head is not None else None
 
-        x = x + self.mamba(x)
-        if self.training and x.requires_grad and self.mamba_grad_scale != 1.0:
-            scale = self.mamba_grad_scale
-            x.register_hook(lambda grad: grad * scale)
+        # 5. Mamba temporal modeling over object slots: (B, T, S, slot_dim)
+        if self.training and obj_slots.requires_grad and self.mamba_grad_scale != 1.0:
+            mamba_in = _ScaleGrad.apply(obj_slots, 1.0 / self.mamba_grad_scale)
+            mamba_out = _ScaleGrad.apply(self.mamba(mamba_in), self.mamba_grad_scale)
+        else:
+            mamba_out = self.mamba(obj_slots)
 
-        x = x.view(B, T, H, W, dim)
-        
+        slots_seq = obj_slots + mamba_out  # (B, T, S, slot_dim)
 
-        # 4. Slot Attention
-        slots, attn_masks = self.slot_attention(x)  # slots: (B, actual_slots, slot_dim), attn_masks: (B, actual_slots, T*H*W)
-        # 5. Reshape attention masks: (B, T, actual_slots, H, W)
+        # Temporal aggregation -> (B, S, slot_dim)
+        if self.temporal_pool == "last":
+            slots = slots_seq[:, -1, :, :]
+        elif self.temporal_pool == "mean":
+            slots = slots_seq.mean(dim=1)
+        else:
+            slots = 0.5 * (slots_seq[:, -1, :, :] + slots_seq.mean(dim=1))
+
+        # 6. Reshape attention masks: (B, T, actual_slots, H, W)
         b, actual_slots, _ = attn_masks.shape
-        attn_masks = attn_masks.view(b, actual_slots, new_seq_len, new_h, new_w) # (B, T, actual_slots, H, W)
+        attn_masks = attn_masks.view(b, actual_slots, new_seq_len, new_h, new_w) # (B, actual_slots, T, H, W)
         attn_masks = attn_masks.permute(0, 2, 1, 3, 4)  # (B, T, actual_slots, H, W)
 
         if seq_len > new_seq_len:
@@ -277,19 +362,25 @@ class ActionSlotModel(BaseModel):
             attn_up = F.interpolate(attn_flat, size=(seq_len, new_h, new_w), mode="trilinear", align_corners=False)
             attn_masks = attn_up.view(b, actual_slots, seq_len, new_h, new_w).permute(0, 2, 1, 3, 4)
 
+        aux_preds = {
+            "obj_counts": pred_counts,
+            "obj_cls": pred_obj_cls,
+        }
+        return slots, ego_x, attn_masks, aux_preds
+
+    def extract_features(
+        self,
+        videos: torch.Tensor,
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor], torch.Tensor]:
+        """Extract slot representations and attention masks."""
+        slots, ego_x, attn_masks, _ = self._extract_all_features(videos)
         return slots, ego_x, attn_masks
 
     def _process_output(self, pred_actor: Tensor) -> Tensor:
-        """Map (B, 24, 3) slot logits into (B, 48) multi-label action logits.
+        """Map slot predictions to (B, 48) multi-label action logits."""
+        if pred_actor.dim() == 2 and pred_actor.shape[-1] == self.num_actor_class:
+            return pred_actor
 
-        For each slot (corresponding to a symbol and an action):
-            - index 0: single active (e.g. x:gotop)
-            - index 1: group active (e.g. x+:gotop)
-            - index 2: background (neither)
-        We subtract background logit to obtain calibrated foreground logits:
-            fg_logits = pred[:, :, :2] - pred[:, :, 2:3]  # (B, 24, 2)
-        And reshape back into the exact order of ALL_CLASSES (48 classes).
-        """
         B = pred_actor.shape[0]
         fg_logits = pred_actor[:, :, :2] - pred_actor[:, :, 2:3]  # (B, 24, 2)
 
@@ -305,13 +396,17 @@ class ActionSlotModel(BaseModel):
         **kwargs,
     ) -> Dict[str, torch.Tensor]:
         """Compute training losses and attach predictions for hooks."""
-        slots, ego_x, attn_masks = self.extract_features(inputs)
+        slots, ego_x, attn_masks, aux_preds = self._extract_all_features(inputs)
         pred_ego, pred_actor = self.head(slots, ego_x=ego_x)
+        pred_counts = aux_preds.get("obj_counts", None)
+        pred_obj_cls = aux_preds.get("obj_cls", None)
 
         pred_dict = {
             "actor": pred_actor,
             "ego": pred_ego,
             "attn": attn_masks,
+            "obj_counts": pred_counts,
+            "obj_cls": pred_obj_cls,
         }
 
         # If targets is provided as raw tensor (B, 48) or dict
@@ -319,11 +414,19 @@ class ActionSlotModel(BaseModel):
 
         # Calibrate logits to 48 classes for metrics and hooks
         logits_48 = self._process_output(pred_actor)
-        target_tensor = targets if isinstance(targets, torch.Tensor) else targets.get("actor", targets.get("target", None))
+        target_tensor = (
+            targets
+            if isinstance(targets, torch.Tensor)
+            else (targets.get("actor", targets.get("target", None)) if isinstance(targets, dict) else None)
+        )
 
         loss_dict["logits"] = logits_48
         loss_dict["preds"] = logits_48
         loss_dict["pred_actor"] = logits_48
+        if pred_counts is not None:
+            loss_dict["pred_obj_counts"] = pred_counts
+        if pred_obj_cls is not None:
+            loss_dict["pred_obj_cls"] = pred_obj_cls
         if target_tensor is not None:
             loss_dict["targets"] = target_tensor
             loss_dict["target_actor"] = target_tensor
@@ -337,13 +440,17 @@ class ActionSlotModel(BaseModel):
         **kwargs,
     ) -> Dict[str, Any]:
         """Validation forward pass."""
-        slots, ego_x, attn_masks = self.extract_features(inputs)
+        slots, ego_x, attn_masks, aux_preds = self._extract_all_features(inputs)
         pred_ego, pred_actor = self.head(slots, ego_x=ego_x)
+        pred_counts = aux_preds.get("obj_counts", None)
+        pred_obj_cls = aux_preds.get("obj_cls", None)
 
         pred_dict = {
             "actor": pred_actor,
             "ego": pred_ego,
             "attn": attn_masks,
+            "obj_counts": pred_counts,
+            "obj_cls": pred_obj_cls,
         }
 
         output: Dict[str, Any] = {}
@@ -355,13 +462,22 @@ class ActionSlotModel(BaseModel):
         probs_48 = torch.sigmoid(logits_48)
         preds_binary = (probs_48 > self.threshold).float()
 
-        target_tensor = targets if isinstance(targets, torch.Tensor) else (targets.get("actor", targets.get("target", None)) if targets else None)
+        target_tensor = (
+            targets
+            if isinstance(targets, torch.Tensor)
+            else (targets.get("actor", targets.get("target", None)) if isinstance(targets, dict) else None)
+        )
 
         output["logits"] = logits_48
         output["preds"] = logits_48
         output["probs"] = probs_48
         output["actor"] = logits_48
         output["pred_actor"] = logits_48
+        if pred_counts is not None:
+            output["obj_counts"] = pred_counts.clamp(min=0.0)
+        if pred_obj_cls is not None:
+            output["obj_cls"] = pred_obj_cls
+            output["obj_cls_probs"] = torch.sigmoid(pred_obj_cls)
 
         if target_tensor is not None:
             output["exact_match"] = (preds_binary == target_tensor).all(dim=-1).float().mean()
@@ -377,8 +493,10 @@ class ActionSlotModel(BaseModel):
     ) -> Dict[str, Any]:
         """Inference forward pass with decoded text labels."""
         th = threshold if threshold is not None else self.threshold
-        slots, ego_x, attn_masks = self.extract_features(inputs)
+        slots, ego_x, attn_masks, aux_preds = self._extract_all_features(inputs)
         _, pred_actor = self.head(slots, ego_x=ego_x)
+        pred_counts = aux_preds.get("obj_counts", None)
+        pred_obj_cls = aux_preds.get("obj_cls", None)
 
         logits_48 = self._process_output(pred_actor)
         probs_48 = torch.sigmoid(logits_48)
@@ -395,6 +513,8 @@ class ActionSlotModel(BaseModel):
             "preds": preds_binary,
             "logits": logits_48,
             "attn": attn_masks,
+            "obj_counts": pred_counts.clamp(min=0.0) if pred_counts is not None else None,
+            "obj_cls_probs": torch.sigmoid(pred_obj_cls) if pred_obj_cls is not None else None,
             "label_strings": decoded_labels,
         }
 
@@ -583,16 +703,21 @@ class MultiLabelMetric(BaseMetric):
     def update(self, preds: Any, targets: Any) -> None:
         if isinstance(preds, dict):
             preds = preds.get("preds", preds.get("probs", preds.get("logits", None)))
+        if isinstance(targets, dict):
+            targets = targets.get("actor", targets.get("target", targets.get("targets", None)))
 
         if isinstance(preds, (list, tuple)):
             preds = preds[0]
         if isinstance(targets, (list, tuple)):
             targets = targets[0]
 
+        if preds is None or targets is None:
+            return
+
         preds = preds.detach().cpu()
         targets = targets.detach().cpu()
 
-        if preds.shape != targets.shape:
+        if preds.min() < 0.0 or preds.max() > 1.0 or preds.shape != targets.shape:
             probs = torch.sigmoid(preds)
             binary_preds = (probs > self.threshold).float()
         else:
