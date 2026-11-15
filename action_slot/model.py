@@ -181,6 +181,7 @@ class ActionSlotModel(BaseModel):
 
         # 3. Project to slot dimension: (B, T_feat, H_feat, W_feat, slot_dim)
         x = self.conv3d(feats)
+        
         x = x + build_2d_sincos_position_embedding(new_h, new_w, self.slot_dim, device= x.device, dtype= x.dtype).unsqueeze(2)
         x = x.permute(0, 2, 3, 4, 1)
         x = torch.reshape(x, (batch_size, new_seq_len, new_h, new_w, -1))
@@ -191,7 +192,7 @@ class ActionSlotModel(BaseModel):
             scale = self.mamba_grad_scale
             x.register_hook(lambda grad: grad / scale)
 
-        x = self.mamba(x)
+        x = x + self.mamba(x)
         if self.training and x.requires_grad and self.mamba_grad_scale != 1.0:
             scale = self.mamba_grad_scale
             x.register_hook(lambda grad: grad * scale)
