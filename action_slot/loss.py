@@ -196,7 +196,7 @@ class ActionSlotLoss(nn.Module):
             c2 = (mask_64[:, 24:48] == 1).any(dim=1)
             c3 = (mask_64[:, 48:64] == 1).any(dim=1)
 
-            # Ghép lại thành (B, 3) và ép kiểu về cùng dtype với actor (ví dụ int64 hoặc float32)
+            
             class_idx = torch.stack([c1, c2, c3], dim=-1).to(mask_64.dtype) # (B,3)
             class_idx = class_idx.view(b, self.num_slots, 1, 1, 1).repeat(1, 1, l, h, w)
             class_idx = torch.permute(class_idx, (0, 2, 1, 3, 4))
@@ -276,9 +276,9 @@ class ActionSlotLoss(nn.Module):
 
         ego_loss = self.ego_loss(pred['ego'],label['ego'])
         actor_loss = self.actor_loss(pred['actor'],label['actor'])
-        # attention_loss = self.attn_loss(pred['attn'],label,validate)
+        attention_loss = self.attn_loss(pred['attn'],label,validate)
 
         loss = {"loss_ego": 0.5 * ego_loss, "loss_actor": actor_loss} 
-        # loss |= attention_loss
+        loss |= attention_loss
 
         return loss
