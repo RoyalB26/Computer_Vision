@@ -20,12 +20,21 @@ def inter_and_union(pred, mask, num_class=1, start_class=0):
 
 
 class ActionSlotLoss(nn.Module):
-    def __init__(self, num_actor_class, attention_res=None, bce_pos_weight = 10, num_slots: int= 32, device = None):
+    def __init__(
+        self,
+        num_actor_class,
+        attention_res=None,
+        bce_pos_weight=10,
+        num_slots: int = 32,
+        feat_recon_weight: float = 0.5,
+        device=None,
+    ):
         super(ActionSlotLoss, self).__init__()
         self.num_actor_class = num_actor_class
         self.num_slots = num_slots
         self.attention_res = attention_res
         self.bce_pos_weight = bce_pos_weight
+        self.feat_recon_weight = float(feat_recon_weight)
 
         self.bg_mask = True
         self.bg_slot = True
@@ -259,6 +268,15 @@ class ActionSlotLoss(nn.Module):
         loss = (raw_loss * sample_weights).sum() / sample_weights.sum()
         return loss
 
+    def feat_recon_loss(self, recon_feats, target_feats):
+        """Compute MSE feature reconstruction loss (DINOSAUR-style)."""
+        if recon_feats is None or target_feats is None or self.feat_recon_weight <= 0:
+            return None
+        return self.feat_recon_weight * F.mse_loss(
+            recon_feats,
+            target_feats.detach().to(device=recon_feats.device, dtype=recon_feats.dtype),
+        )
+
     def forward(self, pred, label, validate=False):
 
         # actor = label['actor']  # shape: (B, 64)
@@ -282,9 +300,12 @@ class ActionSlotLoss(nn.Module):
 
         ego_loss = self.ego_loss(pred['ego'],label['ego'])
         actor_loss = self.actor_loss(pred['actor'],label['actor'])
+        feat_recon_loss = self.feat_recon_loss(pred.get('recon_feats'), pred.get('target_feats'))
         # attention_loss = self.attn_loss(pred['attn'],label,validate)
 
-        loss = {"loss_ego": 0.5 * ego_loss, "loss_actor": actor_loss} 
+        loss = {"loss_ego": 0.5 * ego_loss, "loss_actor": actor_loss}
+        if feat_recon_loss is not None:
+            loss["loss_feat_recon"] = feat_recon_loss
         # loss |= attention_loss
 
         return loss

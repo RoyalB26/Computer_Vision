@@ -24,6 +24,8 @@ model:
   slot_dim: 256
   ego_c: 128
   bg_slot: true
+  use_feat_recon: true
+  feat_recon_weight: 0.5
   dropout: 0.5
   finetune_last_n_stages: 2  # Chỉ fine-tune 2 stage cuối của backbone (đặt unfreeze_all: true nếu muốn mở toàn bộ như v7)
 

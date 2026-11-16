@@ -21,11 +21,17 @@ model:
   num_ego_class: 4
   num_actor_class: 64
   num_slots: 3
-  mamba_layers: 4
+  mamba_layers: 2
   slot_dim: 256
   ego_c: 128
   bg_slot: true
+  use_feat_recon: true
+  feat_recon_weight: 0.5
   dropout: 0.5
+  bce_pos_weight: 5.0
+  resolution3d: [16, 16, 48]
+  mamba_grad_scale: 1.0
+  backbone_grad_scale: 1.0
   pretrained_backbone: true
   pretrained_backbone_path: "/kaggle/working/yolo11n.pt"
   finetune_last_n_stages: 2

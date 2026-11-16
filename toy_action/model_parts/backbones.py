@@ -251,10 +251,11 @@ class YoloV11Backbone(BaseBackbone):
     """Modular YOLOv11 Backbone + Neck feature extractor for video recognition.
 
     Extracts high-level multi-scale features through the YOLOv11 backbone,
-    fuses them through the PANet Neck, and outputs feature map P5 (stride 32, 256 channels).
+    fuses them through the PANet Neck, pushes P5 semantics up into P4 spatial
+    resolution (stride 16, 256 channels), and optionally blends P3 detail.
     For video inputs with temporal dimension (B, C=3, T=16, H=224, W=224),
     frames are processed through 2D convolutions and re-assembled into
-    a spatiotemporal volume (B, C=256, T=16, H=7, W=7).
+    a spatiotemporal volume (B, C=256, T=16, H=14, W=14).
 
     Args:
         pretrained: Whether to load pretrained weights.
@@ -283,7 +284,12 @@ class YoloV11Backbone(BaseBackbone):
         self.neck = YOLOv11Neck()
         self.p3_proj = nn.Conv2d(64, 256, kernel_size=1, bias=False)
         self.p4_proj = nn.Conv2d(128, 256, kernel_size=1, bias=False)
-        self._out_channels = 256  # P5 channel dimension
+        self.p4_fuse = nn.Sequential(
+            nn.Conv2d(256, 256, kernel_size=3, padding=1, bias=False),
+            nn.GroupNorm(16, 256),
+            nn.SiLU(inplace=True),
+        )
+        self._out_channels = 256  # Fused P4 output channel dimension (14x14 for 224x224)
         self.freeze_bn = freeze_bn
 
         # Group modular components into 19 sequential stages:
@@ -350,8 +356,8 @@ class YoloV11Backbone(BaseBackbone):
                 for p in stage.parameters():
                     p.requires_grad = True
 
-        # Keep multi-scale P3/P4 projections aligned with freeze_all flag
-        for proj in (self.p3_proj, self.p4_proj):
+        # Keep multi-scale P3/P4 projections & P4 fusion layer aligned with freeze_all flag
+        for proj in (self.p3_proj, self.p4_proj, self.p4_fuse):
             for p in proj.parameters():
                 p.requires_grad = not freeze_all
 
@@ -440,21 +446,23 @@ class YoloV11Backbone(BaseBackbone):
     def _fuse_neck_features(
         self, p3: torch.Tensor, p4: torch.Tensor, p5: torch.Tensor
     ) -> torch.Tensor:
-        """Fuse multi-scale P3 and P4 neck features into P5 spatial resolution."""
-        h_out, w_out = p5.shape[-2], p5.shape[-1]
+        """Fuse neck features at P4 spatial resolution (14x14), pushing P5 semantics up to P4."""
+        h_out, w_out = p4.shape[-2], p4.shape[-1]
         p3_down = F.adaptive_avg_pool2d(p3, (h_out, w_out)) + F.adaptive_max_pool2d(p3, (h_out, w_out))
-        p4_down = F.adaptive_avg_pool2d(p4, (h_out, w_out)) + F.adaptive_max_pool2d(p4, (h_out, w_out))
-        return p5 + 0.5 * (self.p3_proj(p3_down) + self.p4_proj(p4_down))
+        p4_feat = self.p4_proj(p4)
+        p5_up = F.interpolate(p5, size=(h_out, w_out), mode="bilinear", align_corners=False)
+        fused = p4_feat + p5_up + 0.5 * self.p3_proj(p3_down)
+        return p4_feat + self.p4_fuse(fused)
 
     def forward(self, x: Union[List[torch.Tensor], torch.Tensor]) -> torch.Tensor:
-        """Forward pass extracting multi-scale fused P5 feature map after YOLOv11 neck.
+        """Forward pass extracting P4-resolution fused feature map (pushing P5 semantics into P4).
 
         Args:
             x: Input video tensor of shape (B, C=3, T=16, H=224, W=224)
                or (B, T=16, C=3, H=224, W=224), or list of T frames.
 
         Returns:
-            torch.Tensor: Spatiotemporal feature volume of shape (B, C=256, T=16, H=7, W=7).
+            torch.Tensor: Spatiotemporal feature volume of shape (B, C=256, T=16, H=14, W=14).
         """
         if isinstance(x, list):
             # List of T * (B, C, H, W) -> (B, C, T, H, W)
@@ -480,13 +488,13 @@ class YoloV11Backbone(BaseBackbone):
 
         feat4, feat6, feat10 = self.backbone(x_2d)
         p3, p4, p5 = self.neck(feat4, feat6, feat10)
-        p5 = self._fuse_neck_features(p3, p4, p5)
-        # p5 shape: (B*T, 256, H_feat=7, W_feat=7)
+        p4_fused = self._fuse_neck_features(p3, p4, p5)
+        # p4_fused shape: (B*T, 256, H_feat=14, W_feat=14)
 
-        # Reshape back to 5D spatiotemporal volume: (B, C=256, T=16, H=7, W=7)
-        _, c_out, h_out, w_out = p5.shape
-        p5_5d = p5.reshape(b, t, c_out, h_out, w_out).permute(0, 2, 1, 3, 4).contiguous()
-        return p5_5d
+        # Reshape back to 5D spatiotemporal volume: (B, C=256, T=16, H=14, W=14)
+        _, c_out, h_out, w_out = p4_fused.shape
+        p4_5d = p4_fused.reshape(b, t, c_out, h_out, w_out).permute(0, 2, 1, 3, 4).contiguous()
+        return p4_5d
 
 
 class MoViNetA0Backbone(BaseBackbone):

@@ -26,6 +26,7 @@ from .model_parts.heads import (
     FrameObjectCountHead,
     ObjectActionHead,
     ReduceAllocatedHead,
+    SpatialBroadcastFeatureDecoder,
     VideoObjectClassHead,
 )
 from .model_parts.slot_attention import SlotAttention
@@ -239,6 +240,18 @@ class ActionSlotModel(BaseModel):
 
         self.drop = nn.Dropout(p=dropout)
 
+        # 5b. DINOSAUR-style Spatial Broadcast Feature Decoder
+        self.use_feat_recon = bool(kwargs.get("use_feat_recon", True))
+        feat_recon_weight = float(kwargs.get("feat_recon_weight", 0.5))
+        if self.use_feat_recon:
+            self.feat_decoder = SpatialBroadcastFeatureDecoder(
+                slot_dim=self.slot_dim,
+                hidden_dim=int(kwargs.get("feat_recon_hidden_dim", 128)),
+                out_dim=self.slot_dim,
+            )
+        else:
+            self.feat_decoder = None
+
         # 6. Loss Function
         self.loss_fn = ActionSlotLoss(
             num_actor_class=num_actor_class,
@@ -253,6 +266,7 @@ class ActionSlotModel(BaseModel):
             num_obj_classes=num_obj_classes,
             action_attn_weight=float(kwargs.get("action_attn_weight", 1.0)),
             bg_attn_weight=float(kwargs.get("bg_attn_weight", 0.5)),
+            feat_recon_weight=feat_recon_weight if self.use_feat_recon else 0.0,
             bg_mask=True,
             bg_slot=bg_slot,
         )
@@ -297,6 +311,7 @@ class ActionSlotModel(BaseModel):
     def _extract_all_features(
         self,
         videos: torch.Tensor,
+        compute_recon: bool = False,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], torch.Tensor, Dict[str, Optional[torch.Tensor]]]:
         """Extract object action slots, ego features, attention masks, and auxiliary predictions."""
         videos = self._normalize_input(videos)
@@ -321,9 +336,10 @@ class ActionSlotModel(BaseModel):
         new_h, new_w = feats.shape[3], feats.shape[4]
 
         # 3. Project to slot dimension: (B, T, H, W, slot_dim)
-        x = self.conv3d(feats)
-        x = x + build_2d_sincos_position_embedding(
-            new_h, new_w, self.slot_dim, device=x.device, dtype=x.dtype
+        x_vis = self.conv3d(feats)
+        x_vis_5d = x_vis.permute(0, 2, 3, 4, 1).contiguous()  # pure visual target without PE
+        x = x_vis + build_2d_sincos_position_embedding(
+            new_h, new_w, self.slot_dim, device=x_vis.device, dtype=x_vis.dtype
         ).unsqueeze(2)
         x = x.permute(0, 2, 3, 4, 1).contiguous()  # (B, T, H, W, slot_dim)
 
@@ -334,6 +350,13 @@ class ActionSlotModel(BaseModel):
         # 4b. Auxiliary head: either per-frame object counts (from obj_slots) or video-level object classes (from all slots)
         pred_counts = self.count_head(obj_slots) if self.count_head is not None else None
         pred_obj_cls = self.obj_cls_head(slots_seq_all) if self.obj_cls_head is not None else None
+
+        # 4c. Spatial broadcast feature reconstruction (DINOSAUR-style) from all slots
+        recon_feats = None
+        target_feats = None
+        if compute_recon and self.feat_decoder is not None:
+            recon_feats, _ = self.feat_decoder(slots_seq_all, new_h, new_w)
+            target_feats = x_vis_5d.detach()
 
         # 5. Mamba temporal modeling over object slots: (B, T, S, slot_dim)
         if self.training and obj_slots.requires_grad and self.mamba_grad_scale != 1.0:
@@ -365,6 +388,8 @@ class ActionSlotModel(BaseModel):
         aux_preds = {
             "obj_counts": pred_counts,
             "obj_cls": pred_obj_cls,
+            "recon_feats": recon_feats,
+            "target_feats": target_feats,
         }
         return slots, ego_x, attn_masks, aux_preds
 
@@ -396,7 +421,9 @@ class ActionSlotModel(BaseModel):
         **kwargs,
     ) -> Dict[str, torch.Tensor]:
         """Compute training losses and attach predictions for hooks."""
-        slots, ego_x, attn_masks, aux_preds = self._extract_all_features(inputs)
+        slots, ego_x, attn_masks, aux_preds = self._extract_all_features(
+            inputs, compute_recon=(self.feat_decoder is not None)
+        )
         pred_ego, pred_actor = self.head(slots, ego_x=ego_x)
         pred_counts = aux_preds.get("obj_counts", None)
         pred_obj_cls = aux_preds.get("obj_cls", None)
@@ -407,6 +434,8 @@ class ActionSlotModel(BaseModel):
             "attn": attn_masks,
             "obj_counts": pred_counts,
             "obj_cls": pred_obj_cls,
+            "recon_feats": aux_preds.get("recon_feats", None),
+            "target_feats": aux_preds.get("target_feats", None),
         }
 
         # If targets is provided as raw tensor (B, 48) or dict
@@ -440,7 +469,9 @@ class ActionSlotModel(BaseModel):
         **kwargs,
     ) -> Dict[str, Any]:
         """Validation forward pass."""
-        slots, ego_x, attn_masks, aux_preds = self._extract_all_features(inputs)
+        slots, ego_x, attn_masks, aux_preds = self._extract_all_features(
+            inputs, compute_recon=(self.feat_decoder is not None and targets is not None)
+        )
         pred_ego, pred_actor = self.head(slots, ego_x=ego_x)
         pred_counts = aux_preds.get("obj_counts", None)
         pred_obj_cls = aux_preds.get("obj_cls", None)
@@ -451,6 +482,8 @@ class ActionSlotModel(BaseModel):
             "attn": attn_masks,
             "obj_counts": pred_counts,
             "obj_cls": pred_obj_cls,
+            "recon_feats": aux_preds.get("recon_feats", None),
+            "target_feats": aux_preds.get("target_feats", None),
         }
 
         output: Dict[str, Any] = {}

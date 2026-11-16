@@ -63,9 +63,7 @@ class SlotAttention(nn.Module):
         self.slot_dropout = slot_dropout
 
         # Learnable Gaussian parameters for slot initialization
-        self.slots_mu = nn.Parameter(torch.randn(1, 1, dim))
-        self.slots_sigma = nn.Parameter(torch.randn(1, 1, dim).abs())
-        self.register_buffer("slots_eps", torch.randn(1, num_slots, dim))
+        self.obj_queries = nn.Parameter(torch.randn(1, num_slots, dim) * 0.05)
 
         self.FC1 = nn.Linear(dim, dim)
         self.FC2 = nn.Linear(dim, dim)
@@ -86,6 +84,10 @@ class SlotAttention(nn.Module):
         self.pool = nn.AdaptiveAvgPool1d(1)
         self.pe = SoftPositionEmbed3D(dim, list(resolution))
 
+    def _initial_slots(self, batch_size: int) -> torch.Tensor:
+        q = self.obj_queries
+        return q.expand(batch_size, -1, -1).contiguous()
+
     def get_3d_slot(self, slots, inputs, return_temporal_slots: bool = False):
         b, l, h, w, d = inputs.shape
         inputs = self.pe(inputs)
@@ -104,14 +106,13 @@ class SlotAttention(nn.Module):
             s = attn_ori.shape[1]
             hw = h * w
             attn_t = attn_ori.view(b, s, l, hw)
-            attn_t = attn_t / attn_t.sum(dim=-1, keepdim=True)
             v_t = v.view(b, l, hw, d)
             slots = torch.einsum("bljd,bilj->blid", v_t, attn_t)
             slots = slots + self.fc2(F.relu(self.fc1(self.norm_pre_ff(slots))))
             return slots, attn_ori
 
-        attn = attn_ori / attn_ori.sum(dim=-1, keepdim=True)
-        slots = torch.einsum("bjd,bij->bid", v, attn)
+        
+        slots = torch.einsum("bjd,bij->bid", v, attn_ori)
 
         slots = slots.reshape(b, -1, d)
         slots = slots + self.fc2(F.relu(self.fc1(self.norm_pre_ff(slots))))
@@ -119,9 +120,7 @@ class SlotAttention(nn.Module):
 
     def forward(self, inputs, num_slots=None, return_temporal_slots: bool = False):
         b, nf, h, w, d = inputs.shape
-        mu = self.slots_mu.expand(1, self.num_slots, -1)
-        sigma = self.slots_sigma.expand(1, self.num_slots, -1)
-        slots = (mu + sigma * self.slots_eps).expand(b, -1, -1)
+        slots = self._initial_slots(b)
         slots_out, attns = self.get_3d_slot(
             slots, inputs, return_temporal_slots=return_temporal_slots
         )

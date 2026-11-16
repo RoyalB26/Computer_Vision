@@ -220,3 +220,42 @@ class VideoObjectClassHead(nn.Module):
         pooled = 0.5 * (all_slots.mean(dim=1) + all_slots.max(dim=1).values)
         flat = pooled.reshape(b, -1)
         return self.classifier(flat)
+
+
+class SpatialBroadcastFeatureDecoder(nn.Module):
+    """DINOSAUR-style spatial broadcast decoder in backbone feature space.
+
+    Reconstructs input feature map `(B, T, H, W, out_dim)` from slot representations
+    `(B, T, actual_slots, slot_dim)` via a shared per-pixel MLP over broadcasted
+    slot vectors and normalized 2D coordinates, plus slot-wise alpha masks.
+    """
+
+    def __init__(self, slot_dim: int = 256, hidden_dim: int = 128, out_dim: int = 256):
+        super().__init__()
+        self.slot_dim = slot_dim
+        self.out_dim = out_dim
+        self.mlp = nn.Sequential(
+            nn.Linear(slot_dim + 2, hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, out_dim + 1),  # out_dim features + 1 alpha logit
+        )
+
+    def forward(self, slots_seq: torch.Tensor, h: int, w: int) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Decode slots into reconstructed feature maps `(B, T, H, W, out_dim)` and alpha masks `(B, T, S, H, W)`."""
+        b, t, s, _ = slots_seq.shape
+        ys = torch.linspace(-1.0, 1.0, steps=h, device=slots_seq.device, dtype=slots_seq.dtype)
+        xs = torch.linspace(-1.0, 1.0, steps=w, device=slots_seq.device, dtype=slots_seq.dtype)
+        gy, gx = torch.meshgrid(ys, xs, indexing="ij")
+        coords = torch.stack([gx, gy], dim=-1).reshape(1, 1, 1, h * w, 2)
+
+        coords_exp = coords.expand(b, t, s, -1, -1)
+        slots_exp = slots_seq.unsqueeze(3).expand(-1, -1, -1, h * w, -1)
+        dec_in = torch.cat([slots_exp, coords_exp], dim=-1)  # (B, T, S, HW, slot_dim + 2)
+        dec_out = self.mlp(dec_in)
+
+        feats_pred = dec_out[..., :-1]
+        alpha_masks = dec_out[..., -1].softmax(dim=2)  # Compete across all slots
+        recon = (feats_pred * alpha_masks.unsqueeze(-1)).sum(dim=2)
+        return recon.view(b, t, h, w, self.out_dim), alpha_masks.view(b, t, s, h, w)

@@ -44,6 +44,7 @@ class ActionSlotLoss(nn.Module):
         num_obj_classes: int = 12,
         action_attn_weight: float = 1.0,
         bg_attn_weight: float = 0.5,
+        feat_recon_weight: float = 0.5,
         bg_mask: bool = True,
         bg_slot: bool = True,
         device: Optional[torch.device] = None,
@@ -61,6 +62,7 @@ class ActionSlotLoss(nn.Module):
         self.num_obj_classes = int(num_obj_classes)
         self.action_attn_weight = action_attn_weight
         self.bg_attn_weight = bg_attn_weight
+        self.feat_recon_weight = float(feat_recon_weight)
         self.bg_mask = bg_mask
         self.bg_slot = bg_slot
         self.device = device
@@ -203,6 +205,18 @@ class ActionSlotLoss(nn.Module):
 
         return losses
 
+    def feat_recon_loss(
+        self,
+        recon_feats: Optional[torch.Tensor],
+        target_feats: Optional[torch.Tensor],
+    ) -> Optional[torch.Tensor]:
+        """Compute MSE feature reconstruction loss (DINOSAUR-style)."""
+        if recon_feats is None or target_feats is None or self.feat_recon_weight <= 0:
+            return None
+        return self.feat_recon_weight * F.mse_loss(
+            recon_feats, target_feats.detach().to(device=recon_feats.device, dtype=recon_feats.dtype)
+        )
+
     def forward(
         self,
         pred: Dict[str, torch.Tensor],
@@ -265,6 +279,11 @@ class ActionSlotLoss(nn.Module):
             loss_count = None
             loss_obj_cls = self.obj_cls_loss(pred.get("obj_cls", None), actor_gt)
 
+        loss_recon = self.feat_recon_loss(
+            pred.get("recon_feats", None),
+            pred.get("target_feats", None),
+        )
+
         total_loss = loss_actor
         for v in attn_losses.values():
             total_loss = total_loss + v
@@ -272,6 +291,8 @@ class ActionSlotLoss(nn.Module):
             total_loss = total_loss + loss_count
         if loss_obj_cls is not None:
             total_loss = total_loss + loss_obj_cls
+        if loss_recon is not None:
+            total_loss = total_loss + loss_recon
 
         loss_dict: Dict[str, torch.Tensor] = {
             "loss": total_loss,
@@ -281,5 +302,7 @@ class ActionSlotLoss(nn.Module):
             loss_dict["loss_obj_count"] = loss_count
         if loss_obj_cls is not None:
             loss_dict["loss_obj_cls"] = loss_obj_cls
+        if loss_recon is not None:
+            loss_dict["loss_feat_recon"] = loss_recon
         loss_dict.update(attn_losses)
         return loss_dict

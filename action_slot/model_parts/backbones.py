@@ -1,4 +1,4 @@
-"""Modular Video Backbones with registration."""
+"""Modular Video Backbones for Toy Action models."""
 
 from abc import ABC, abstractmethod
 import hashlib
@@ -7,11 +7,16 @@ import os
 import ssl
 from typing import Any, Dict, List, Optional, Tuple, Union
 from pathlib import Path
-import torch.nn.functional as F
 import urllib.request
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from yolo.yolov11 import YOLOv11, YOLOv11Backbone, YOLOv11Neck, _extract_state_dict
+from .movinet import (
+    MOVINET_A0_STREAM_WEIGHTS_URL,
+    MOVINET_A0_WEIGHTS_URL,
+    MoViNetA0Features,
+)
 _LOGGER = logging.getLogger("BaseModel.Train")
 _X3D_M_HTTP_URL = "http://dl.fbaipublicfiles.com/pytorchvideo/model_zoo/kinetics/X3D_M.pyth"
 _X3D_M_SHA256 = "eb9583d5f5a988a5c5f06f75760b070a5c9715794bd3b0536b78bd30595dcf67"
@@ -70,7 +75,12 @@ def _resolve_local_x3d_checkpoint(pretrained_path: Optional[str]) -> Optional[st
         return env_path
 
     cache_path = os.path.join(torch.hub.get_dir(), "checkpoints", "X3D_M.pyth")
-    for candidate in (cache_path, "./X3D_M.pyth", "./checkpoints/X3D_M.pyth", "/content/data/X3D_M.pyth"):
+    for candidate in (
+        cache_path,
+        "./X3D_M.pyth",
+        "./checkpoints/X3D_M.pyth",
+        os.path.expanduser("~/.cache/torch/hub/checkpoints/X3D_M.pyth"),
+    ):
         if os.path.isfile(candidate) and os.path.getsize(candidate) > 0:
             return candidate
     return None
@@ -129,6 +139,13 @@ def load_x3d_m_backbone(pretrained: bool = True, pretrained_path: Optional[str] 
         return _load_x3d_weights(_build_x3d_m_hub(pretrained=False), cache_path)
 
 
+def _freeze_batchnorm_stats(module: nn.Module) -> None:
+    """Keep BatchNorm running stats in eval mode inside ``module``."""
+    for m in module.modules():
+        if isinstance(m, nn.modules.batchnorm._BatchNorm):
+            m.eval()
+
+
 class BaseBackbone(nn.Module, ABC):
     """Abstract base class for all spatiotemporal feature extractors."""
 
@@ -149,7 +166,16 @@ class BaseBackbone(nn.Module, ABC):
 
 
 class X3DBackbone(BaseBackbone):
-    """Pretrained X3D-M backbone from PyTorchVideo hub."""
+    """Pretrained X3D-M backbone with flexible stage freezing.
+
+    Blocks in X3D-M:
+        - Block 0: Stem (stride 2)
+        - Block 1: ResStage1 (stride 2)
+        - Block 2: ResStage2 (stride 2)
+        - Block 3: ResStage3 (stride 2)
+        - Block 4: ResStage4 (stride 2)
+    Total 5 blocks. Output channels = 192.
+    """
 
     def __init__(
         self,
@@ -164,7 +190,6 @@ class X3DBackbone(BaseBackbone):
         super().__init__()
         x3d_hub = load_x3d_m_backbone(pretrained=pretrained, pretrained_path=pretrained_path)
         # All residual stages except the final 1x1x1 classification head
-        # Blocks: [0: Stem, 1: ResStage1, 2: ResStage2, 3: ResStage3, 4: ResStage4]
         self.blocks = x3d_hub.blocks[:-1]
         self._out_channels = 192
         self.freeze_bn = freeze_bn
@@ -175,6 +200,7 @@ class X3DBackbone(BaseBackbone):
         elif unfreeze_all:
             self.freeze_stages = 0
         elif finetune_last_n_stages is not None:
+            # e.g., 5 blocks total, finetune_last_n_stages=2 -> freeze first 3 blocks (Stem, Stage1, Stage2)
             self.freeze_stages = max(0, len(self.blocks) - finetune_last_n_stages)
         elif freeze_stages is not None:
             self.freeze_stages = freeze_stages
@@ -200,10 +226,13 @@ class X3DBackbone(BaseBackbone):
 
     def train(self, mode: bool = True):
         super().train(mode)
-        # Keep frozen blocks (especially BatchNorm running stats) in eval mode
-        if mode and self.freeze_bn and self.freeze_stages > 0:
+        # Keep frozen blocks in eval mode, and freeze BatchNorm running stats across all blocks when freeze_bn=True
+        if mode and self.freeze_stages > 0:
             for block in self.blocks[:self.freeze_stages]:
                 block.eval()
+        if mode and self.freeze_bn:
+            _freeze_batchnorm_stats(self)
+        return self
 
     @property
     def out_channels(self) -> int:
@@ -211,22 +240,22 @@ class X3DBackbone(BaseBackbone):
 
     def forward(self, x: Union[List[torch.Tensor], torch.Tensor]) -> torch.Tensor:
         if isinstance(x, list):
-            # Shape transition: list of T * (B, C, H, W) -> (B, C, T, H, W)
+            # list of T * (B, C, H, W) -> (B, C, T, H, W)
             x = torch.stack(x, dim=0).permute((1, 2, 0, 3, 4))
 
         for block in self.blocks:
             x = block(x)
         return x
 
-
 class YoloV11Backbone(BaseBackbone):
     """Modular YOLOv11 Backbone + Neck feature extractor for video recognition.
 
     Extracts high-level multi-scale features through the YOLOv11 backbone,
-    fuses them through the PANet Neck, and outputs feature map P5 (stride 32, 256 channels).
+    fuses them through the PANet Neck, pushes P5 semantics up into P4 spatial
+    resolution (stride 16, 256 channels), and optionally blends P3 detail.
     For video inputs with temporal dimension (B, C=3, T=16, H=224, W=224),
     frames are processed through 2D convolutions and re-assembled into
-    a spatiotemporal volume (B, C=256, T=16, H=7, W=7).
+    a spatiotemporal volume (B, C=256, T=16, H=14, W=14).
 
     Args:
         pretrained: Whether to load pretrained weights.
@@ -255,7 +284,12 @@ class YoloV11Backbone(BaseBackbone):
         self.neck = YOLOv11Neck()
         self.p3_proj = nn.Conv2d(64, 256, kernel_size=1, bias=False)
         self.p4_proj = nn.Conv2d(128, 256, kernel_size=1, bias=False)
-        self._out_channels = 256  # P5 channel dimension
+        self.p4_fuse = nn.Sequential(
+            nn.Conv2d(256, 256, kernel_size=3, padding=1, bias=False),
+            nn.GroupNorm(16, 256),
+            nn.SiLU(inplace=True),
+        )
+        self._out_channels = 256  # Fused P4 output channel dimension (14x14 for 224x224)
         self.freeze_bn = freeze_bn
 
         # Group modular components into 19 sequential stages:
@@ -322,8 +356,8 @@ class YoloV11Backbone(BaseBackbone):
                 for p in stage.parameters():
                     p.requires_grad = True
 
-        # Keep multi-scale P3/P4 projections aligned with freeze_all flag
-        for proj in (self.p3_proj, self.p4_proj):
+        # Keep multi-scale P3/P4 projections & P4 fusion layer aligned with freeze_all flag
+        for proj in (self.p3_proj, self.p4_proj, self.p4_fuse):
             for p in proj.parameters():
                 p.requires_grad = not freeze_all
 
@@ -399,10 +433,12 @@ class YoloV11Backbone(BaseBackbone):
 
     def train(self, mode: bool = True):
         super().train(mode)
-        # Keep frozen stages (BatchNorm running stats) in eval mode
-        if mode and self.freeze_bn and self.freeze_stages > 0:
+        # Keep frozen stages in eval mode, and freeze BatchNorm running stats when freeze_bn=True
+        if mode and self.freeze_stages > 0:
             for stage in self.stages[:self.freeze_stages]:
                 stage.eval()
+        if mode and self.freeze_bn:
+            _freeze_batchnorm_stats(self)
         return self
 
     @property
@@ -412,21 +448,23 @@ class YoloV11Backbone(BaseBackbone):
     def _fuse_neck_features(
         self, p3: torch.Tensor, p4: torch.Tensor, p5: torch.Tensor
     ) -> torch.Tensor:
-        """Fuse multi-scale P3 and P4 neck features into P5 spatial resolution."""
-        h_out, w_out = p5.shape[-2], p5.shape[-1]
+        """Fuse neck features at P4 spatial resolution (14x14), pushing P5 semantics up to P4."""
+        h_out, w_out = p4.shape[-2], p4.shape[-1]
         p3_down = F.adaptive_avg_pool2d(p3, (h_out, w_out)) + F.adaptive_max_pool2d(p3, (h_out, w_out))
-        p4_down = F.adaptive_avg_pool2d(p4, (h_out, w_out)) + F.adaptive_max_pool2d(p4, (h_out, w_out))
-        return p5 + 0.5 * (self.p3_proj(p3_down) + self.p4_proj(p4_down))
+        p4_feat = self.p4_proj(p4)
+        p5_up = F.interpolate(p5, size=(h_out, w_out), mode="bilinear", align_corners=False)
+        fused = p4_feat + p5_up + 0.5 * self.p3_proj(p3_down)
+        return p4_feat + self.p4_fuse(fused)
 
     def forward(self, x: Union[List[torch.Tensor], torch.Tensor]) -> torch.Tensor:
-        """Forward pass extracting multi-scale fused P5 feature map after YOLOv11 neck.
+        """Forward pass extracting P4-resolution fused feature map (pushing P5 semantics into P4).
 
         Args:
             x: Input video tensor of shape (B, C=3, T=16, H=224, W=224)
                or (B, T=16, C=3, H=224, W=224), or list of T frames.
 
         Returns:
-            torch.Tensor: Spatiotemporal feature volume of shape (B, C=256, T=16, H=7, W=7).
+            torch.Tensor: Spatiotemporal feature volume of shape (B, C=256, T=16, H=14, W=14).
         """
         if isinstance(x, list):
             # List of T * (B, C, H, W) -> (B, C, T, H, W)
@@ -452,10 +490,189 @@ class YoloV11Backbone(BaseBackbone):
 
         feat4, feat6, feat10 = self.backbone(x_2d)
         p3, p4, p5 = self.neck(feat4, feat6, feat10)
-        p5 = self._fuse_neck_features(p3, p4, p5)
-        # p5 shape: (B*T, 256, H_feat=7, W_feat=7)
+        p4_fused = self._fuse_neck_features(p3, p4, p5)
+        # p4_fused shape: (B*T, 256, H_feat=14, W_feat=14)
 
-        # Reshape back to 5D spatiotemporal volume: (B, C=256, T=16, H=7, W=7)
-        _, c_out, h_out, w_out = p5.shape
-        p5_5d = p5.reshape(b, t, c_out, h_out, w_out).permute(0, 2, 1, 3, 4).contiguous()
-        return p5_5d
+        # Reshape back to 5D spatiotemporal volume: (B, C=256, T=16, H=14, W=14)
+        _, c_out, h_out, w_out = p4_fused.shape
+        p4_5d = p4_fused.reshape(b, t, c_out, h_out, w_out).permute(0, 2, 1, 3, 4).contiguous()
+        return p4_5d
+
+
+class MoViNetA0Backbone(BaseBackbone):
+    """Pretrained MoViNet-A0 backbone with flexible stage freezing.
+
+    Stages in MoViNet-A0 (7 sequential stages):
+        - Stage 0: ``conv1`` stem (stride 2 -> 112x112, 8 ch)
+        - Stage 1: ``b0`` / Block 2 (1 layer, stride 4 -> 56x56, 8 ch)
+        - Stage 2: ``b1`` / Block 3 (3 layers, stride 8 -> 28x28, 32 ch)
+        - Stage 3: ``b2`` / Block 4 (3 layers, stride 16 -> 14x14, 56 ch)
+        - Stage 4: ``b3`` / Block 5 (4 layers, stride 16 -> 14x14, 56 ch)
+        - Stage 5: ``b4`` / Block 6 (4 layers, stride 32 -> 7x7, 104 ch)
+        - Stage 6: ``conv7`` projection (480 ch)
+    Total output shape for ``(B, 3, 16, 224, 224)`` is ``(B, 480, 16, 7, 7)``.
+    """
+
+    def __init__(
+        self,
+        pretrained: bool = True,
+        pretrained_path: Optional[str] = None,
+        causal: bool = False,
+        freeze_stages: Optional[int] = None,
+        finetune_last_n_stages: Optional[int] = 2,
+        freeze_all: bool = False,
+        unfreeze_all: bool = False,
+        freeze_bn: bool = True,
+    ):
+        super().__init__()
+        self.causal = causal
+        self.freeze_bn = freeze_bn
+        self._out_channels = 480
+
+        self.features = MoViNetA0Features(
+            causal=causal,
+            conv_type="2plus1d" if causal else "3d",
+            tf_like=True,
+        )
+
+        # Group layers into 7 sequential stage groups without duplicating modules in state_dict
+        self._stage_groups: List[List[nn.Module]] = [
+            [self.features.conv1],
+            *[
+                [getattr(self.features.blocks, name) for name in block_names]
+                for block_names in self.features.stage_block_names
+            ],
+            [self.features.conv7],
+        ]
+
+        if pretrained or pretrained_path is not None:
+            self.load_pretrained(pretrained_path=pretrained_path)
+
+        total_stages = len(self._stage_groups)
+        if freeze_all:
+            self.freeze_stages = total_stages
+        elif unfreeze_all:
+            self.freeze_stages = 0
+        elif finetune_last_n_stages is not None:
+            self.freeze_stages = max(0, total_stages - finetune_last_n_stages)
+        elif freeze_stages is not None:
+            self.freeze_stages = freeze_stages
+        else:
+            self.freeze_stages = max(0, total_stages - 2)
+
+        for stage_idx, stage_modules in enumerate(self._stage_groups):
+            trainable = stage_idx >= self.freeze_stages
+            for mod in stage_modules:
+                for param in mod.parameters():
+                    param.requires_grad = trainable
+
+    def _resolve_local_checkpoint(self, pretrained_path: Optional[str]) -> Optional[str]:
+        """Locate an explicit or locally cached MoViNet-A0 checkpoint file."""
+        if pretrained_path is not None:
+            if os.path.isfile(pretrained_path):
+                return pretrained_path
+            raise FileNotFoundError(f"Specified MoViNet-A0 checkpoint does not exist: {pretrained_path}")
+
+        filename = "modelA0_stream_statedict_v3" if self.causal else "modelA0_statedict_v3"
+        env_var = "MOVINET_A0_STREAM_WEIGHTS_PATH" if self.causal else "MOVINET_A0_WEIGHTS_PATH"
+        env_path = os.environ.get(env_var)
+        if env_path and os.path.isfile(env_path):
+            return env_path
+
+        cache_path = os.path.join(torch.hub.get_dir(), "checkpoints", filename)
+        for candidate in (
+            cache_path,
+            f"./{filename}",
+            f"./checkpoints/{filename}",
+            os.path.expanduser(f"~/.cache/torch/hub/checkpoints/{filename}"),
+        ):
+            if os.path.isfile(candidate) and os.path.getsize(candidate) > 0:
+                return candidate
+        return None
+
+    @staticmethod
+    def _filter_feature_state_dict(raw_ckpt: Any) -> Dict[str, torch.Tensor]:
+        """Extract and align MoViNet backbone state_dict keys (conv1, blocks, conv7)."""
+        if isinstance(raw_ckpt, dict):
+            if "state_dict" in raw_ckpt:
+                sd = raw_ckpt["state_dict"]
+            elif "model_state" in raw_ckpt:
+                sd = raw_ckpt["model_state"]
+            elif "model" in raw_ckpt:
+                m = raw_ckpt["model"]
+                sd = m.state_dict() if hasattr(m, "state_dict") else m
+            else:
+                sd = raw_ckpt
+        elif hasattr(raw_ckpt, "state_dict"):
+            sd = raw_ckpt.state_dict()
+        else:
+            raise ValueError(f"Unsupported checkpoint object type: {type(raw_ckpt)}")
+
+        filtered: Dict[str, torch.Tensor] = {}
+        for key, val in sd.items():
+            clean_key = key
+            for prefix in ("module.", "backbone.", "features."):
+                if clean_key.startswith(prefix):
+                    clean_key = clean_key[len(prefix):]
+            if clean_key.startswith(("conv1.", "blocks.", "conv7.")):
+                filtered[clean_key] = val
+        return filtered
+
+    def load_pretrained(self, pretrained_path: Optional[str] = None) -> Tuple[List[str], List[str]]:
+        """Load Kinetics-600 pretrained weights into MoViNet-A0 backbone stages."""
+        local_ckpt = self._resolve_local_checkpoint(pretrained_path)
+        if local_ckpt is not None:
+            try:
+                raw_ckpt = torch.load(local_ckpt, map_location="cpu", weights_only=True)
+            except TypeError:
+                raw_ckpt = torch.load(local_ckpt, map_location="cpu")
+            source_desc = local_ckpt
+        else:
+            url = MOVINET_A0_STREAM_WEIGHTS_URL if self.causal else MOVINET_A0_WEIGHTS_URL
+            filename = "modelA0_stream_statedict_v3" if self.causal else "modelA0_statedict_v3"
+            raw_ckpt = torch.hub.load_state_dict_from_url(
+                url,
+                map_location="cpu",
+                file_name=filename,
+                progress=True,
+            )
+            source_desc = url
+
+        feature_sd = self._filter_feature_state_dict(raw_ckpt)
+        missing, unexpected = self.features.load_state_dict(feature_sd, strict=False)
+        _LOGGER.info(
+            "[MoViNetA0Backbone] Loaded %d pretrained tensors from %s (missing: %d, unexpected: %d)",
+            len(feature_sd),
+            source_desc,
+            len(missing),
+            len(unexpected),
+        )
+        if missing:
+            _LOGGER.warning("[MoViNetA0Backbone] Missing keys while loading pretrained weights: %s", missing)
+        return list(missing), list(unexpected)
+
+    def train(self, mode: bool = True):
+        super().train(mode)
+        if mode and self.freeze_stages > 0:
+            for stage_modules in self._stage_groups[:self.freeze_stages]:
+                for mod in stage_modules:
+                    mod.eval()
+        if mode and self.freeze_bn:
+            _freeze_batchnorm_stats(self)
+        return self
+
+    @property
+    def out_channels(self) -> int:
+        return self._out_channels
+
+    def forward(self, x: Union[List[torch.Tensor], torch.Tensor]) -> torch.Tensor:
+        if isinstance(x, list):
+            x = torch.stack(x, dim=0).permute(1, 2, 0, 3, 4)
+
+        if x.dim() != 5:
+            raise ValueError(f"Expected 5D video tensor, got {x.dim()}D tensor with shape {x.shape}")
+
+        if x.shape[1] != 3 and x.shape[2] == 3:
+            x = x.permute(0, 2, 1, 3, 4)
+
+        return self.features(x)

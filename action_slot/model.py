@@ -8,7 +8,13 @@ import torch.nn.functional as F
 import torchvision.ops
 from torch import Tensor
 from model_parts.backbones import X3DBackbone, YoloV11Backbone
-from model_parts.heads import Allocated_Head, ReduceAllocatedHead, VideoObjectClassHead, ObjectActionHead
+from model_parts.heads import (
+    Allocated_Head,
+    ReduceAllocatedHead,
+    VideoObjectClassHead,
+    ObjectActionHead,
+    SpatialBroadcastFeatureDecoder,
+)
 from model_parts.slot_attention import SlotAttention
 from model_parts.Mamba.model import Mamba, MambaConfig
 from loss import ActionSlotLoss
@@ -161,9 +167,27 @@ class ActionSlotModel(BaseModel):
         )
         self.drop = nn.Dropout(p=dropout)
 
-        bce_pos_weight = kwargs.get('bce_pos_weight', 3.0)
+        # DINOSAUR-style Spatial Broadcast Feature Decoder
+        self.use_feat_recon = bool(kwargs.get("use_feat_recon", True))
+        feat_recon_weight = float(kwargs.get("feat_recon_weight", 0.5))
+        if self.use_feat_recon:
+            self.feat_decoder = SpatialBroadcastFeatureDecoder(
+                slot_dim=self.slot_dim,
+                hidden_dim=int(kwargs.get("feat_recon_hidden_dim", 128)),
+                out_dim=self.slot_dim,
+            )
+        else:
+            self.feat_decoder = None
 
-        self.loss_fn = ActionSlotLoss(num_actor_class = num_actor_class, attention_res=(resolution3d[1],resolution3d[2]), bce_pos_weight = bce_pos_weight, num_slots= self.num_slots)
+        bce_pos_weight = kwargs.get('bce_pos_weight', 5.0)
+
+        self.loss_fn = ActionSlotLoss(
+            num_actor_class=num_actor_class,
+            attention_res=(resolution3d[1], resolution3d[2]),
+            bce_pos_weight=bce_pos_weight,
+            num_slots=self.num_slots,
+            feat_recon_weight=feat_recon_weight if self.use_feat_recon else 0.0,
+        )
 
         # Mamba operates strictly over the S object slots (excluding bg_slot)
         mambaCfg = MambaConfig(
@@ -189,10 +213,11 @@ class ActionSlotModel(BaseModel):
         return None
 
 
-    def extract_features(
+    def _extract_features_with_aux(
         self,
         videos: Union[List[torch.Tensor], torch.Tensor],
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        compute_recon: bool = False,
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor], torch.Tensor, Dict[str, Optional[torch.Tensor]]]:
         if isinstance(videos, list):
             videos = torch.stack(videos, dim=0)
         if videos.dtype == torch.uint8:
@@ -205,7 +230,6 @@ class ActionSlotModel(BaseModel):
         # 1. Backbone feature extraction: (B, C, T_feat, H_feat, W_feat)
         feats = self.backbone(videos)
 
-
         # 2. Ego feature branch
         ego_x = None
         if self.conv3d_ego is not None:
@@ -217,15 +241,23 @@ class ActionSlotModel(BaseModel):
         new_h, new_w = feats.shape[3], feats.shape[4]
 
         # 3. Project to slot dimension: (B, T_feat, H_feat, W_feat, slot_dim)
-        x = self.conv3d(feats)
-        x = x + build_2d_sincos_position_embedding(
-            new_h, new_w, self.slot_dim, device=x.device, dtype=x.dtype
+        x_vis = self.conv3d(feats)
+        x_vis_5d = x_vis.permute(0, 2, 3, 4, 1).contiguous()
+        x = x_vis + build_2d_sincos_position_embedding(
+            new_h, new_w, self.slot_dim, device=x_vis.device, dtype=x_vis.dtype
         ).unsqueeze(2)
         x = x.permute(0, 2, 3, 4, 1).contiguous()  # (B, T, H, W, slot_dim)
 
         # 4. Per-frame Slot Attention -> (B, T, actual_slots, slot_dim)
         slots_seq_all, attn_masks = self.slot_attention(x, return_temporal_slots=True)
         obj_slots = slots_seq_all[:, :, :self.num_slots, :]  # (B, T, S, slot_dim)
+
+        # 4b. DINOSAUR-style Spatial Broadcast feature reconstruction from all slots
+        recon_feats = None
+        target_feats = None
+        if compute_recon and self.feat_decoder is not None:
+            recon_feats, _ = self.feat_decoder(slots_seq_all, new_h, new_w)
+            target_feats = x_vis_5d.detach()
 
         # 5. Mamba temporal modeling over object slots: (B, T, S, slot_dim)
         if self.training and obj_slots.requires_grad and self.mamba_grad_scale != 1.0:
@@ -254,10 +286,21 @@ class ActionSlotModel(BaseModel):
             attn_up = F.interpolate(attn_flat, size=(seq_len, new_h, new_w), mode="trilinear", align_corners=False)
             attn_masks = attn_up.view(b, actual_slots, seq_len, new_h, new_w).permute(0, 2, 1, 3, 4).clamp(0.0, 1.0)
 
-
-        ego_x = self.drop(ego_x)
+        if ego_x is not None:
+            ego_x = self.drop(ego_x)
         slots = self.drop(slots)
 
+        aux_preds = {
+            "recon_feats": recon_feats,
+            "target_feats": target_feats,
+        }
+        return slots, ego_x, attn_masks, aux_preds
+
+    def extract_features(
+        self,
+        videos: Union[List[torch.Tensor], torch.Tensor],
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor], torch.Tensor]:
+        slots, ego_x, attn_masks, _ = self._extract_features_with_aux(videos, compute_recon=False)
         return slots, ego_x, attn_masks
 
 
@@ -326,7 +369,9 @@ class ActionSlotModel(BaseModel):
         # print(targets['ego'].shape)
         # print(targets['actor'].shape)
         """Tính toán Detection Loss trong quá trình huấn luyện với FPN và Deformable Sampling Loss."""
-        slots, ego_x, attn_masks = self.extract_features(inputs)
+        slots, ego_x, attn_masks, aux_preds = self._extract_features_with_aux(
+            inputs, compute_recon=(self.feat_decoder is not None)
+        )
 
         pred_ego, pred_actor = self.head(slots, ego_x=ego_x)
 
@@ -334,6 +379,8 @@ class ActionSlotModel(BaseModel):
             "actor": pred_actor,
             "ego": pred_ego,
             "attn": attn_masks,
+            "recon_feats": aux_preds.get("recon_feats"),
+            "target_feats": aux_preds.get("target_feats"),
             # "cls_pred": cls_pred
         }
 
@@ -365,13 +412,17 @@ class ActionSlotModel(BaseModel):
         **kwargs,
     ) -> Dict[str, Any]:
         """Validation forward pass: tính validation losses và trích xuất preds phục vụ tính mAP."""
-        slots, ego_x, attn_masks = self.extract_features(inputs)
+        slots, ego_x, attn_masks, aux_preds = self._extract_features_with_aux(
+            inputs, compute_recon=(self.feat_decoder is not None and targets is not None)
+        )
         pred_ego, pred_actor = self.head(slots, ego_x=ego_x)
 
         pred = {
             "actor": pred_actor,
             "ego": pred_ego,
             "attn": attn_masks,
+            "recon_feats": aux_preds.get("recon_feats"),
+            "target_feats": aux_preds.get("target_feats"),
         }
 
         output = {}

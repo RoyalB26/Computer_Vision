@@ -32,7 +32,7 @@ if project_root not in sys.path:
 
 from BaseModel.utils import Config
 from BaseModel.model import build_model
-from toy_action.dataset import ALL_CLASSES, IDX_TO_CLASS
+from toy_action.dataset import ALL_CLASSES, IDX_TO_CLASS, SYMBOLS, SYMBOL_VARIANTS
 
 # Distinct vibrant color palette for up to 32 slots (RGB)
 SLOT_PALETTE: List[Tuple[int, int, int]] = [
@@ -269,7 +269,10 @@ def create_16_frame_grid_with_legend(
         for s_idx in active_slot_indices
     ]
 
-    legend_h = 50 + ((len(legend_entries) - 1) // 4) * 30
+    max_label_len = max((len(name) for _, name in legend_entries), default=0)
+    cols_legend = 2 if max_label_len > 14 else 4
+    rows_legend = max(1, (len(legend_entries) + cols_legend - 1) // cols_legend)
+    legend_h = 40 + rows_legend * 28
     legend_bar = np.full((legend_h, grid_w, 3), 245, dtype=np.uint8)
 
     cv2.putText(
@@ -283,10 +286,11 @@ def create_16_frame_grid_with_legend(
         cv2.LINE_AA,
     )
 
+    col_w = grid_w // cols_legend
     for i, (s_idx, s_name) in enumerate(legend_entries):
-        col = i % 4
-        row = i // 4
-        x = 12 + col * (grid_w // 4)
+        col = i % cols_legend
+        row = i // cols_legend
+        x = 12 + col * col_w
         y = 52 + row * 28
 
         color = SLOT_PALETTE[s_idx % len(SLOT_PALETTE)]
@@ -300,7 +304,7 @@ def create_16_frame_grid_with_legend(
             f"S{s_idx:02d}: {s_name}",
             (x + 28, y - 2),
             cv2.FONT_HERSHEY_SIMPLEX,
-            0.45,
+            0.43,
             (20, 20, 20),
             1,
             cv2.LINE_AA,
@@ -309,6 +313,21 @@ def create_16_frame_grid_with_legend(
     # Concatenate vertically
     full_image = np.vstack([grid, legend_bar])
     return full_image
+
+
+def _map_class_to_slot(cls_idx: int, num_obj_slots: int) -> int:
+    """Map an action class index (0..47) to its object/action slot index."""
+    if num_obj_slots == len(SYMBOLS):
+        # 6 object slots: slot s covers single + group (+) actions (8 classes per symbol)
+        return cls_idx // 8
+    if num_obj_slots == 24:
+        # 24 symbol-direction slots: (6 symbols * 4 directions)
+        sym_idx = cls_idx // 8
+        act_idx = (cls_idx % 8) % 4
+        return sym_idx * 4 + act_idx
+    if num_obj_slots >= len(ALL_CLASSES):
+        return cls_idx
+    return min(cls_idx // max(1, len(ALL_CLASSES) // max(1, num_obj_slots)), num_obj_slots - 1)
 
 
 def run_inference(
@@ -383,14 +402,26 @@ def run_inference(
         conf = probs[idx] * 100.0
         status = "[DETECTED]" if probs[idx] >= threshold else "          "
         print(f"  {rank}. {status} {cls_name:<16} : {conf:6.2f}%")
+
+    # Show auxiliary predictions if available (per-frame object counts or video object classes)
+    obj_counts = preds_dict.get("obj_counts", None)
+    if obj_counts is not None:
+        counts_np = obj_counts.squeeze(0).cpu().numpy()  # (16, 6)
+        mean_counts = counts_np.mean(axis=0)
+        count_strs = [f"{sym}:{mean_counts[i]:.2f}" for i, sym in enumerate(SYMBOLS)]
+        print("\nPredicted Mean Object Counts (per frame):")
+        print("  " + " | ".join(count_strs))
+
+    obj_cls_probs = preds_dict.get("obj_cls_probs", None)
+    if obj_cls_probs is not None:
+        cls_p = obj_cls_probs.squeeze(0).cpu().numpy()  # (12,)
+        present = [f"{SYMBOL_VARIANTS[i]}({cls_p[i]*100:.0f}%)" for i in range(len(SYMBOL_VARIANTS)) if cls_p[i] >= threshold]
+        print("\nPredicted Video Object Classes:")
+        print("  " + (", ".join(present) if present else "(None above threshold)"))
     print("=" * 60)
 
     # Extract Multi-Slot Attention Maps:
     attn_tensor = preds_dict.get("attn", None)
-    torch.set_printoptions(precision=2, sci_mode= False)
-    for i in range(25):
-        print(attn_tensor[0,5,i,:,:])
-    exit(0)
     active_slot_indices: List[int] = []
     slot_label_names: Dict[int, str] = {}
     bg_slot_attn = None
@@ -398,36 +429,58 @@ def run_inference(
     if attn_tensor is not None:
         # attn_tensor shape: (1, 16, actual_slots, H, W)
         attn = attn_tensor.squeeze(0).cpu().numpy()  # (16, actual_slots, H, W)
-        num_slots = attn.shape[1]
+        total_slots = attn.shape[1]
+        model_obj_slots = getattr(model, "num_slots", 6)
 
-        # Last slot is background slot if bg_slot is enabled
-        if getattr(model, "bg_slot", True) and num_slots > 24:
+        # Last slot is background slot if bg_slot is enabled and extra slot is present
+        has_bg_slot = getattr(model, "bg_slot", True) and total_slots > model_obj_slots
+        num_obj_slots = total_slots - 1 if has_bg_slot else min(total_slots, model_obj_slots)
+        if has_bg_slot:
             bg_slot_attn = attn[:, -1, :, :]  # (16, H, W)
 
-        # Map top detected classes back to their corresponding slots
-        for idx in top_indices:
-            sym_idx = idx // 8
-            rem = idx % 8
-            act_idx = rem % 4
-            s_idx = sym_idx * 4 + act_idx
+        # Group classes by object slot
+        slot_to_classes: Dict[int, List[int]] = {}
+        for c_idx in range(len(probs)):
+            s_idx = _map_class_to_slot(c_idx, num_obj_slots)
+            if 0 <= s_idx < num_obj_slots:
+                slot_to_classes.setdefault(s_idx, []).append(c_idx)
 
-            if s_idx not in active_slot_indices and s_idx < 24:
-                active_slot_indices.append(s_idx)
-                slot_label_names[s_idx] = IDX_TO_CLASS[idx]
+        # Order slots by highest class confidence, keeping detected slots + meaningful candidates (>= 5%)
+        slot_scores = [
+            (s_idx, float(max(probs[c] for c in c_list)))
+            for s_idx, c_list in slot_to_classes.items()
+        ]
+        slot_scores.sort(key=lambda x: x[1], reverse=True)
 
-            if len(active_slot_indices) >= top_k_slots:
-                break
+        selected = [
+            (s_idx, score)
+            for s_idx, score in slot_scores
+            if score >= threshold or (s_idx in {_map_class_to_slot(int(i), num_obj_slots) for i in top_indices} and score >= 0.05)
+        ]
+        if not selected:
+            selected = slot_scores[: min(top_k_slots, 3)]
+
+        for s_idx, _ in selected[: min(top_k_slots, num_obj_slots)]:
+            c_list = sorted(slot_to_classes[s_idx], key=lambda c: probs[c], reverse=True)
+            detected_c = [c for c in c_list if probs[c] >= threshold]
+            chosen_c = detected_c if detected_c else c_list[:1]
+            label_parts = [f"{IDX_TO_CLASS[c]} ({probs[c]*100:.0f}%)" for c in chosen_c[:2]]
+            if len(chosen_c) > 2:
+                label_parts.append(f"+{len(chosen_c) - 2}")
+            active_slot_indices.append(s_idx)
+            slot_label_names[s_idx] = ", ".join(label_parts)
 
         if not active_slot_indices:
-            active_slot_indices = list(range(min(4, 24)))
+            active_slot_indices = list(range(min(4, num_obj_slots)))
             for s in active_slot_indices:
-                slot_label_names[s] = f"Slot_{s}"
+                slot_label_names[s] = SYMBOLS[s] if num_obj_slots == len(SYMBOLS) else f"Slot_{s}"
 
         print(f"\n[SLOT COLOR ASSIGNMENTS]")
         for s_idx in active_slot_indices:
             color = SLOT_PALETTE[s_idx % len(SLOT_PALETTE)]
             name = slot_label_names.get(s_idx, f"Slot_{s_idx}")
-            print(f"  Slot {s_idx:02d} ({name:<16}) -> RGB Color: {color}")
+            sym_tag = f" [{SYMBOLS[s_idx]}]" if num_obj_slots == len(SYMBOLS) else ""
+            print(f"  Slot {s_idx:02d}{sym_tag} ({name:<28}) -> RGB Color: {color}")
     else:
         attn = np.zeros((16, 1, 224, 224), dtype=np.float32)
         active_slot_indices = [0]
@@ -503,7 +556,7 @@ def main():
     parser.add_argument(
         "--top-k-slots",
         type=int,
-        default=24,
+        default=6,
         help="Maximum number of active slot attention maps to colorize",
     )
     parser.add_argument(
