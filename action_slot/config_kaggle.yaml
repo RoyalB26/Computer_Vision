@@ -31,6 +31,7 @@ model:
   bg_attn_weight: 0.5
   dropout: 0.5
   bce_pos_weight: 5.0
+  use_class_pos_weight: true
   resolution3d: [16, 16, 48]
   mamba_grad_scale: 1.0
   backbone_grad_scale: 0.25

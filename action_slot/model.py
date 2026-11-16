@@ -190,6 +190,7 @@ class ActionSlotModel(BaseModel):
             action_attn_weight=float(kwargs.get("action_attn_weight", 1.0)),
             bg_attn_weight=float(kwargs.get("bg_attn_weight", 0.5)),
             ego_loss_weight=float(kwargs.get("ego_loss_weight", 0.2)),
+            use_class_pos_weight=bool(kwargs.get("use_class_pos_weight", True)),
         )
 
         # Mamba operates strictly over the S object slots (excluding bg_slot)

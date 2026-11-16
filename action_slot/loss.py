@@ -5,6 +5,11 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch import Tensor
 
+try:
+    from .metrics.taco_labels import get_taco_actor_pos_weight_ratios
+except ImportError:
+    from action_slot.metrics.taco_labels import get_taco_actor_pos_weight_ratios
+
 def inter_and_union(pred, mask, num_class=1, start_class=0):
     pred = pred.data.cpu().numpy().squeeze().astype(np.uint8)
     mask = mask.data.cpu().numpy().astype(np.uint8)
@@ -30,6 +35,7 @@ class ActionSlotLoss(nn.Module):
         action_attn_weight: float = 1.0,
         bg_attn_weight: float = 0.5,
         ego_loss_weight: float = 0.2,
+        use_class_pos_weight: bool = True,
         device=None,
     ):
         super(ActionSlotLoss, self).__init__()
@@ -45,6 +51,7 @@ class ActionSlotLoss(nn.Module):
         self.action_attn_weight = float(action_attn_weight)
         self.bg_attn_weight = float(bg_attn_weight)
         self.ego_loss_weight = float(ego_loss_weight)
+        self.use_class_pos_weight = bool(use_class_pos_weight)
 
         self.seq_len = 16
         self.mask_every_frame = 4
@@ -59,7 +66,14 @@ class ActionSlotLoss(nn.Module):
         self.attn_loss_type = self._parse_attn_loss()
 
     def _parse_actor_loss(self):
-        pos_weight = torch.ones([self.num_actor_class])*self.bce_pos_weight
+        if self.use_class_pos_weight:
+            ratios = get_taco_actor_pos_weight_ratios()
+            if self.num_actor_class == len(ratios):
+                pos_weight = torch.tensor(ratios, dtype=torch.float32) * self.bce_pos_weight
+            else:
+                pos_weight = torch.ones([self.num_actor_class], dtype=torch.float32) * self.bce_pos_weight
+        else:
+            pos_weight = torch.ones([self.num_actor_class], dtype=torch.float32) * self.bce_pos_weight
         self.bce = nn.BCEWithLogitsLoss(reduction='mean', pos_weight=pos_weight)
 
         weight_matrix = torch.tensor([
