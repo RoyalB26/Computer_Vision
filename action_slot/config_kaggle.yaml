@@ -26,7 +26,7 @@ model:
   ego_c: 128
   bg_slot: true
   use_feat_recon: true
-  feat_recon_weight: 1.0
+  feat_recon_weight: 0.25
   action_attn_weight: 1.0
   bg_attn_weight: 0.5
   dropout: 0.5
