@@ -161,7 +161,9 @@ class ActionSlotModel(BaseModel):
         )
         self.drop = nn.Dropout(p=dropout)
 
-        self.loss_fn = ActionSlotLoss(num_actor_class = num_actor_class, attention_res=(resolution3d[1],resolution3d[2]), bce_pos_weight = 10, num_slots= self.num_slots)
+        bce_pos_weight = kwargs.get('bce_pos_weight', 3.0)
+
+        self.loss_fn = ActionSlotLoss(num_actor_class = num_actor_class, attention_res=(resolution3d[1],resolution3d[2]), bce_pos_weight = bce_pos_weight, num_slots= self.num_slots)
 
         # Mamba operates strictly over the S object slots (excluding bg_slot)
         mambaCfg = MambaConfig(
@@ -252,6 +254,9 @@ class ActionSlotModel(BaseModel):
             attn_up = F.interpolate(attn_flat, size=(seq_len, new_h, new_w), mode="trilinear", align_corners=False)
             attn_masks = attn_up.view(b, actual_slots, seq_len, new_h, new_w).permute(0, 2, 1, 3, 4).clamp(0.0, 1.0)
 
+
+        ego_x = self.drop(ego_x)
+        slots = self.drop(slots)
 
         return slots, ego_x, attn_masks
 

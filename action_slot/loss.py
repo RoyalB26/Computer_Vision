@@ -282,9 +282,9 @@ class ActionSlotLoss(nn.Module):
 
         ego_loss = self.ego_loss(pred['ego'],label['ego'])
         actor_loss = self.actor_loss(pred['actor'],label['actor'])
-        attention_loss = self.attn_loss(pred['attn'],label,validate)
+        # attention_loss = self.attn_loss(pred['attn'],label,validate)
 
         loss = {"loss_ego": 0.5 * ego_loss, "loss_actor": actor_loss} 
-        loss |= attention_loss
+        # loss |= attention_loss
 
         return loss
