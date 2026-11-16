@@ -26,7 +26,7 @@ model:
   ego_c: 128
   bg_slot: true
   dropout: 0.5
-  unfreeze_all: true
+  pretrained_backbone_path: "/kaggle/working/yolo11n.pt"
 # 2. Dataset Configuration
 # Hỗ trợ cấu hình nhiều data_root dưới dạng danh sách (list) hoặc đường dẫn đơn (str)
 data:

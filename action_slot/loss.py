@@ -30,8 +30,8 @@ class ActionSlotLoss(nn.Module):
         self.bg_mask = True
         self.bg_slot = True
         self.obj_mask = False
-        self.action_attn_weight = 0
-        self.bg_attn_weight = 0
+        self.action_attn_weight = 1
+        self.bg_attn_weight = 0.5
 
         self.seq_len = 16
         self.mask_every_frame = 4
@@ -192,12 +192,12 @@ class ActionSlotLoss(nn.Module):
             B = mask_64.shape[0]
 
             
-            p1 = mask_64[:, 0:24].reshape(B, 2, 12).transpose(1, 2)
-            p2 = mask_64[:, 24:48].reshape(B, 2, 12).transpose(1, 2)
-            p3 = mask_64[:, 48:64].reshape(B, 2, 8).transpose(1, 2)
-            fg_mask = torch.cat([p1, p2, p3], dim=1)  # shape: (B, 32, 2)
+            c1 = (mask_64[:, 0:24] == 1).any(dim=1)
+            c2 = (mask_64[:, 24:48] == 1).any(dim=1)
+            c3 = (mask_64[:, 48:64] == 1).any(dim=1)
 
-            class_idx = fg_mask.all(dim=-1)     # shape: (B, 32), dtype: torch.bool
+            # Ghép lại thành (B, 3) và ép kiểu về cùng dtype với actor (ví dụ int64 hoặc float32)
+            class_idx = torch.stack([c1, c2, c3], dim=-1).to(mask_64.dtype) # (B,3)
             class_idx = class_idx.view(b, self.num_slots, 1, 1, 1).repeat(1, 1, l, h, w)
             class_idx = torch.permute(class_idx, (0, 2, 1, 3, 4))
 
