@@ -77,6 +77,7 @@ def _synthesize_dummy_input(model: nn.Module, cfg: Any, device: torch.device) ->
     width = 224
     is_video = False
     use_uint8 = False
+    has_explicit_hw = False
 
     if data_cfg:
         train_ds = getattr(getattr(data_cfg, "train", None), "dataset", {})
@@ -93,15 +94,19 @@ def _synthesize_dummy_input(model: nn.Module, cfg: Any, device: torch.device) ->
                         if "video_size" in p:
                             height, width = p["video_size"]
                             is_video = True
+                            has_explicit_hw = True
                         elif "img_size" in p:
                             img_s = p["img_size"]
                             if isinstance(img_s, (list, tuple)):
                                 height, width = img_s[0], img_s[1]
                             elif isinstance(img_s, int):
                                 height = width = img_s
+                            has_explicit_hw = True
                         elif "Action_Slot_Transform" in p.get("type", ""):
                             height, width = 256, 768
                             is_video = True
+                            use_uint8 = True
+                            has_explicit_hw = True
 
     model_cfg = getattr(cfg, "model", {})
     if isinstance(model_cfg, dict):
@@ -109,8 +114,11 @@ def _synthesize_dummy_input(model: nn.Module, cfg: Any, device: torch.device) ->
             res = model_cfg["resolution3d"]
             if isinstance(res, (list, tuple)) and len(res) >= 3:
                 seq_len = int(res[0])
-                height = int(res[1]) * 32
-                width = int(res[2]) * 32
+                if not has_explicit_hw:
+                    bb_type = str(model_cfg.get("backbone_type", "")).lower()
+                    spatial_stride = 16 if bb_type in ("yolo", "yolov11", "yolo11") else 32
+                    height = int(res[1]) * spatial_stride
+                    width = int(res[2]) * spatial_stride
                 is_video = True
                 use_uint8 = True
 

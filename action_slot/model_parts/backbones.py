@@ -285,7 +285,8 @@ class YoloV11Backbone(BaseBackbone):
         self.p3_proj = nn.Conv2d(64, 256, kernel_size=1, bias=False)
         self.p4_proj = nn.Conv2d(128, 256, kernel_size=1, bias=False)
         self.p4_fuse = nn.Sequential(
-            nn.Conv2d(256, 256, kernel_size=3, padding=1, bias=False),
+            nn.Conv2d(256, 256, kernel_size=3, padding=1, groups=256, bias=False),
+            nn.Conv2d(256, 256, kernel_size=1, bias=False),
             nn.GroupNorm(16, 256),
             nn.SiLU(inplace=True),
         )

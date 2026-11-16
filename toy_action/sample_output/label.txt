@@ -1,6 +1,6 @@
-Label: O+:gotop, T:goleft
+Label: 8+:gobottom, O:goleft
 Mask explanation: 255 = Background, 0 = Foreground Object
 Objects:
-  - {'symbol': 'O', 'action': 'gotop', 'size': 25, 'start_frame': 0, 'speed': 9.80194092500191, 'start_pos': (104, 159)}
-  - {'symbol': 'O', 'action': 'gotop', 'size': 17, 'start_frame': 0, 'speed': 7.4978829230201605, 'start_pos': (146, 127)}
-  - {'symbol': 'T', 'action': 'goleft', 'size': 29, 'start_frame': 0, 'speed': 9.357287733917765, 'start_pos': (176, 108)}
+  - {'symbol': '8', 'action': 'gobottom', 'size': 10, 'start_frame': 0, 'speed': 6.857237650216778, 'start_pos': (95, 18)}
+  - {'symbol': '8', 'action': 'gobottom', 'size': 16, 'start_frame': 2, 'speed': 8.670091530302381, 'start_pos': (22, 13)}
+  - {'symbol': 'O', 'action': 'goleft', 'size': 26, 'start_frame': 3, 'speed': 6.4567306502667074, 'start_pos': (130, 186)}

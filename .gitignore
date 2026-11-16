@@ -14,5 +14,6 @@ work_dirs/
 env/
 .idea/
 .vscode/
+toy_action/sample_output
 toy_action/data
 work_dirs/
