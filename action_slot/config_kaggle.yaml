@@ -27,6 +27,7 @@ model:
   bg_slot: true
   dropout: 0.5
   pretrained_backbone_path: "/kaggle/working/yolo11n.pt"
+  finetune_last_n_stages: 2
 # 2. Dataset Configuration
 # Hỗ trợ cấu hình nhiều data_root dưới dạng danh sách (list) hoặc đường dẫn đơn (str)
 data:
