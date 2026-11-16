@@ -26,7 +26,9 @@ class ActionSlotLoss(nn.Module):
         attention_res=None,
         bce_pos_weight=10,
         num_slots: int = 32,
-        feat_recon_weight: float = 0.5,
+        feat_recon_weight: float = 0.15,
+        action_attn_weight: float = 1.0,
+        bg_attn_weight: float = 0.5,
         device=None,
     ):
         super(ActionSlotLoss, self).__init__()
@@ -39,13 +41,14 @@ class ActionSlotLoss(nn.Module):
         self.bg_mask = True
         self.bg_slot = True
         self.obj_mask = False
-        self.action_attn_weight = 1
-        self.bg_attn_weight = 0.5
+        self.action_attn_weight = float(action_attn_weight)
+        self.bg_attn_weight = float(bg_attn_weight)
 
         self.seq_len = 16
         self.mask_every_frame = 4
         self.bg_upsample = 4
-        if self.attention_res: self.attention_res = (self.attention_res[0] * self.bg_upsample, self.attention_res[1] * self.bg_upsample)
+        if self.attention_res:
+            self.attention_res = (self.attention_res[0] * self.bg_upsample, self.attention_res[1] * self.bg_upsample)
 
         self.device = device
 
@@ -189,53 +192,56 @@ class ActionSlotLoss(nn.Module):
         # Action-slot, background mask + negative mask
         elif self.attn_loss_type == 3:
             b, l, n, h, w = attn.shape
-
-
-            if self.bg_upsample != 1:
+            target_hw = bg_seg.shape[-2:]
+            if (h, w) != target_hw:
                 attn = attn.reshape(-1, 1, h, w)
-                attn = F.interpolate(attn, size=self.attention_res, mode='bilinear')
+                attn = F.interpolate(attn, size=target_hw, mode='bilinear', align_corners=False)
                 _, _, h, w = attn.shape
                 attn = attn.reshape(b, l, n, h, w)
 
             action_attn = attn[:, :, :self.num_slots, :, :]
-            bg_attn = attn[:, ::self.mask_every_frame, -1, :, :].reshape(b, -1, h, w)
+            step = max(1, l // max(1, bg_seg.shape[1]))
+            bg_attn = attn[:, ::step, -1, :, :][:, :bg_seg.shape[1], :, :].reshape(b, -1, h, w)
 
             mask_64 = (label['actor'] == 0.0)  # shape: (B, 64), dtype: torch.bool
-            B = mask_64.shape[0]
-
-            
             c1 = (mask_64[:, 0:24] == 1).any(dim=1)
             c2 = (mask_64[:, 24:48] == 1).any(dim=1)
             c3 = (mask_64[:, 48:64] == 1).any(dim=1)
 
-            
-            class_idx = torch.stack([c1, c2, c3], dim=-1).to(mask_64.dtype) # (B,3)
+            class_idx = torch.stack([c1, c2, c3], dim=-1).to(mask_64.dtype)  # (B, 3)
             class_idx = class_idx.view(b, self.num_slots, 1, 1, 1).repeat(1, 1, l, h, w)
             class_idx = torch.permute(class_idx, (0, 2, 1, 3, 4))
 
             attn_gt = torch.zeros([b, l, self.num_slots, h, w], dtype=torch.float32, device=action_attn.device)
-            
+
             if class_idx.any():
-                attn_loss = self.obj_bce(action_attn[class_idx].clamp(1e-6, 1.0 - 1e-6), attn_gt[class_idx])
+                attn_loss = self.action_attn_weight * self.obj_bce(
+                    action_attn[class_idx].clamp(1e-6, 1.0 - 1e-6),
+                    attn_gt[class_idx],
+                )
             else:
                 attn_loss = action_attn.sum() * 0.0
             bg_attn_loss = self.obj_bce(bg_attn.clamp(1e-6, 1.0 - 1e-6), bg_seg.clamp(0.0, 1.0))
         # background mask only
         elif self.attn_loss_type == 4:
             b, l, n, h, w = attn.shape
-
-            if self.bg_upsample != 1:
+            target_hw = bg_seg.shape[-2:]
+            if (h, w) != target_hw:
                 attn = attn.reshape(-1, 1, h, w)
-                attn = F.interpolate(attn, size=self.attention_res, mode='bilinear')
+                attn = F.interpolate(attn, size=target_hw, mode='bilinear', align_corners=False)
                 _, _, h, w = attn.shape
                 attn = attn.reshape(b, l, n, h, w)
 
-            bg_attn = attn[:, ::self.mask_every_frame, -1, :, :].reshape(b, l//self.mask_every_frame, h, w)
+            step = max(1, l // max(1, bg_seg.shape[1]))
+            bg_attn = attn[:, ::step, -1, :, :][:, :bg_seg.shape[1], :, :].reshape(b, -1, h, w)
             bg_attn_loss = self.obj_bce(bg_attn.clamp(1e-6, 1.0 - 1e-6), bg_seg.clamp(0.0, 1.0))
-            loss = {'bg_attn_loss': 0.5 * bg_attn_loss}
-            return loss
+            return {'loss_bg_attn': self.bg_attn_weight * bg_attn_loss}
 
-        loss = {'attn_loss':attn_loss,'bg_attn_loss': 0.5 * bg_attn_loss}
+        loss = {}
+        if attn_loss is not None:
+            loss['loss_attn_suppress'] = attn_loss
+        if bg_attn_loss is not None:
+            loss['loss_bg_attn'] = self.bg_attn_weight * bg_attn_loss
 
         if validate:
             loss['action_inter'] = None
@@ -243,7 +249,7 @@ class ActionSlotLoss(nn.Module):
             loss['bg_inter'] = None
             loss['bg_union'] = None
 
-            if action_attn is not None:
+            if action_attn is not None and class_idx.any():
                 action_attn_pred = action_attn[class_idx] > 0.5
                 inter, union = inter_and_union(action_attn_pred.reshape(-1, h, w), attn_gt[class_idx].reshape(-1, h, w), 1, 0)
                 loss['action_inter'] = inter
@@ -298,14 +304,18 @@ class ActionSlotLoss(nn.Module):
 
 
 
-        ego_loss = self.ego_loss(pred['ego'],label['ego'])
-        actor_loss = self.actor_loss(pred['actor'],label['actor'])
+        ego_loss = self.ego_loss(pred['ego'], label['ego'])
+        actor_loss = self.actor_loss(pred['actor'], label['actor'])
         feat_recon_loss = self.feat_recon_loss(pred.get('recon_feats'), pred.get('target_feats'))
-        # attention_loss = self.attn_loss(pred['attn'],label,validate)
+        attention_loss = {}
+        if pred.get('attn') is not None and isinstance(label, dict) and 'bg_seg' in label:
+            attention_loss = self.attn_loss(pred['attn'], label, validate)
 
         loss = {"loss_ego": 0.5 * ego_loss, "loss_actor": actor_loss}
         if feat_recon_loss is not None:
             loss["loss_feat_recon"] = feat_recon_loss
-        # loss |= attention_loss
+        for k, v in attention_loss.items():
+            if v is not None and "loss" in k:
+                loss[k] = v
 
         return loss

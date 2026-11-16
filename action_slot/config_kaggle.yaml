@@ -26,7 +26,9 @@ model:
   ego_c: 128
   bg_slot: true
   use_feat_recon: true
-  feat_recon_weight: 0.5
+  feat_recon_weight: 0.15
+  action_attn_weight: 1.0
+  bg_attn_weight: 0.5
   dropout: 0.5
   bce_pos_weight: 5.0
   resolution3d: [16, 16, 48]
@@ -116,5 +118,6 @@ train_cfg:
   max_epochs: 100
   val_interval: 10                           # Đánh giá validation và tính mAP mỗi 10 epochs
   log_interval: 2500                        # In log tiến trình mỗi 2500 batches
-  grad_clip: null                           # Không clip gradient (đồng bộ với D:\v7\Action-slot)
+  grad_clip: 1.0
+  accumulate: 2
   use_amp: false                            # Chạy FP32 chính xác cao

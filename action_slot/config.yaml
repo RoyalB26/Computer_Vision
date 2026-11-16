@@ -25,7 +25,11 @@ model:
   ego_c: 128
   bg_slot: true
   use_feat_recon: true
-  feat_recon_weight: 0.5
+  feat_recon_weight: 0.15
+  action_attn_weight: 1.0
+  bg_attn_weight: 0.5
+  mamba_grad_scale: 1.0
+  backbone_grad_scale: 1.0
   resolution3d: [16, 16, 48]
   dropout: 0.5
   finetune_last_n_stages: 2  # Chỉ fine-tune 2 stage cuối của backbone (đặt unfreeze_all: true nếu muốn mở toàn bộ như v7)
@@ -111,5 +115,6 @@ train_cfg:
   max_epochs: 1
   val_interval: 1                           # Đánh giá validation và tính mAP ở MỌI epoch để tracking liên tục
   log_interval: 2500                        # In log tiến trình mỗi 2500 batches
-  grad_clip: null                           # Không clip gradient (đồng bộ với D:\v7\Action-slot)
+  grad_clip: 1.0
+  accumulate: 4                             # Hiệu dụng batch = 2 * 4 = 8 để ổn định gradient
   use_amp: false                            # Chạy FP32 chính xác cao

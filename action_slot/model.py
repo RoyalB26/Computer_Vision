@@ -169,7 +169,7 @@ class ActionSlotModel(BaseModel):
 
         # DINOSAUR-style Spatial Broadcast Feature Decoder
         self.use_feat_recon = bool(kwargs.get("use_feat_recon", True))
-        feat_recon_weight = float(kwargs.get("feat_recon_weight", 0.5))
+        feat_recon_weight = float(kwargs.get("feat_recon_weight", 0.15))
         if self.use_feat_recon:
             self.feat_decoder = SpatialBroadcastFeatureDecoder(
                 slot_dim=self.slot_dim,
@@ -187,6 +187,8 @@ class ActionSlotModel(BaseModel):
             bce_pos_weight=bce_pos_weight,
             num_slots=self.num_slots,
             feat_recon_weight=feat_recon_weight if self.use_feat_recon else 0.0,
+            action_attn_weight=float(kwargs.get("action_attn_weight", 1.0)),
+            bg_attn_weight=float(kwargs.get("bg_attn_weight", 0.5)),
         )
 
         # Mamba operates strictly over the S object slots (excluding bg_slot)
@@ -198,7 +200,7 @@ class ActionSlotModel(BaseModel):
         )
         self.mamba = Mamba(mambaCfg)
         self.temporal_pool = str(kwargs.get("temporal_pool", "last_mean")).lower()
-        self.mamba_grad_scale = float(kwargs.get("mamba_grad_scale", 10.0))
+        self.mamba_grad_scale = float(kwargs.get("mamba_grad_scale", 1.0))
         self.backbone_grad_scale = float(kwargs.get("backbone_grad_scale", 1.0))
 
     def init_weights(self) -> None:
@@ -257,7 +259,7 @@ class ActionSlotModel(BaseModel):
         target_feats = None
         if compute_recon and self.feat_decoder is not None:
             recon_feats, _ = self.feat_decoder(slots_seq_all, new_h, new_w)
-            target_feats = x_vis_5d.detach()
+            target_feats = F.layer_norm(x_vis_5d.detach(), (self.slot_dim,))
 
         # 5. Mamba temporal modeling over object slots: (B, T, S, slot_dim)
         if self.training and obj_slots.requires_grad and self.mamba_grad_scale != 1.0:
