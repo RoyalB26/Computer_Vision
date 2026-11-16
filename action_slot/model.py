@@ -290,7 +290,6 @@ class ActionSlotModel(BaseModel):
 
         if ego_x is not None:
             ego_x = self.drop(ego_x)
-        slots = self.drop(slots)
 
         aux_preds = {
             "recon_feats": recon_feats,

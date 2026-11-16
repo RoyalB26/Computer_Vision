@@ -33,7 +33,7 @@ model:
   bce_pos_weight: 5.0
   resolution3d: [16, 16, 48]
   mamba_grad_scale: 1.0
-  backbone_grad_scale: 1.0
+  backbone_grad_scale: 0.5
   pretrained_backbone: true
   pretrained_backbone_path: "/kaggle/working/yolo11n.pt"
   finetune_last_n_stages: 2
