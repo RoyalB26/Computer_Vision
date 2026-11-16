@@ -234,9 +234,6 @@ class ActionSlotModel(BaseModel):
 
         # 1. Backbone feature extraction: (B, C, T_feat, H_feat, W_feat)
         feats = self.backbone(videos)
-        if self.training and feats.requires_grad and self.backbone_grad_scale != 1.0:
-            b_scale = self.backbone_grad_scale
-            feats.register_hook(lambda grad: grad * b_scale)
 
         # 2. Ego feature branch (attenuates gradient pull back into backbone)
         ego_x = None
@@ -254,8 +251,14 @@ class ActionSlotModel(BaseModel):
         new_seq_len = feats.shape[2]
         new_h, new_w = feats.shape[3], feats.shape[4]
 
-        # 3. Project to slot dimension: (B, T_feat, H_feat, W_feat, slot_dim)
-        x_vis = self.conv3d(feats)
+        # 3. Project to slot dimension (decouple slot->backbone gradient scale from ego branch)
+        slot_in = feats
+        if self.training and feats.requires_grad:
+            if self.backbone_grad_scale == 0.0:
+                slot_in = feats.detach()
+            elif self.backbone_grad_scale != 1.0:
+                slot_in = _ScaleGrad.apply(feats, self.backbone_grad_scale)
+        x_vis = self.conv3d(slot_in)
         x_vis_5d = x_vis.permute(0, 2, 3, 4, 1).contiguous()
         x = x_vis + build_2d_sincos_position_embedding(
             new_h, new_w, self.slot_dim, device=x_vis.device, dtype=x_vis.dtype

@@ -26,17 +26,17 @@ model:
   ego_c: 128
   bg_slot: true
   use_feat_recon: true
-  feat_recon_weight: 0.25
+  feat_recon_weight: 0.15
   action_attn_weight: 1.0
   bg_attn_weight: 0.5
   dropout: 0.5
   bce_pos_weight: 5.0
   use_class_pos_weight: true
   resolution3d: [16, 16, 48]
-  mamba_grad_scale: 1.0
-  backbone_grad_scale: 0.25
+  mamba_grad_scale: 5.0
+  backbone_grad_scale: 1.0
   ego_loss_weight: 0.2
-  ego_backbone_grad_scale: 0.1
+  ego_backbone_grad_scale: 0.05
   pretrained_backbone: true
   pretrained_backbone_path: "/kaggle/working/yolo11n.pt"
   finetune_last_n_stages: 2
@@ -54,6 +54,7 @@ data:
       seed: 42
       pipeline:
         - type: "Action_Slot_Transform"
+          photometric_aug: true
     batch_size: 8
     shuffle: true
     num_workers: 2          # Kaggle có 4 vCPU; accelerate chạy 2 rank -> 2 worker/rank = 4 worker tổng (tránh tranh chấp CPU)
@@ -81,6 +82,13 @@ data:
 optimizer:
   type: "AdamW"
   lr: 0.0005
+  weight_decay: 0.07
+
+# 4. Learning Rate Scheduler Configuration
+lr_scheduler:
+  type: "CosineAnnealingLR"
+  T_max: 100
+  eta_min: 0.00001
 
 
 # 5. Evaluation Metrics Configuration
@@ -119,7 +127,7 @@ hooks:
 # 7. Training Engine Configuration
 train_cfg:
   max_epochs: 100
-  val_interval: 10                           # Đánh giá validation và tính mAP mỗi 10 epochs
+  val_interval: 5                           # Đánh giá validation và tính mAP mỗi 10 epochs
   log_interval: 2500                        # In log tiến trình mỗi 2500 batches
   grad_clip: 1.0
   accumulate: 2

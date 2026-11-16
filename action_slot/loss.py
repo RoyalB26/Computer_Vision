@@ -219,10 +219,10 @@ class ActionSlotLoss(nn.Module):
             step = max(1, l // max(1, bg_seg.shape[1]))
             bg_attn = attn[:, ::step, -1, :, :][:, :bg_seg.shape[1], :, :].reshape(b, -1, h, w)
 
-            mask_64 = (label['actor'] == 0.0)  # shape: (B, 64), dtype: torch.bool
-            c1 = (mask_64[:, 0:24] == 1).any(dim=1)
-            c2 = (mask_64[:, 24:48] == 1).any(dim=1)
-            c3 = (mask_64[:, 48:64] == 1).any(dim=1)
+            mask_64 = (label['actor'] == 0.0)  # shape: (B, 64), True where class is absent
+            c1 = mask_64[:, 0:24].all(dim=1)   # Suppress Car slot only when ALL car classes are 0
+            c2 = mask_64[:, 24:48].all(dim=1)  # Suppress Bike slot only when ALL bike classes are 0
+            c3 = mask_64[:, 48:64].all(dim=1)  # Suppress Ped slot only when ALL ped classes are 0
 
             class_idx = torch.stack([c1, c2, c3], dim=-1).to(mask_64.dtype)  # (B, 3)
             class_idx = class_idx.view(b, self.num_slots, 1, 1, 1).repeat(1, 1, l, h, w)

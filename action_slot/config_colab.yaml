@@ -31,7 +31,7 @@ model:
   mamba_grad_scale: 1.0
   backbone_grad_scale: 1.0
   ego_loss_weight: 0.2
-  ego_backbone_grad_scale: 0.1
+  ego_backbone_grad_scale: 0.05
   bce_pos_weight: 5.0
   use_class_pos_weight: true
   dropout: 0.5
@@ -50,6 +50,7 @@ data:
       seed: 42
       pipeline:
         - type: "Action_Slot_Transform"
+          photometric_aug: true
     batch_size: 4
     shuffle: true
     num_workers: 12
@@ -73,6 +74,12 @@ optimizer:
   type: "AdamW"
   lr: 0.0005
   weight_decay: 0.07
+
+# 4. Learning Rate Scheduler Configuration
+lr_scheduler:
+  type: "CosineAnnealingLR"
+  T_max: 100
+  eta_min: 0.00001
 
 
 # 5. Evaluation Metrics Configuration

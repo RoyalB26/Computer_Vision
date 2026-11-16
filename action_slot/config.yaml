@@ -31,7 +31,7 @@ model:
   mamba_grad_scale: 1.0
   backbone_grad_scale: 1.0
   ego_loss_weight: 0.2
-  ego_backbone_grad_scale: 0.1
+  ego_backbone_grad_scale: 0.05
   bce_pos_weight: 5.0
   use_class_pos_weight: true
   resolution3d: [16, 16, 48]
@@ -52,6 +52,7 @@ data:
       seed: 42
       pipeline:
         - type: "Action_Slot_Transform"
+          photometric_aug: true
     batch_size: 2
     shuffle: true
     num_workers: 0
@@ -77,9 +78,11 @@ optimizer:
   lr: 0.0005
   weight_decay: 0.07
 
-# 4. Learning Rate Scheduler Configuration (Đồng bộ chuẩn xác với D:\v7\Action-slot: tăng x1.1 mỗi epoch trong 11 epoch đầu, sau đó giảm theo 0.7^(epoch//3))
+# 4. Learning Rate Scheduler Configuration
 lr_scheduler:
-  type: "TACOLRScheduler"
+  type: "CosineAnnealingLR"
+  T_max: 100
+  eta_min: 0.00001
 
 # 5. Evaluation Metrics Configuration
 metrics:
