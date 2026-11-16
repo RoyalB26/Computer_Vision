@@ -66,6 +66,67 @@ def build_2d_sincos_position_embedding(H: int, W: int, embed_dim: int, device=No
     pos_emb = pos_emb.view(H, W, embed_dim).permute(2, 0, 1).unsqueeze(0)
     return pos_emb
 
+
+class TemporalDifferenceBlock(nn.Module):
+    """Bidirectional temporal-difference motion encoder for 5D volumes `(B, C, T, H, W)`.
+
+    Computes backward (`x_t - x_{t-1}`) and forward (`x_{t+1} - x_t`) feature differences,
+    mixes local spatial displacements and short-range temporal consistency via separable
+    (2+1)D depthwise-pointwise convolutions, and fuses back via a scaled residual branch.
+    """
+
+    def __init__(self, channels: int, spatial_kernel: int = 3, temporal_kernel: int = 3):
+        super().__init__()
+        self.channels = channels
+        sp_pad = spatial_kernel // 2
+        t_pad = temporal_kernel // 2
+        num_groups = math.gcd(channels, 16)
+
+        self.diff_proj = nn.Conv3d(channels * 2, channels, kernel_size=1, bias=False)
+        self.spatial_dw = nn.Conv3d(
+            channels,
+            channels,
+            kernel_size=(1, spatial_kernel, spatial_kernel),
+            padding=(0, sp_pad, sp_pad),
+            groups=channels,
+            bias=False,
+        )
+        self.temporal_dw = nn.Conv3d(
+            channels,
+            channels,
+            kernel_size=(temporal_kernel, 1, 1),
+            padding=(t_pad, 0, 0),
+            groups=channels,
+            bias=False,
+        )
+        self.pw_fuse = nn.Sequential(
+            nn.GroupNorm(num_groups=num_groups, num_channels=channels),
+            nn.SiLU(inplace=True),
+            nn.Conv3d(channels, channels, kernel_size=1, bias=False),
+            nn.GroupNorm(num_groups=num_groups, num_channels=channels),
+        )
+        self.gamma = nn.Parameter(torch.full((1, channels, 1, 1, 1), 0.25))
+
+    @staticmethod
+    def _compute_bidirectional_diff(x: Tensor) -> Tensor:
+        """Compute `[x_t - x_{t-1}, x_{t+1} - x_t]` with zero-padded temporal boundaries."""
+        if x.shape[2] <= 1:
+            zeros = torch.zeros_like(x)
+            return torch.cat([zeros, zeros], dim=1)
+
+        delta = x[:, :, 1:] - x[:, :, :-1]
+        bwd = F.pad(delta, (0, 0, 0, 0, 1, 0))
+        fwd = F.pad(delta, (0, 0, 0, 0, 0, 1))
+        return torch.cat([bwd, fwd], dim=1)
+
+    def forward(self, x: Tensor) -> Tensor:
+        diffs = self._compute_bidirectional_diff(x)
+        motion = self.diff_proj(diffs)
+        motion = self.spatial_dw(motion)
+        motion = self.temporal_dw(motion)
+        motion = self.pw_fuse(motion)
+        return x + self.gamma * motion
+
 @MODELS.register_module(name="ActionSlotModel")
 class ActionSlotModel(BaseModel):
     """Spatiotemporal Action-Slot model.
@@ -115,6 +176,10 @@ class ActionSlotModel(BaseModel):
         )
         in_c = self.backbone.out_channels
 
+        self.use_temporal_diff = bool(kwargs.get("use_temporal_diff", True))
+        td_spatial_kernel = int(kwargs.get("td_spatial_kernel", 3))
+        td_temporal_kernel = int(kwargs.get("td_temporal_kernel", 3))
+
         # 2. Ego Feature Branch
         if self.num_ego_class > 0:
             self.conv3d_ego = nn.Sequential(
@@ -122,9 +187,19 @@ class ActionSlotModel(BaseModel):
                 nn.BatchNorm3d(in_c),
                 nn.Conv3d(in_c, self.ego_c, (1, 1, 1), stride=1),
             )
+            self.ego_temporal_diff = (
+                TemporalDifferenceBlock(
+                    channels=self.ego_c,
+                    spatial_kernel=td_spatial_kernel,
+                    temporal_kernel=td_temporal_kernel,
+                )
+                if self.use_temporal_diff
+                else None
+            )
             self.pool_ego = nn.AdaptiveAvgPool3d(output_size=1)
         else:
             self.conv3d_ego = None
+            self.ego_temporal_diff = None
             self.pool_ego = None
 
         # 3. Spatiotemporal Feature Projection
@@ -133,6 +208,15 @@ class ActionSlotModel(BaseModel):
             nn.BatchNorm3d(in_c),
             nn.Conv3d(in_c, self.slot_dim, (1, 1, 1), stride=1),
             nn.ReLU(),
+        )
+        self.temporal_diff = (
+            TemporalDifferenceBlock(
+                channels=self.slot_dim,
+                spatial_kernel=td_spatial_kernel,
+                temporal_kernel=td_temporal_kernel,
+            )
+            if self.use_temporal_diff
+            else None
         )
 
         # 4. Slot Attention
@@ -245,6 +329,8 @@ class ActionSlotModel(BaseModel):
                 elif self.ego_backbone_grad_scale != 1.0:
                     ego_in = _ScaleGrad.apply(feats, self.ego_backbone_grad_scale)
             ego_feat = self.conv3d_ego(ego_in)
+            if self.ego_temporal_diff is not None:
+                ego_feat = self.ego_temporal_diff(ego_feat)
             ego_feat = self.pool_ego(ego_feat)
             ego_x = torch.reshape(ego_feat, (batch_size, self.ego_c))
 
@@ -259,6 +345,8 @@ class ActionSlotModel(BaseModel):
             elif self.backbone_grad_scale != 1.0:
                 slot_in = _ScaleGrad.apply(feats, self.backbone_grad_scale)
         x_vis = self.conv3d(slot_in)
+        if self.temporal_diff is not None:
+            x_vis = self.temporal_diff(x_vis)
         x_vis_5d = x_vis.permute(0, 2, 3, 4, 1).contiguous()
         x = x_vis + build_2d_sincos_position_embedding(
             new_h, new_w, self.slot_dim, device=x_vis.device, dtype=x_vis.dtype
