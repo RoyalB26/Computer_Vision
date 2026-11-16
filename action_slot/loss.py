@@ -172,7 +172,10 @@ class ActionSlotLoss(nn.Module):
             class_idx = torch.permute(class_idx, (0, 2, 1, 3, 4))
 
             attn_gt = torch.zeros([b, l, self.num_actor_class, h, w], dtype=torch.float32, device=action_attn.device)
-            attn_loss = self.obj_bce(action_attn[class_idx], attn_gt[class_idx])
+            if class_idx.any():
+                attn_loss = self.obj_bce(action_attn[class_idx].clamp(1e-6, 1.0 - 1e-6), attn_gt[class_idx])
+            else:
+                attn_loss = action_attn.sum() * 0.0
 
         # Action-slot, background mask + negative mask
         elif self.attn_loss_type == 3:
@@ -203,8 +206,11 @@ class ActionSlotLoss(nn.Module):
 
             attn_gt = torch.zeros([b, l, self.num_slots, h, w], dtype=torch.float32, device=action_attn.device)
             
-            attn_loss = self.obj_bce(action_attn[class_idx], attn_gt[class_idx])
-            bg_attn_loss = self.obj_bce(bg_attn, bg_seg)
+            if class_idx.any():
+                attn_loss = self.obj_bce(action_attn[class_idx].clamp(1e-6, 1.0 - 1e-6), attn_gt[class_idx])
+            else:
+                attn_loss = action_attn.sum() * 0.0
+            bg_attn_loss = self.obj_bce(bg_attn.clamp(1e-6, 1.0 - 1e-6), bg_seg.clamp(0.0, 1.0))
         # background mask only
         elif self.attn_loss_type == 4:
             b, l, n, h, w = attn.shape
@@ -216,7 +222,7 @@ class ActionSlotLoss(nn.Module):
                 attn = attn.reshape(b, l, n, h, w)
 
             bg_attn = attn[:, ::self.mask_every_frame, -1, :, :].reshape(b, l//self.mask_every_frame, h, w)
-            bg_attn_loss = self.obj_bce(bg_attn, bg_seg)
+            bg_attn_loss = self.obj_bce(bg_attn.clamp(1e-6, 1.0 - 1e-6), bg_seg.clamp(0.0, 1.0))
             loss = {'bg_attn_loss': 0.5 * bg_attn_loss}
             return loss
 

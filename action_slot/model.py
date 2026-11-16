@@ -175,6 +175,17 @@ class ActionSlotModel(BaseModel):
         self.mamba_grad_scale = float(kwargs.get("mamba_grad_scale", 10.0))
         self.backbone_grad_scale = float(kwargs.get("backbone_grad_scale", 1.0))
 
+    def init_weights(self) -> None:
+        """Preserve pretrained backbone weights and submodule-specific initializations.
+
+        BaseModel.scripts.train invokes `model.init_weights()` after `build_model()`,
+        whose default implementation in `BaseModel` overwrites Conv2d/BatchNorm2d/Linear
+        parameters (wiping pretrained backbones while leaving pretrained BN running stats
+        intact, causing activation explosion in frozen BN layers). Each submodule already
+        initializes itself during `__init__`.
+        """
+        return None
+
 
     def extract_features(
         self,
@@ -239,7 +250,7 @@ class ActionSlotModel(BaseModel):
         if seq_len > new_seq_len:
             attn_flat = attn_masks.permute(0, 2, 1, 3, 4).reshape(b * actual_slots, 1, new_seq_len, new_h, new_w)
             attn_up = F.interpolate(attn_flat, size=(seq_len, new_h, new_w), mode="trilinear", align_corners=False)
-            attn_masks = attn_up.view(b, actual_slots, seq_len, new_h, new_w).permute(0, 2, 1, 3, 4)
+            attn_masks = attn_up.view(b, actual_slots, seq_len, new_h, new_w).permute(0, 2, 1, 3, 4).clamp(0.0, 1.0)
 
 
         return slots, ego_x, attn_masks
