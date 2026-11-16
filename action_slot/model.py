@@ -67,6 +67,111 @@ def build_2d_sincos_position_embedding(H: int, W: int, embed_dim: int, device=No
     return pos_emb
 
 
+class PanoramicRayPositionEncoding(nn.Module):
+    """Camera-ray & panoramic spherical positional encoding with ground-plane depth proxy.
+
+    Combines:
+      1. Multi-frequency spherical sin-cos bands over azimuth `theta` and elevation `phi`.
+      2. A learnable projection of 7D camera-ray & road-horizon geometry:
+         `[ray_x, ray_y, ray_z, theta_norm, phi_norm, ground_inv_depth, ground_log_depth]`.
+    Output shape: `(1, embed_dim, H, W)`.
+    """
+
+    def __init__(
+        self,
+        embed_dim: int,
+        hfov_deg: float = 180.0,
+        vfov_deg: float = 60.0,
+        horizon_ratio: float = 0.45,
+        default_hw: Optional[Tuple[int, int]] = None,
+    ):
+        super().__init__()
+        assert embed_dim % 4 == 0, f"embed_dim ({embed_dim}) phải chia hết cho 4."
+        self.embed_dim = embed_dim
+        self.hfov_rad = math.radians(float(hfov_deg))
+        self.vfov_rad = math.radians(float(vfov_deg))
+        self.horizon_ratio = float(horizon_ratio)
+
+        hidden_dim = max(64, embed_dim // 2)
+        num_groups = math.gcd(embed_dim, 16)
+        self.ray_mlp = nn.Sequential(
+            nn.Conv2d(7, hidden_dim, kernel_size=1, bias=True),
+            nn.SiLU(inplace=True),
+            nn.Conv2d(hidden_dim, embed_dim, kernel_size=1, bias=False),
+            nn.GroupNorm(num_groups=num_groups, num_channels=embed_dim),
+        )
+        self.ray_scale = nn.Parameter(torch.full((1, embed_dim, 1, 1), 0.25))
+
+        if default_hw is not None:
+            sincos, geom = self._build_spherical_grid(default_hw[0], default_hw[1], device=None, dtype=torch.float32)
+            self.register_buffer("_cached_sincos", sincos, persistent=False)
+            self.register_buffer("_cached_geom", geom, persistent=False)
+        else:
+            self._cached_sincos = None
+            self._cached_geom = None
+
+    def _build_spherical_grid(
+        self, H: int, W: int, device=None, dtype: torch.dtype = torch.float32
+    ) -> Tuple[Tensor, Tensor]:
+        """Construct spherical sin-cos embedding `(1, D, H, W)` and 7D ray geometry `(1, 7, H, W)`."""
+        u = ((torch.arange(W, device=device, dtype=dtype) + 0.5) / float(W)) * 2.0 - 1.0  # [-1, 1]
+        v = ((torch.arange(H, device=device, dtype=dtype) + 0.5) / float(H)) * 2.0 - 1.0  # [-1, 1]
+        v_01 = (torch.arange(H, device=device, dtype=dtype) + 0.5) / float(H)  # [0, 1]
+
+        theta_1d = u * (0.5 * self.hfov_rad)
+        phi_1d = v * (0.5 * self.vfov_rad)
+        phi, theta = torch.meshgrid(phi_1d, theta_1d, indexing="ij")
+        v_grid, u_grid = torch.meshgrid(v_01, u, indexing="ij")
+        v_signed, _ = torch.meshgrid(v, u, indexing="ij")
+
+        # Multi-frequency spherical sin-cos encoding
+        dim_per_axis = self.embed_dim // 2
+        num_bands = dim_per_axis // 2
+        freq_theta = torch.logspace(
+            0.0, math.log2(max(float(W), 16.0)), steps=num_bands, base=2.0, device=device, dtype=dtype
+        )
+        freq_phi = torch.logspace(
+            0.0, math.log2(max(float(H), 16.0)), steps=num_bands, base=2.0, device=device, dtype=dtype
+        )
+        ang_theta = theta.reshape(-1, 1) * freq_theta.unsqueeze(0)
+        ang_phi = phi.reshape(-1, 1) * freq_phi.unsqueeze(0)
+        emb_theta = torch.cat([torch.sin(ang_theta), torch.cos(ang_theta)], dim=-1)
+        emb_phi = torch.cat([torch.sin(ang_phi), torch.cos(ang_phi)], dim=-1)
+        sincos = torch.cat([emb_theta, emb_phi], dim=-1).view(H, W, self.embed_dim).permute(2, 0, 1).unsqueeze(0)
+
+        # 3D camera unit ray + flat-ground perspective depth proxies relative to horizon
+        cos_phi = torch.cos(phi)
+        ray_x = torch.sin(theta) * cos_phi
+        ray_y = torch.sin(phi)
+        ray_z = torch.cos(theta) * cos_phi
+
+        dy_below = F.relu(v_grid - self.horizon_ratio)
+        ground_inv_depth = dy_below / max(1.0 - self.horizon_ratio, 1e-4)
+        ground_log_depth = torch.log1p(1.0 / (dy_below + 0.05)) / math.log1p(20.0)
+
+        geom = torch.stack(
+            [ray_x, ray_y, ray_z, u_grid, v_signed, ground_inv_depth, ground_log_depth],
+            dim=0,
+        ).unsqueeze(0)
+        return sincos, geom
+
+    def forward(self, H: int, W: int, device=None, dtype: torch.dtype = torch.float32) -> Tensor:
+        if (
+            self._cached_sincos is not None
+            and self._cached_geom is not None
+            and self._cached_sincos.shape[2:] == (H, W)
+        ):
+            sincos = self._cached_sincos.to(device=device, dtype=dtype)
+            geom = self._cached_geom.to(device=device, dtype=self.ray_mlp[0].weight.dtype)
+        else:
+            sincos, geom = self._build_spherical_grid(H, W, device=device, dtype=torch.float32)
+            sincos = sincos.to(dtype=dtype)
+            geom = geom.to(dtype=self.ray_mlp[0].weight.dtype)
+
+        ray_emb = self.ray_mlp(geom).to(dtype=dtype)
+        return sincos + self.ray_scale.to(dtype=dtype) * ray_emb
+
+
 class TemporalDifferenceBlock(nn.Module):
     """Bidirectional temporal-difference motion encoder for 5D volumes `(B, C, T, H, W)`.
 
@@ -218,6 +323,18 @@ class ActionSlotModel(BaseModel):
             if self.use_temporal_diff
             else None
         )
+        self.use_ray_pe = bool(kwargs.get("use_ray_pe", True))
+        self.ray_pos_enc = (
+            PanoramicRayPositionEncoding(
+                embed_dim=self.slot_dim,
+                hfov_deg=float(kwargs.get("ray_hfov_deg", 180.0)),
+                vfov_deg=float(kwargs.get("ray_vfov_deg", 60.0)),
+                horizon_ratio=float(kwargs.get("ray_horizon_ratio", 0.45)),
+                default_hw=(int(resolution3d[1]), int(resolution3d[2])),
+            )
+            if self.use_ray_pe
+            else None
+        )
 
         # 4. Slot Attention
         actual_slots = self.num_slots + 1 if bg_slot else self.num_slots
@@ -348,9 +465,13 @@ class ActionSlotModel(BaseModel):
         if self.temporal_diff is not None:
             x_vis = self.temporal_diff(x_vis)
         x_vis_5d = x_vis.permute(0, 2, 3, 4, 1).contiguous()
-        x = x_vis + build_2d_sincos_position_embedding(
-            new_h, new_w, self.slot_dim, device=x_vis.device, dtype=x_vis.dtype
-        ).unsqueeze(2)
+        if self.ray_pos_enc is not None:
+            pos_emb = self.ray_pos_enc(new_h, new_w, device=x_vis.device, dtype=x_vis.dtype)
+        else:
+            pos_emb = build_2d_sincos_position_embedding(
+                new_h, new_w, self.slot_dim, device=x_vis.device, dtype=x_vis.dtype
+            )
+        x = x_vis + pos_emb.unsqueeze(2)
         x = x.permute(0, 2, 3, 4, 1).contiguous()  # (B, T, H, W, slot_dim)
 
         # 4. Per-frame Slot Attention -> (B, T, actual_slots, slot_dim)
