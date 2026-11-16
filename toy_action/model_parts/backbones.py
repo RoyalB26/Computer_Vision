@@ -455,15 +455,20 @@ class YoloV11Backbone(BaseBackbone):
         fused = p4_feat + p5_up + 0.5 * self.p3_proj(p3_down)
         return p4_feat + self.p4_fuse(fused)
 
-    def forward(self, x: Union[List[torch.Tensor], torch.Tensor]) -> torch.Tensor:
-        """Forward pass extracting P4-resolution fused feature map (pushing P5 semantics into P4).
+    def forward(
+        self,
+        x: Union[List[torch.Tensor], torch.Tensor],
+        return_multiscale: bool = False,
+    ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+        """Forward pass extracting P4 fused feature map (and optional high-res P3 for deformable sampling).
 
         Args:
             x: Input video tensor of shape (B, C=3, T=16, H=224, W=224)
                or (B, T=16, C=3, H=224, W=224), or list of T frames.
+            return_multiscale: If True, also return projected P3 5D features (B, 256, T, 28, 28).
 
         Returns:
-            torch.Tensor: Spatiotemporal feature volume of shape (B, C=256, T=16, H=14, W=14).
+            torch.Tensor or (p4_5d, p3_5d) when return_multiscale=True.
         """
         if isinstance(x, list):
             # List of T * (B, C, H, W) -> (B, C, T, H, W)
@@ -473,7 +478,10 @@ class YoloV11Backbone(BaseBackbone):
             # Single image or already flat batch of frames: (B, C, H, W)
             feat4, feat6, feat10 = self.backbone(x)
             p3, p4, p5 = self.neck(feat4, feat6, feat10)
-            return self._fuse_neck_features(p3, p4, p5)
+            p4_fused = self._fuse_neck_features(p3, p4, p5)
+            if return_multiscale:
+                return p4_fused, self.p3_proj(p3)
+            return p4_fused
 
         if x.dim() != 5:
             raise ValueError(f"Expected 4D or 5D tensor, got {x.dim()}D tensor with shape {x.shape}")
@@ -495,6 +503,11 @@ class YoloV11Backbone(BaseBackbone):
         # Reshape back to 5D spatiotemporal volume: (B, C=256, T=16, H=14, W=14)
         _, c_out, h_out, w_out = p4_fused.shape
         p4_5d = p4_fused.reshape(b, t, c_out, h_out, w_out).permute(0, 2, 1, 3, 4).contiguous()
+        if return_multiscale:
+            p3_proj = self.p3_proj(p3)
+            _, c_p3, h_p3, w_p3 = p3_proj.shape
+            p3_5d = p3_proj.reshape(b, t, c_p3, h_p3, w_p3).permute(0, 2, 1, 3, 4).contiguous()
+            return p4_5d, p3_5d
         return p4_5d
 
 

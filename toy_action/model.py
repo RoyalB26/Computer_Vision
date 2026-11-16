@@ -1,14 +1,14 @@
 """Model module for Toy Action Video Recognition.
 
 Implements:
-1. ActionSlotModel: Advanced Spatio-Temporal Slot Attention model with X3D backbone,
-   adapted from action_slot for the 48-class toy_action benchmark.
+1. DeformableMambaActionModel: Spatiotemporal model using Backbone (P4+P3) ->
+   DeformableFeatureHead (10x10 output map) -> Flatten 100 spatial tokens + 2D PosEmb ->
+   Mamba temporal modeling -> MambaActionHead (48-class multi-label action prediction).
 2. ToyActionNet: Lightweight Conv2D-GRU baseline model.
 3. MultiLabelMetric: Standard multi-label evaluation metric.
 """
 
 from typing import Any, Dict, List, Optional, Tuple, Union
-import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -18,23 +18,19 @@ from BaseModel.core import METRICS, MODELS
 from BaseModel.model import BaseModel
 from BaseModel.utils.metrics.base_metric import BaseMetric
 
-from .dataset import ALL_CLASSES, CLASS_TO_IDX, IDX_TO_CLASS, NUM_CLASSES, SYMBOL_VARIANTS, decode_target
-from .loss import ActionSlotLoss
+from .dataset import IDX_TO_CLASS, NUM_CLASSES
+from .loss import DeformableActionLoss
 from .model_parts.backbones import MoViNetA0Backbone, X3DBackbone, YoloV11Backbone
 from .model_parts.heads import (
-    Allocated_Head,
-    FrameObjectCountHead,
-    ObjectActionHead,
-    ReduceAllocatedHead,
-    SpatialBroadcastFeatureDecoder,
-    VideoObjectClassHead,
+    DeformableFeatureHead,
+    MambaActionHead,
+    build_2d_sincos_position_embedding,
 )
-from .model_parts.slot_attention import SlotAttention
 from .model_parts.Mamba.model import Mamba, MambaConfig
 
 
 class _ScaleGrad(torch.autograd.Function):
-    """Identity in forward pass; scales backward gradients by `scale`."""
+    """Identity in forward pass; scales backward gradients by ``scale``."""
 
     @staticmethod
     def forward(ctx, x: Tensor, scale: float) -> Tensor:
@@ -46,82 +42,41 @@ class _ScaleGrad(torch.autograd.Function):
         return grad_output * ctx.scale, None
 
 
+@MODELS.register_module(name="DeformableMambaActionModel")
+@MODELS.register_module(name="ToyDeformableMambaModel")
+class DeformableMambaActionModel(BaseModel):
+    """Deformable Spatial Attention + Mamba model for Toy Action benchmark.
 
-def build_2d_sincos_position_embedding(H: int, W: int, embed_dim: int, device=None, dtype=torch.float32) -> Tensor:
-    """
-    Tạo 2D Sin-Cos Positional Encoding hoàn toàn bằng PyTorch trên device thích hợp.
-    Output shape: [1, embed_dim, H, W]
-    """
-    assert embed_dim % 4 == 0, f"embed_dim ({embed_dim}) phải chia hết cho 4."
-    dim_per_axis = embed_dim // 2
-    # Tọa độ lưới
-    grid_y, grid_x = torch.meshgrid(
-        torch.arange(H, device=device, dtype=dtype),
-        torch.arange(W, device=device, dtype=dtype),
-        indexing='ij'
-    )
-    grid_x = grid_x.reshape(-1)  # [H * W]
-    grid_y = grid_y.reshape(-1)  # [H * W]
-
-    def get_1d_sincos(grid: Tensor, dim: int) -> Tensor:
-        omega = torch.arange(dim // 2, device=device, dtype=dtype)
-        omega /= (dim / 2.0)
-        omega = 1.0 / (10000.0 ** omega)  # [dim // 2]
-        out = torch.einsum('n, d -> nd', grid, omega)  # [H * W, dim // 2]
-        return torch.cat([torch.sin(out), torch.cos(out)], dim=-1)  # [H * W, dim]
-
-    emb_x = get_1d_sincos(grid_x, dim_per_axis)  # [H * W, dim_per_axis]
-    emb_y = get_1d_sincos(grid_y, dim_per_axis)  # [H * W, dim_per_axis]
-    pos_emb = torch.cat([emb_x, emb_y], dim=-1)  # [H * W, embed_dim]
-    # Đổi về format chuẩn ảnh: [1, embed_dim, H, W]
-    pos_emb = pos_emb.view(H, W, embed_dim).permute(2, 0, 1).unsqueeze(0)
-    return pos_emb
-
-@MODELS.register_module(name="ActionSlotModel")
-@MODELS.register_module(name="ToyActionSlotModel")
-class ActionSlotModel(BaseModel):
-    """Spatiotemporal Action-Slot model adapted for Toy Action benchmark.
-
-    Architecture:
-        1. Backbone: X3D-M video backbone with stage-freezing (e.g. finetune last 2 stages).
-        2. Spatiotemporal Feature Projection: 3D Conv projecting backbone features to slot_dim.
-        3. Slot Attention: 3D iterative clustering into semantic object/action slots.
-        4. Classification Head: ReduceAllocatedHead predicting [single, group+, background]
-           per slot -> 24 slots x 2 = 48 action classes!
-        5. ActionSlotLoss: Multi-task loss supervising slot action and attention masks.
-
-    Args:
-        num_actor_class: Total number of action classes (default: 48).
-        num_slots: Number of semantic action slots (default: 24, corresponding to
-                   6 symbols x 4 actions).
-        slot_dim: Feature dimension for slots (default: 256).
-        bg_slot: Whether to include an extra background slot (default: True).
-        resolution3d: Spatiotemporal feature grid shape (default: (16, 7, 7)).
-        dropout: Dropout rate (default: 0.5).
-        finetune_last_n_stages: Number of final backbone stages to train (default: 2).
+    Pipeline:
+        1. Backbone: YOLOv11 (multi-scale P4 + P3), X3D-M, or MoViNet-A0.
+        2. Projection: 3D 1x1 convolutions projecting map_pred and feat_deform to ``dim``.
+        3. DeformableFeatureHead: Samples deformable features onto a ``10x10`` grid.
+        4. Spatial Flattening + PosEmb: Reshapes ``10x10`` feature map to ``100`` points
+           per frame and adds 2D sin-cos positional embeddings.
+        5. Mamba: Scans each of the ``100`` spatial points across ``T`` frames.
+        6. MambaActionHead: Attentive + max + mean spatial pooling -> 48 action logits.
     """
 
     def __init__(
         self,
         num_actor_class: int = 48,
-        num_slots: int = 6,
         num_ego_class: int = 0,
-        slot_dim: int = 256,
+        dim: int = 256,
         ego_c: int = 128,
-        bg_slot: bool = True,
-        resolution3d: Tuple[int, int, int] = (16, 7, 7),
+        grid_size: Tuple[int, int] = (10, 10),
+        num_heads: int = 4,
+        num_points: int = 4,
         dropout: float = 0.5,
-        **kwargs
+        **kwargs,
     ):
         super().__init__()
-        self.num_actor_class = num_actor_class
-        self.num_slots = num_slots
-        self.num_ego_class = num_ego_class
-        self.slot_dim = slot_dim
-        self.ego_c = ego_c
-        self.bg_slot = bg_slot
-        self.resolution3d = resolution3d
-        self.threshold = kwargs.get("threshold", 0.5)
+        self.num_actor_class = int(num_actor_class)
+        self.num_ego_class = int(num_ego_class)
+        self.dim = int(kwargs.get("slot_dim", dim))
+        self.ego_c = int(ego_c)
+        self.grid_size = (int(grid_size[0]), int(grid_size[1]))
+        self.num_tokens = self.grid_size[0] * self.grid_size[1]  # 10x10 -> 100
+        self.threshold = float(kwargs.get("threshold", 0.5))
 
         finetune_last_n_stages = kwargs.get("finetune_last_n_stages", 2)
         freeze_stages = kwargs.get("freeze_stages", None)
@@ -130,9 +85,10 @@ class ActionSlotModel(BaseModel):
         freeze_bn = kwargs.get("freeze_bn", True)
         pretrained_backbone = kwargs.get("pretrained_backbone", True)
         pretrained_backbone_path = kwargs.get("pretrained_backbone_path", None)
-        backbone_type = kwargs.get("backbone_type", "x3d").lower()
+        backbone_type = str(kwargs.get("backbone_type", "yolo")).lower()
 
-        # 1. Video Backbone with stage freezing (supports 'x3d', 'yolov11', or 'movinet-a0')
+        # 1. Video Backbone
+        self._multiscale_backbone = False
         if backbone_type in ("yolo", "yolov11", "yolo11"):
             self.backbone = YoloV11Backbone(
                 pretrained=pretrained_backbone,
@@ -143,6 +99,7 @@ class ActionSlotModel(BaseModel):
                 unfreeze_all=unfreeze_all,
                 freeze_bn=freeze_bn,
             )
+            self._multiscale_backbone = True
         elif backbone_type in ("movinet", "movinet_a0", "movinet-a0", "movineta0"):
             self.backbone = MoViNetA0Backbone(
                 pretrained=pretrained_backbone,
@@ -166,7 +123,7 @@ class ActionSlotModel(BaseModel):
             )
         in_c = self.backbone.out_channels
 
-        # 2. Ego Feature Branch (optional, default 0 for toy_action)
+        # 2. Optional Ego Feature Branch
         if self.num_ego_class > 0:
             self.conv3d_ego = nn.Sequential(
                 nn.ReLU(),
@@ -178,129 +135,70 @@ class ActionSlotModel(BaseModel):
             self.conv3d_ego = None
             self.pool_ego = None
 
-        # 3. Spatiotemporal Feature Projection 
+        # 3. Spatiotemporal Projections for Base Grid Map and Deformable Sampling Map
         self.conv3d = nn.Sequential(
             nn.ReLU(),
             nn.BatchNorm3d(in_c),
-            nn.Conv3d(in_c, self.slot_dim, (1, 1, 1), stride=1),
+            nn.Conv3d(in_c, self.dim, (1, 1, 1), stride=1),
             nn.ReLU(),
         )
+        if self._multiscale_backbone:
+            self.conv3d_deform = nn.Sequential(
+                nn.ReLU(),
+                nn.BatchNorm3d(in_c),
+                nn.Conv3d(in_c, self.dim, (1, 1, 1), stride=1),
+                nn.ReLU(),
+            )
+        else:
+            self.conv3d_deform = None
 
-
-        # 4. Slot Attention
-        actual_slots = self.num_slots + 1 if bg_slot else self.num_slots
-        self.slot_attention = SlotAttention(
-            num_slots=actual_slots,
-            dim=self.slot_dim,
-            eps=1e-8,
-            input_dim=self.slot_dim,
-            resolution=list(resolution3d),
-            num_actor_class=num_actor_class,
-            allocated_slot=kwargs.get("allocated_slot", True),
-            slot_dropout=kwargs.get("slot_dropout", 0.0),
+        # 4. Deformable Spatial Head (Visdrone DeformableSlotDetectionHead without slots)
+        self.deformable_head = DeformableFeatureHead(
+            dim=self.dim,
+            grid_size=self.grid_size,
+            num_points=int(num_points),
+            num_heads=int(num_heads),
         )
 
-        # 5. Classification Head & Per-Frame Object Count Head
-        self.actor_loss_type = str(kwargs.get("actor_loss_type", "bce")).lower()
-        if self.actor_loss_type == "bce" and self.num_slots < num_actor_class:
-            self.head = ObjectActionHead(
-                in_channel=slot_dim,
-                num_actor_classes=num_actor_class,
-                num_slots=self.num_slots,
-                num_ego_classes=num_ego_class,
-                ego_channel=ego_c,
-            )
-        else:
-            self.head = ReduceAllocatedHead(
-                in_channel=slot_dim,
-                num_actor_classes=num_actor_class,
-                num_slots=self.num_slots,
-                num_ego_classes=num_ego_class,
-                ego_channel=ego_c,
-            )
-
-        self.use_obj_count_loss = bool(kwargs.get("use_obj_count_loss", True))
-        num_obj_classes = int(kwargs.get("num_obj_classes", len(SYMBOL_VARIANTS)))
-        if self.use_obj_count_loss:
-            self.count_head = FrameObjectCountHead(
-                in_channel=slot_dim,
-                num_slots=self.num_slots,
-                hidden_dim=int(kwargs.get("count_hidden_dim", 64)),
-            )
-            self.obj_cls_head = None
-        else:
-            self.count_head = None
-            self.obj_cls_head = VideoObjectClassHead(
-                in_channel=slot_dim,
-                num_slots=actual_slots,
-                num_obj_classes=num_obj_classes,
-                hidden_dim=int(kwargs.get("obj_cls_hidden_dim", 256)),
-                dropout=float(kwargs.get("obj_cls_dropout", 0.2)),
-            )
-
-        self.drop = nn.Dropout(p=dropout)
-
-        # 5b. DINOSAUR-style Spatial Broadcast Feature Decoder
-        self.use_feat_recon = bool(kwargs.get("use_feat_recon", True))
-        feat_recon_weight = float(kwargs.get("feat_recon_weight", 0.5))
-        if self.use_feat_recon:
-            self.feat_decoder = SpatialBroadcastFeatureDecoder(
-                slot_dim=self.slot_dim,
-                hidden_dim=int(kwargs.get("feat_recon_hidden_dim", 128)),
-                out_dim=self.slot_dim,
-            )
-        else:
-            self.feat_decoder = None
-
-        # 6. Loss Function
-        self.loss_fn = ActionSlotLoss(
-            num_actor_class=num_actor_class,
-            num_slots=self.num_slots,
-            attention_res=(resolution3d[1], resolution3d[2]),
-            bce_pos_weight=float(kwargs.get("bce_pos_weight", 5.0)),
-            actor_loss_type=self.actor_loss_type,
-            use_obj_count_loss=self.use_obj_count_loss,
-            obj_count_weight=float(kwargs.get("obj_count_weight", 1.0)),
-            obj_cls_weight=float(kwargs.get("obj_cls_weight", 1.0)),
-            obj_cls_pos_weight=float(kwargs.get("obj_cls_pos_weight", 3.0)),
-            num_obj_classes=num_obj_classes,
-            action_attn_weight=float(kwargs.get("action_attn_weight", 1.0)),
-            bg_attn_weight=float(kwargs.get("bg_attn_weight", 0.5)),
-            feat_recon_weight=feat_recon_weight if self.use_feat_recon else 0.0,
-            bg_mask=True,
-            bg_slot=bg_slot,
-        )
-
-        # Mamba operates strictly over the S object slots (excluding bg_slot)
-        mambaCfg = MambaConfig(
-            d_model=self.slot_dim,
-            n_layer=int(kwargs.get("mamba_layers", 1)),
+        # 5. Mamba Temporal Modeling over 100 flattened spatial points
+        mamba_cfg = MambaConfig(
+            d_model=self.dim,
+            n_layer=int(kwargs.get("mamba_layers", 2)),
             d_state=int(kwargs.get("mamba_d_state", 16)),
-            num_slot=self.num_slots,
+            num_slot=self.num_tokens,
         )
-        self.mamba = Mamba(mambaCfg)
+        self.mamba = Mamba(mamba_cfg)
         self.temporal_pool = str(kwargs.get("temporal_pool", "last_mean")).lower()
-        self.mamba_grad_scale = float(kwargs.get("mamba_grad_scale", 10.0))
-        self.backbone_grad_scale = float(kwargs.get("backbone_grad_scale", 2.0))
+        self.mamba_grad_scale = float(kwargs.get("mamba_grad_scale", 1.0))
+        self.backbone_grad_scale = float(kwargs.get("backbone_grad_scale", 0.5))
+
+        # 6. Action Classification Head
+        self.head = MambaActionHead(
+            in_channel=self.dim,
+            num_actor_classes=self.num_actor_class,
+            grid_size=self.grid_size,
+            num_ego_classes=self.num_ego_class,
+            ego_channel=self.ego_c,
+            dropout=float(dropout),
+        )
+
+        # 7. Loss Function
+        self.loss_fn = DeformableActionLoss(
+            num_actor_class=self.num_actor_class,
+            bce_pos_weight=float(kwargs.get("bce_pos_weight", 5.0)),
+            ego_loss_weight=float(kwargs.get("ego_loss_weight", 0.2)),
+        )
 
     def init_weights(self) -> None:
-        """Preserve pretrained backbone weights and submodule-specific initializations.
-
-        BaseModel.scripts.train invokes `model.init_weights()` after `build_model()`,
-        whose default implementation in `BaseModel` overwrites all Conv2d/BatchNorm2d/Linear
-        parameters (wiping pretrained backbones while leaving pretrained BN running stats
-        intact, causing activation explosion in frozen BN layers, and clobbering Mamba/Slot
-        initializations). Each submodule already initializes itself during `__init__`.
-        """
+        """Preserve pretrained backbone weights and submodule-specific initializations."""
         return None
 
     def _normalize_input(self, inputs: torch.Tensor) -> torch.Tensor:
-        """Ensure input tensor is of shape (B, C=3, T=16, H=224, W=224)."""
+        """Ensure input tensor is of shape (B, C=3, T=16, H, W)."""
         if inputs.dim() != 5:
             raise ValueError(f"Expected 5D tensor, got {inputs.shape}")
 
         if inputs.shape[2] == 3 and inputs.shape[1] == 16:
-            # (B, T, C, H, W) -> (B, C, T, H, W)
             inputs = inputs.permute(0, 2, 1, 3, 4)
 
         if inputs.dtype == torch.uint8:
@@ -308,111 +206,96 @@ class ActionSlotModel(BaseModel):
 
         return inputs.contiguous()
 
-    def _extract_all_features(
-        self,
-        videos: torch.Tensor,
-        compute_recon: bool = False,
-    ) -> Tuple[torch.Tensor, Optional[torch.Tensor], torch.Tensor, Dict[str, Optional[torch.Tensor]]]:
-        """Extract object action slots, ego features, attention masks, and auxiliary predictions."""
-        videos = self._normalize_input(videos)
-        batch_size, _, seq_len, _, _ = videos.shape
-
-        # 1. Backbone forward: (B, C_feat, T=16, H=7, W=7)
-        feats = self.backbone(videos)
-
-        if self.training and feats.requires_grad and self.backbone_grad_scale != 1.0:
-            b_scale = self.backbone_grad_scale
-            feats.register_hook(lambda grad: grad * b_scale)
-
-        # 2. Ego feature branch (if configured)
-        ego_x = None
-        if self.conv3d_ego is not None:
-            ego_feat = self.conv3d_ego(feats)
-            ego_feat = self.pool_ego(ego_feat)
-            ego_x = torch.reshape(ego_feat, (batch_size, self.ego_c))
-            ego_x = self.drop(ego_x)
-
-        new_seq_len = feats.shape[2]
-        new_h, new_w = feats.shape[3], feats.shape[4]
-
-        # 3. Project to slot dimension: (B, T, H, W, slot_dim)
-        x_vis = self.conv3d(feats)
-        x_vis_5d = x_vis.permute(0, 2, 3, 4, 1).contiguous()  # pure visual target without PE
-        x = x_vis + build_2d_sincos_position_embedding(
-            new_h, new_w, self.slot_dim, device=x_vis.device, dtype=x_vis.dtype
-        ).unsqueeze(2)
-        x = x.permute(0, 2, 3, 4, 1).contiguous()  # (B, T, H, W, slot_dim)
-
-        # 4. Per-frame Slot Attention -> (B, T, actual_slots, slot_dim)
-        slots_seq_all, attn_masks = self.slot_attention(x, return_temporal_slots=True)
-        obj_slots = slots_seq_all[:, :, :self.num_slots, :]  # (B, T, S, slot_dim)
-
-        # 4b. Auxiliary head: either per-frame object counts (from obj_slots) or video-level object classes (from all slots)
-        pred_counts = self.count_head(obj_slots) if self.count_head is not None else None
-        pred_obj_cls = self.obj_cls_head(slots_seq_all) if self.obj_cls_head is not None else None
-
-        # 4c. Spatial broadcast feature reconstruction (DINOSAUR-style) from all slots
-        recon_feats = None
-        target_feats = None
-        if compute_recon and self.feat_decoder is not None:
-            recon_feats, _ = self.feat_decoder(slots_seq_all, new_h, new_w)
-            target_feats = x_vis_5d.detach()
-
-        # 5. Mamba temporal modeling over object slots: (B, T, S, slot_dim)
-        if self.training and obj_slots.requires_grad and self.mamba_grad_scale != 1.0:
-            mamba_in = _ScaleGrad.apply(obj_slots, 1.0 / self.mamba_grad_scale)
-            mamba_out = _ScaleGrad.apply(self.mamba(mamba_in), self.mamba_grad_scale)
-        else:
-            mamba_out = self.mamba(obj_slots)
-
-        slots_seq = obj_slots + mamba_out  # (B, T, S, slot_dim)
-
-        # Temporal aggregation -> (B, S, slot_dim)
-        if self.temporal_pool == "last":
-            slots = slots_seq[:, -1, :, :]
-        elif self.temporal_pool == "mean":
-            slots = slots_seq.mean(dim=1)
-        else:
-            slots = 0.5 * (slots_seq[:, -1, :, :] + slots_seq.mean(dim=1))
-
-        # 6. Reshape attention masks: (B, T, actual_slots, H, W)
-        b, actual_slots, _ = attn_masks.shape
-        attn_masks = attn_masks.view(b, actual_slots, new_seq_len, new_h, new_w) # (B, actual_slots, T, H, W)
-        attn_masks = attn_masks.permute(0, 2, 1, 3, 4)  # (B, T, actual_slots, H, W)
-
-        if seq_len > new_seq_len:
-            attn_flat = attn_masks.permute(0, 2, 1, 3, 4).reshape(b * actual_slots, 1, new_seq_len, new_h, new_w)
-            attn_up = F.interpolate(attn_flat, size=(seq_len, new_h, new_w), mode="trilinear", align_corners=False)
-            attn_masks = attn_up.view(b, actual_slots, seq_len, new_h, new_w).permute(0, 2, 1, 3, 4)
-
-        aux_preds = {
-            "obj_counts": pred_counts,
-            "obj_cls": pred_obj_cls,
-            "recon_feats": recon_feats,
-            "target_feats": target_feats,
-        }
-        return slots, ego_x, attn_masks, aux_preds
+    def _get_token_pos_emb(self, device: torch.device, dtype: torch.dtype) -> Tensor:
+        """Cached 2D sin-cos position embedding for the flattened 100 grid tokens: [1, 1, 100, D]."""
+        h_g, w_g = self.grid_size
+        cache_key = (h_g, w_g, self.dim, device, dtype)
+        if getattr(self, "_mamba_pos_cache_key", None) != cache_key:
+            pos_2d = build_2d_sincos_position_embedding(h_g, w_g, self.dim, device=device, dtype=dtype)
+            self._mamba_pos_cache = (
+                pos_2d.flatten(2).permute(0, 2, 1).unsqueeze(1).contiguous()
+            )  # [1, 1, 100, D]
+            self._mamba_pos_cache_key = cache_key
+        return self._mamba_pos_cache
 
     def extract_features(
         self,
         videos: torch.Tensor,
-    ) -> Tuple[torch.Tensor, Optional[torch.Tensor], torch.Tensor]:
-        """Extract slot representations and attention masks."""
-        slots, ego_x, attn_masks, _ = self._extract_all_features(videos)
-        return slots, ego_x, attn_masks
+    ) -> Tuple[Tensor, Optional[Tensor], Dict[str, Tensor]]:
+        """Run Backbone -> DeformableFeatureHead (10x10) -> Flatten 100 + PosEmb -> Mamba -> Temporal Pool."""
+        videos = self._normalize_input(videos)
+        batch_size = videos.shape[0]
 
-    def _process_output(self, pred_actor: Tensor) -> Tensor:
-        """Map slot predictions to (B, 48) multi-label action logits."""
-        if pred_actor.dim() == 2 and pred_actor.shape[-1] == self.num_actor_class:
-            return pred_actor
+        # 1. Backbone extraction
+        if self._multiscale_backbone:
+            feats_map, feats_high = self.backbone(videos, return_multiscale=True)
+        else:
+            feats_map = self.backbone(videos)
+            feats_high = None
 
-        B = pred_actor.shape[0]
-        fg_logits = pred_actor[:, :, :2] - pred_actor[:, :, 2:3]  # (B, 24, 2)
+        if self.training and feats_map.requires_grad and self.backbone_grad_scale != 1.0:
+            b_scale = self.backbone_grad_scale
+            feats_map.register_hook(lambda grad: grad * b_scale)
+            if feats_high is not None and feats_high.requires_grad:
+                feats_high.register_hook(lambda grad: grad * b_scale)
 
-        # (B, 24, 2) -> (B, 6 symbols, 4 actions, 2 variants)
-        # Permute to (B, 6, 2 variants [single, group+], 4 actions) -> (B, 48)
-        logits_48 = fg_logits.view(B, 6, 4, 2).permute(0, 1, 3, 2).reshape(B, 48)
-        return logits_48
+        # Optional ego branch
+        ego_x = None
+        if self.conv3d_ego is not None:
+            ego_feat = self.conv3d_ego(feats_map)
+            ego_feat = self.pool_ego(ego_feat)
+            ego_x = torch.reshape(ego_feat, (batch_size, self.ego_c))
+
+        # 2. Spatiotemporal projections -> reshape per-frame [B*T, D, H, W]
+        x_map = self.conv3d(feats_map)  # [B, D, T, H_m, W_m]
+        _, _, seq_len, h_m, w_m = x_map.shape
+        map_pred = x_map.permute(0, 2, 1, 3, 4).reshape(batch_size * seq_len, self.dim, h_m, w_m)
+
+        if self.conv3d_deform is not None and feats_high is not None:
+            x_def = self.conv3d_deform(feats_high)
+            _, _, _, h_d, w_d = x_def.shape
+            feat_deform = x_def.permute(0, 2, 1, 3, 4).reshape(batch_size * seq_len, self.dim, h_d, w_d)
+        else:
+            feat_deform = map_pred
+
+        # 3. DeformableFeatureHead -> 10x10 output feature image [B*T, D, 10, 10]
+        deform_map, sampling_info = self.deformable_head(map_pred, feat_deform)
+
+        # 4. Flatten 10x10 -> 100 points + Position Embedding -> [B, T, 100, D]
+        tokens = (
+            deform_map.flatten(2)
+            .permute(0, 2, 1)
+            .contiguous()
+            .view(batch_size, seq_len, self.num_tokens, self.dim)
+        )
+        mamba_in = tokens + self._get_token_pos_emb(device=tokens.device, dtype=tokens.dtype)
+
+        # 5. Mamba temporal modeling over the 100 points
+        if self.training and mamba_in.requires_grad and self.mamba_grad_scale != 1.0:
+            m_scaled_in = _ScaleGrad.apply(mamba_in, 1.0 / self.mamba_grad_scale)
+            mamba_out = _ScaleGrad.apply(self.mamba(m_scaled_in), self.mamba_grad_scale)
+        else:
+            mamba_out = self.mamba(mamba_in)
+
+        seq_tokens = mamba_in + mamba_out  # [B, T, 100, D]
+
+        # 6. Temporal aggregation -> [B, 100, D]
+        if self.temporal_pool == "last":
+            spatial_tokens = seq_tokens[:, -1, :, :]
+        elif self.temporal_pool == "mean":
+            spatial_tokens = seq_tokens.mean(dim=1)
+        else:
+            spatial_tokens = 0.5 * (seq_tokens[:, -1, :, :] + seq_tokens.mean(dim=1))
+
+        aux_info = {
+            "sampling_locations": sampling_info["sampling_locations"].view(
+                batch_size, seq_len, *self.grid_size, self.deformable_head.num_heads, self.deformable_head.num_points, 2
+            ),
+            "attn_weights": sampling_info["attn_weights"].view(
+                batch_size, seq_len, *self.grid_size, self.deformable_head.num_heads, self.deformable_head.num_points
+            ),
+        }
+        return spatial_tokens, ego_x, aux_info
 
     def forward_train(
         self,
@@ -421,45 +304,27 @@ class ActionSlotModel(BaseModel):
         **kwargs,
     ) -> Dict[str, torch.Tensor]:
         """Compute training losses and attach predictions for hooks."""
-        slots, ego_x, attn_masks, aux_preds = self._extract_all_features(
-            inputs, compute_recon=(self.feat_decoder is not None)
-        )
-        pred_ego, pred_actor = self.head(slots, ego_x=ego_x)
-        pred_counts = aux_preds.get("obj_counts", None)
-        pred_obj_cls = aux_preds.get("obj_cls", None)
+        spatial_tokens, ego_x, _ = self.extract_features(inputs)
+        pred_ego, pred_actor, spatial_attn = self.head(spatial_tokens, ego_x=ego_x)
 
         pred_dict = {
             "actor": pred_actor,
             "ego": pred_ego,
-            "attn": attn_masks,
-            "obj_counts": pred_counts,
-            "obj_cls": pred_obj_cls,
-            "recon_feats": aux_preds.get("recon_feats", None),
-            "target_feats": aux_preds.get("target_feats", None),
+            "spatial_attn": spatial_attn,
         }
-
-        # If targets is provided as raw tensor (B, 48) or dict
         loss_dict = self.loss_fn(pred_dict, targets, validate=False)
 
-        # Calibrate logits to 48 classes for metrics and hooks
-        logits_48 = self._process_output(pred_actor)
         target_tensor = (
             targets
             if isinstance(targets, torch.Tensor)
             else (targets.get("actor", targets.get("target", None)) if isinstance(targets, dict) else None)
         )
-
-        loss_dict["logits"] = logits_48
-        loss_dict["preds"] = logits_48
-        loss_dict["pred_actor"] = logits_48
-        if pred_counts is not None:
-            loss_dict["pred_obj_counts"] = pred_counts
-        if pred_obj_cls is not None:
-            loss_dict["pred_obj_cls"] = pred_obj_cls
+        loss_dict["logits"] = pred_actor
+        loss_dict["preds"] = pred_actor
+        loss_dict["pred_actor"] = pred_actor
         if target_tensor is not None:
             loss_dict["targets"] = target_tensor
             loss_dict["target_actor"] = target_tensor
-
         return loss_dict
 
     def forward_val(
@@ -469,53 +334,30 @@ class ActionSlotModel(BaseModel):
         **kwargs,
     ) -> Dict[str, Any]:
         """Validation forward pass."""
-        slots, ego_x, attn_masks, aux_preds = self._extract_all_features(
-            inputs, compute_recon=(self.feat_decoder is not None and targets is not None)
-        )
-        pred_ego, pred_actor = self.head(slots, ego_x=ego_x)
-        pred_counts = aux_preds.get("obj_counts", None)
-        pred_obj_cls = aux_preds.get("obj_cls", None)
-
-        pred_dict = {
-            "actor": pred_actor,
-            "ego": pred_ego,
-            "attn": attn_masks,
-            "obj_counts": pred_counts,
-            "obj_cls": pred_obj_cls,
-            "recon_feats": aux_preds.get("recon_feats", None),
-            "target_feats": aux_preds.get("target_feats", None),
-        }
+        spatial_tokens, ego_x, _ = self.extract_features(inputs)
+        pred_ego, pred_actor, _ = self.head(spatial_tokens, ego_x=ego_x)
 
         output: Dict[str, Any] = {}
         if targets is not None:
-            loss_dict = self.loss_fn(pred_dict, targets, validate=True)
+            loss_dict = self.loss_fn({"actor": pred_actor, "ego": pred_ego}, targets, validate=True)
             output.update(loss_dict)
 
-        logits_48 = self._process_output(pred_actor)
-        probs_48 = torch.sigmoid(logits_48)
-        preds_binary = (probs_48 > self.threshold).float()
+        probs = torch.sigmoid(pred_actor)
+        preds_binary = (probs > self.threshold).float()
 
         target_tensor = (
             targets
             if isinstance(targets, torch.Tensor)
             else (targets.get("actor", targets.get("target", None)) if isinstance(targets, dict) else None)
         )
-
-        output["logits"] = logits_48
-        output["preds"] = logits_48
-        output["probs"] = probs_48
-        output["actor"] = logits_48
-        output["pred_actor"] = logits_48
-        if pred_counts is not None:
-            output["obj_counts"] = pred_counts.clamp(min=0.0)
-        if pred_obj_cls is not None:
-            output["obj_cls"] = pred_obj_cls
-            output["obj_cls_probs"] = torch.sigmoid(pred_obj_cls)
-
+        output["logits"] = pred_actor
+        output["preds"] = pred_actor
+        output["probs"] = probs
+        output["actor"] = pred_actor
+        output["pred_actor"] = pred_actor
         if target_tensor is not None:
             output["exact_match"] = (preds_binary == target_tensor).all(dim=-1).float().mean()
             output["hamming_acc"] = (preds_binary == target_tensor).float().mean()
-
         return output
 
     def predict(
@@ -524,16 +366,13 @@ class ActionSlotModel(BaseModel):
         threshold: Optional[float] = None,
         **kwargs,
     ) -> Dict[str, Any]:
-        """Inference forward pass with decoded text labels."""
+        """Inference forward pass returning predictions, 10x10 spatial attention, and sampling locations."""
         th = threshold if threshold is not None else self.threshold
-        slots, ego_x, attn_masks, aux_preds = self._extract_all_features(inputs)
-        _, pred_actor = self.head(slots, ego_x=ego_x)
-        pred_counts = aux_preds.get("obj_counts", None)
-        pred_obj_cls = aux_preds.get("obj_cls", None)
+        spatial_tokens, ego_x, aux_info = self.extract_features(inputs)
+        _, pred_actor, spatial_attn = self.head(spatial_tokens, ego_x=ego_x)
 
-        logits_48 = self._process_output(pred_actor)
-        probs_48 = torch.sigmoid(logits_48)
-        preds_binary = (probs_48 > th).float()
+        probs = torch.sigmoid(pred_actor)
+        preds_binary = (probs > th).float()
 
         preds_np = preds_binary.detach().cpu().numpy()
         decoded_labels = []
@@ -542,12 +381,12 @@ class ActionSlotModel(BaseModel):
             decoded_labels.append(", ".join(sorted(tokens)))
 
         return {
-            "probs": probs_48,
+            "probs": probs,
             "preds": preds_binary,
-            "logits": logits_48,
-            "attn": attn_masks,
-            "obj_counts": pred_counts.clamp(min=0.0) if pred_counts is not None else None,
-            "obj_cls_probs": torch.sigmoid(pred_obj_cls) if pred_obj_cls is not None else None,
+            "logits": pred_actor,
+            "spatial_attn": spatial_attn,
+            "sampling_locations": aux_info["sampling_locations"],
+            "sampling_attn": aux_info["attn_weights"],
             "label_strings": decoded_labels,
         }
 

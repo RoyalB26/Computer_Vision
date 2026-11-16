@@ -1,9 +1,9 @@
 # ==============================================================================
-# Configuration for Toy Action Slot Model (BaseModel Framework)
+# Configuration for Toy Action Deformable-Mamba Model (BaseModel Framework)
 # ==============================================================================
 
-work_dir: "./work_dirs/toy_action_slot_exp"
-project_name: "toy_action_slot"
+work_dir: "./work_dirs/toy_action_deformable_mamba_exp"
+project_name: "toy_action_deformable_mamba"
 device: "cuda"
 seed: 42
 tqdm: true
@@ -16,38 +16,29 @@ custom_imports:
   - "toy_action.metrics"
   - "toy_action.scheduler"
 
-# 2. Model Architecture: ActionSlotModel (Object Slots + Mamba + ObjectActionHead + CountHead)
+# 2. Model Architecture: Backbone -> DeformableFeatureHead (10x10 -> 100 pts) -> Mamba -> MambaActionHead
 model:
-  type: "ActionSlotModel"
+  type: "DeformableMambaActionModel"
   num_actor_class: 48
-  num_slots: 6
   num_ego_class: 0
-  slot_dim: 256
-  bg_slot: true
+  dim: 256
+  grid_size: [10, 10]
+  num_heads: 4
+  num_points: 4
   mamba_layers: 2
-  actor_loss_type: "bce"
+  mamba_d_state: 16
   temporal_pool: "last_mean"
   mamba_grad_scale: 1.0
   backbone_grad_scale: 0.5
   bce_pos_weight: 5.0
-  use_obj_count_loss: true
-  obj_count_weight: 0.0
-  obj_cls_weight: 0.0
-  obj_cls_pos_weight: 0.0
-  action_attn_weight: 0.0
-  bg_attn_weight: 0.0
-  use_feat_recon: true
-  feat_recon_weight: 0.5
   dropout: 0.5
-  resolution3d: [16, 14, 14]
   pretrained_backbone: true
   # ============================================================================
   # Backbone Freezing Strategy:
-  # X3D-M có 5 blocks [0: Stem, 1: Stage1, 2: Stage2, 3: Stage3, 4: Stage4].
-  # finetune_last_n_stages: 2 -> Đóng băng 3 block đầu (Stem, Stage1, Stage2)
-  # và chỉ mở (unfreeze / train) 2 stage cuối (Stage3, Stage4).
+  # finetune_last_n_stages: 2 -> Chỉ mở (unfreeze / train) 2 stage cuối.
   # ============================================================================
   backbone_type: "yolo"
+  finetune_last_n_stages: 2
 
 # 3. Data Loaders & LMDB Datasets
 data:
