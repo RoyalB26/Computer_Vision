@@ -30,6 +30,8 @@ model:
   bg_attn_weight: 0.5
   mamba_grad_scale: 1.0
   backbone_grad_scale: 1.0
+  ego_loss_weight: 0.2
+  ego_backbone_grad_scale: 0.1
   dropout: 0.5
   finetune_last_n_stages: 2  # Chỉ fine-tune 2 stage cuối của backbone (đặt unfreeze_all: true nếu muốn mở toàn bộ như v7)
 

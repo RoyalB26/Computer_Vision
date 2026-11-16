@@ -189,6 +189,7 @@ class ActionSlotModel(BaseModel):
             feat_recon_weight=feat_recon_weight if self.use_feat_recon else 0.0,
             action_attn_weight=float(kwargs.get("action_attn_weight", 1.0)),
             bg_attn_weight=float(kwargs.get("bg_attn_weight", 0.5)),
+            ego_loss_weight=float(kwargs.get("ego_loss_weight", 0.2)),
         )
 
         # Mamba operates strictly over the S object slots (excluding bg_slot)
@@ -202,6 +203,7 @@ class ActionSlotModel(BaseModel):
         self.temporal_pool = str(kwargs.get("temporal_pool", "last_mean")).lower()
         self.mamba_grad_scale = float(kwargs.get("mamba_grad_scale", 1.0))
         self.backbone_grad_scale = float(kwargs.get("backbone_grad_scale", 1.0))
+        self.ego_backbone_grad_scale = float(kwargs.get("ego_backbone_grad_scale", 0.1))
 
     def init_weights(self) -> None:
         """Preserve pretrained backbone weights and submodule-specific initializations.
@@ -231,11 +233,20 @@ class ActionSlotModel(BaseModel):
 
         # 1. Backbone feature extraction: (B, C, T_feat, H_feat, W_feat)
         feats = self.backbone(videos)
+        if self.training and feats.requires_grad and self.backbone_grad_scale != 1.0:
+            b_scale = self.backbone_grad_scale
+            feats.register_hook(lambda grad: grad * b_scale)
 
-        # 2. Ego feature branch
+        # 2. Ego feature branch (attenuates gradient pull back into backbone)
         ego_x = None
         if self.conv3d_ego is not None:
-            ego_feat = self.conv3d_ego(feats)
+            ego_in = feats
+            if self.training and feats.requires_grad:
+                if self.ego_backbone_grad_scale == 0.0:
+                    ego_in = feats.detach()
+                elif self.ego_backbone_grad_scale != 1.0:
+                    ego_in = _ScaleGrad.apply(feats, self.ego_backbone_grad_scale)
+            ego_feat = self.conv3d_ego(ego_in)
             ego_feat = self.pool_ego(ego_feat)
             ego_x = torch.reshape(ego_feat, (batch_size, self.ego_c))
 

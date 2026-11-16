@@ -26,14 +26,16 @@ model:
   ego_c: 128
   bg_slot: true
   use_feat_recon: true
-  feat_recon_weight: 0.15
+  feat_recon_weight: 1.0
   action_attn_weight: 1.0
   bg_attn_weight: 0.5
   dropout: 0.5
   bce_pos_weight: 5.0
   resolution3d: [16, 16, 48]
   mamba_grad_scale: 1.0
-  backbone_grad_scale: 0.5
+  backbone_grad_scale: 0.25
+  ego_loss_weight: 0.2
+  ego_backbone_grad_scale: 0.1
   pretrained_backbone: true
   pretrained_backbone_path: "/kaggle/working/yolo11n.pt"
   finetune_last_n_stages: 2

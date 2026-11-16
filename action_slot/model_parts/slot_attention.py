@@ -102,14 +102,12 @@ class SlotAttention(nn.Module):
             s = attn_ori.shape[1]
             hw = h * w
             attn_t = attn_ori.view(b, s, l, hw)
-            attn_t = attn_t / attn_t.sum(dim=-1, keepdim=True)
             v_t = v.view(b, l, hw, d)
             slots = torch.einsum("bljd,bilj->blid", v_t, attn_t)
             slots = slots + self.fc2(F.relu(self.fc1(self.norm_pre_ff(slots))))
             return slots, attn_ori
 
-        attn = attn_ori / attn_ori.sum(dim=-1, keepdim=True)
-        slots = torch.einsum("bjd,bij->bid", v, attn)
+        slots = torch.einsum("bjd,bij->bid", v, attn_ori)
 
         slots = slots.reshape(b, -1, d)
         slots = slots + self.fc2(F.relu(self.fc1(self.norm_pre_ff(slots))))

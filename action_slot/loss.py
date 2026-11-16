@@ -29,6 +29,7 @@ class ActionSlotLoss(nn.Module):
         feat_recon_weight: float = 0.15,
         action_attn_weight: float = 1.0,
         bg_attn_weight: float = 0.5,
+        ego_loss_weight: float = 0.2,
         device=None,
     ):
         super(ActionSlotLoss, self).__init__()
@@ -43,6 +44,7 @@ class ActionSlotLoss(nn.Module):
         self.obj_mask = False
         self.action_attn_weight = float(action_attn_weight)
         self.bg_attn_weight = float(bg_attn_weight)
+        self.ego_loss_weight = float(ego_loss_weight)
 
         self.seq_len = 16
         self.mask_every_frame = 4
@@ -311,7 +313,7 @@ class ActionSlotLoss(nn.Module):
         if pred.get('attn') is not None and isinstance(label, dict) and 'bg_seg' in label:
             attention_loss = self.attn_loss(pred['attn'], label, validate)
 
-        loss = {"loss_ego": 0.5 * ego_loss, "loss_actor": actor_loss}
+        loss = {"loss_ego": self.ego_loss_weight * ego_loss, "loss_actor": actor_loss}
         if feat_recon_loss is not None:
             loss["loss_feat_recon"] = feat_recon_loss
         for k, v in attention_loss.items():
