@@ -38,7 +38,6 @@ model:
   ego_loss_weight: 0.2
   ego_backbone_grad_scale: 0.05
   pretrained_backbone: true
-  pretrained_backbone_path: "/kaggle/working/yolo11n.pt"
   finetune_last_n_stages: 2
 # 2. Dataset Configuration
 # Hỗ trợ cấu hình nhiều data_root dưới dạng danh sách (list) hoặc đường dẫn đơn (str)

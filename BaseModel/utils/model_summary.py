@@ -176,9 +176,15 @@ def _run_forward_profiling(
 
     ram_start = _get_ram_info()["process_rss_mb"]
 
-    # Compute FLOPs using PyTorch 2.1+ FlopCounterMode
+    # Compute FLOPs using PyTorch 2.1+ FlopCounterMode.
+    # Temporarily disable parameter `requires_grad` during `torch.no_grad()` profiling so
+    # PyTorch's ModuleTracker does not attach grad hooks onto parameter-derived views
+    # (e.g. `obj_queries.expand(...)`) and fail with `AssertionError: assert node is not None`.
+    saved_req_grad = [(p, p.requires_grad) for p in model.parameters()]
     try:
         from torch.utils.flop_counter import FlopCounterMode
+        for p, _ in saved_req_grad:
+            p.requires_grad_(False)
         counter = FlopCounterMode(display=False, depth=3)
         with counter, torch.no_grad():
             out = model(dummy_input)
@@ -187,7 +193,7 @@ def _run_forward_profiling(
             result["flops_table"] = counter.get_table(depth=3)
         except Exception:
             result["flops_table"] = None
-    except Exception as flop_err:
+    except Exception:
         total_flops = 0
         try:
             with torch.no_grad():
@@ -195,6 +201,9 @@ def _run_forward_profiling(
         except Exception as fwd_err:
             result["error_msg"] = str(fwd_err)
             return result
+    finally:
+        for p, req_grad in saved_req_grad:
+            p.requires_grad_(req_grad)
 
     # Format output description
     if isinstance(out, torch.Tensor):
