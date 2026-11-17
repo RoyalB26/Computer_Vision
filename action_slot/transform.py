@@ -11,6 +11,8 @@ import random
 from typing import Any, Dict, List, Tuple
 import numpy as np
 import torch
+import torch.nn as nn
+import torch.nn.functional as F
 from BaseModel.core.registrar import TRANSFORMS
 
 try:
@@ -19,6 +21,124 @@ try:
 except ImportError:
     cv2 = None
     _HAS_CV2 = False
+
+
+class GPUBatchPhotometricAug(nn.Module):
+    """Vectorized clip-consistent photometric augmentation running on GPU batches `(B, T, 3, H, W)` in `[0, 1]`."""
+
+    def __init__(
+        self,
+        aug_prob: float = 0.8,
+        brightness: float = 0.25,
+        contrast: float = 0.25,
+        saturation: float = 0.25,
+        gamma: float = 0.15,
+        channel_jitter: float = 0.08,
+        grayscale_prob: float = 0.1,
+        blur_prob: float = 0.15,
+    ):
+        super().__init__()
+        self.aug_prob = float(aug_prob)
+        self.brightness = float(brightness)
+        self.contrast = float(contrast)
+        self.saturation = float(saturation)
+        self.gamma = float(gamma)
+        self.channel_jitter = float(channel_jitter)
+        self.grayscale_prob = float(grayscale_prob)
+        self.blur_prob = float(blur_prob)
+        # Precompute 3x3 grid offsets for vectorized Gaussian blur kernels
+        coords = torch.tensor([-1.0, 0.0, 1.0], dtype=torch.float32)
+        gy, gx = torch.meshgrid(coords, coords, indexing="ij")
+        self.register_buffer("_blur_dist2", (gx * gx + gy * gy).unsqueeze(0), persistent=False)
+
+    @torch.no_grad()
+    def forward(self, videos: torch.Tensor) -> torch.Tensor:
+        """Apply clip-consistent photometric augmentations to `(B, T, 3, H, W)` float tensor in `[0, 1]`."""
+        if not self.training or videos.ndim != 5 or videos.shape[2] != 3:
+            return videos
+
+        b, t_len, _, h, w = videos.shape
+        device = videos.device
+        dtype = videos.dtype
+        out = videos
+
+        # 1. Gamma + Contrast + Brightness + RGB channel gain (shared across all T frames of each clip)
+        if self.aug_prob > 0.0:
+            apply_main = torch.rand((b, 1, 1, 1, 1), device=device) < self.aug_prob
+            if apply_main.any():
+                if self.gamma > 0.0:
+                    g_lo = max(0.5, 1.0 - self.gamma)
+                    g_hi = 1.0 + self.gamma
+                    gamma_val = torch.empty((b, 1, 1, 1, 1), device=device, dtype=dtype).uniform_(g_lo, g_hi)
+                    gamma_val = torch.where(apply_main, gamma_val, torch.ones_like(gamma_val))
+                    out = out.clamp(0.0, 1.0).pow(gamma_val)
+
+                if self.contrast > 0.0:
+                    c_lo = max(0.3, 1.0 - self.contrast)
+                    c_hi = 1.0 + self.contrast
+                    contrast_val = torch.empty((b, 1, 1, 1, 1), device=device, dtype=dtype).uniform_(c_lo, c_hi)
+                    contrast_val = torch.where(apply_main, contrast_val, torch.ones_like(contrast_val))
+                    out = (out - 0.5) * contrast_val + 0.5
+
+                if self.brightness > 0.0:
+                    shift = torch.empty((b, 1, 1, 1, 1), device=device, dtype=dtype).uniform_(
+                        -self.brightness, self.brightness
+                    )
+                    shift = torch.where(apply_main, shift, torch.zeros_like(shift))
+                    out = out + shift
+
+                if self.channel_jitter > 0.0:
+                    j_lo = max(0.5, 1.0 - self.channel_jitter)
+                    j_hi = 1.0 + self.channel_jitter
+                    gain = torch.empty((b, 1, 3, 1, 1), device=device, dtype=dtype).uniform_(j_lo, j_hi)
+                    gain = torch.where(apply_main, gain, torch.ones_like(gain))
+                    out = out * gain
+
+                out = out.clamp_(0.0, 1.0)
+
+        # 2. Random Grayscale or Saturation Jitter
+        if self.grayscale_prob > 0.0 or self.saturation > 0.0:
+            is_gray = torch.rand((b, 1, 1, 1, 1), device=device) < self.grayscale_prob
+            do_sat = is_gray | (
+                (torch.rand((b, 1, 1, 1, 1), device=device) < 0.5)
+                if self.saturation > 0.0
+                else torch.zeros_like(is_gray)
+            )
+            if do_sat.any():
+                s_lo = max(0.2, 1.0 - self.saturation)
+                s_hi = 1.0 + self.saturation
+                sat = torch.empty((b, 1, 1, 1, 1), device=device, dtype=dtype).uniform_(s_lo, s_hi)
+                sat = torch.where(is_gray, torch.zeros_like(sat), sat)
+                sat = torch.where(do_sat, sat, torch.ones_like(sat))
+                luma = (
+                    0.299 * out[:, :, 0:1]
+                    + 0.587 * out[:, :, 1:2]
+                    + 0.114 * out[:, :, 2:3]
+                )
+                out = (luma + sat * (out - luma)).clamp_(0.0, 1.0)
+
+        # 3. Clip-consistent 3x3 Gaussian Blur on the selected subset of clips
+        if self.blur_prob > 0.0:
+            blur_mask = torch.rand((b,), device=device) < self.blur_prob
+            if blur_mask.any():
+                sub = out[blur_mask]  # (K, T, 3, H, W)
+                k_cnt = sub.shape[0]
+                sigmas = torch.empty((k_cnt, 1, 1), device=device, dtype=torch.float32).uniform_(0.2, 1.0)
+                dist2 = self._blur_dist2.to(device=device, dtype=torch.float32)
+                kernels = torch.exp(-dist2 / (2.0 * sigmas * sigmas))
+                kernels = (kernels / kernels.sum(dim=(-2, -1), keepdim=True)).to(dtype=dtype)
+                # Expand kernel identically across RGB channels: (K*3, 1, 3, 3)
+                kernels = kernels.unsqueeze(1).expand(k_cnt, 3, 3, 3).reshape(k_cnt * 3, 1, 3, 3)
+
+                # Reshape to (T, K*3, H, W) so depthwise conv blurs each frame independently
+                sub_2d = sub.permute(1, 0, 2, 3, 4).reshape(t_len, k_cnt * 3, h, w)
+                sub_pad = F.pad(sub_2d, (1, 1, 1, 1), mode="reflect")
+                blurred = F.conv2d(sub_pad, kernels, groups=k_cnt * 3)
+                blurred = blurred.reshape(t_len, k_cnt, 3, h, w).permute(1, 0, 2, 3, 4)
+                out = out.clone()
+                out[blur_mask] = blurred
+
+        return out
 
 
 @TRANSFORMS.register_module("Action_Slot_Transform")
@@ -31,6 +151,7 @@ class Action_Slot_Transform:
         mask_size: Tuple[int, int] = (32, 96),
         normalize_on_gpu: bool = True,
         photometric_aug: bool = False,
+        aug_on_gpu: bool = True,
         aug_prob: float = 0.8,
         brightness: float = 0.25,
         contrast: float = 0.25,
@@ -44,6 +165,7 @@ class Action_Slot_Transform:
         self.mask_size = tuple(mask_size)
         self.normalize_on_gpu = normalize_on_gpu
         self.photometric_aug = photometric_aug
+        self.aug_on_gpu = bool(aug_on_gpu)
         self.aug_prob = float(aug_prob)
         self.brightness = float(brightness)
         self.contrast = float(contrast)
@@ -64,7 +186,7 @@ class Action_Slot_Transform:
             inputs = self.process_videos(inputs)
 
         if isinstance(inputs, torch.Tensor):
-            if self.photometric_aug and inputs.dtype == torch.uint8:
+            if self.photometric_aug and not self.aug_on_gpu and inputs.dtype == torch.uint8:
                 inputs = self._apply_photometric_aug(inputs)
             if not self.normalize_on_gpu and inputs.dtype == torch.uint8:
                 inputs = inputs.float().mul_(1.0 / (255.0 * 0.225)).add_(-0.45 / 0.225)

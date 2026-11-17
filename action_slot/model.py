@@ -18,6 +18,10 @@ from model_parts.heads import (
 from model_parts.slot_attention import SlotAttention
 from model_parts.Mamba.model import Mamba, MambaConfig
 from loss import ActionSlotLoss
+try:
+    from .transform import GPUBatchPhotometricAug
+except ImportError:
+    from transform import GPUBatchPhotometricAug
 from typing import Dict, List, Optional, Union
 
 from BaseModel.core import MODELS
@@ -407,6 +411,22 @@ class ActionSlotModel(BaseModel):
         self.backbone_grad_scale = float(kwargs.get("backbone_grad_scale", 1.0))
         self.ego_backbone_grad_scale = float(kwargs.get("ego_backbone_grad_scale", 0.1))
 
+        self.use_gpu_photometric_aug = bool(kwargs.get("gpu_photometric_aug", True))
+        self.gpu_photometric_aug = (
+            GPUBatchPhotometricAug(
+                aug_prob=float(kwargs.get("aug_prob", 0.8)),
+                brightness=float(kwargs.get("aug_brightness", 0.25)),
+                contrast=float(kwargs.get("aug_contrast", 0.25)),
+                saturation=float(kwargs.get("aug_saturation", 0.25)),
+                gamma=float(kwargs.get("aug_gamma", 0.15)),
+                channel_jitter=float(kwargs.get("aug_channel_jitter", 0.08)),
+                grayscale_prob=float(kwargs.get("aug_grayscale_prob", 0.1)),
+                blur_prob=float(kwargs.get("aug_blur_prob", 0.15)),
+            )
+            if self.use_gpu_photometric_aug
+            else None
+        )
+
     def init_weights(self) -> None:
         """Preserve pretrained backbone weights and submodule-specific initializations.
 
@@ -428,7 +448,11 @@ class ActionSlotModel(BaseModel):
             videos = torch.stack(videos, dim=0)
         if videos.dtype == torch.uint8:
             # Chuyển uint8 [0, 255] -> float32 chuẩn hóa (mean=0.45, std=0.225) trên GPU để giảm 4x băng thông CPU->GPU
-            videos = videos.float().mul_(1.0 / (255.0 * 0.225)).add_(-0.45 / 0.225)
+            if self.training and self.gpu_photometric_aug is not None:
+                videos = self.gpu_photometric_aug(videos.float().mul_(1.0 / 255.0))
+                videos = videos.sub_(0.45).mul_(1.0 / 0.225)
+            else:
+                videos = videos.float().mul_(1.0 / (255.0 * 0.225)).add_(-0.45 / 0.225)
         videos = videos.permute(0, 2, 1, 3, 4)
         seq_len = videos.shape[2]
         batch_size = videos.shape[0]

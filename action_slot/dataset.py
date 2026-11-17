@@ -10,6 +10,7 @@ import io
 import json
 import pickle
 import random
+import struct
 from typing import Any, Dict, List, Optional, Tuple, Union
 import numpy as np
 from PIL import Image
@@ -102,6 +103,7 @@ class ACTION_SLOT_LMDBDataset(BaseDataset):
         self.label: Dict[str, Any] = {}
         self.videos_path: List[Dict[str, Any]] = []
         self.env_cache: Dict[str, Any] = {}
+        self._rgb_reduced_cache: Dict[str, bool] = {}
 
         super().__init__(
             data_root=primary_root,
@@ -623,6 +625,19 @@ class ACTION_SLOT_LMDBDataset(BaseDataset):
 
         return [{"lmdb_idx": idx} for idx in indices]
 
+    @staticmethod
+    def _decode_lmdb_value(val: bytes) -> Dict[str, Any]:
+        """Decode raw JPEG/PNG/RAW0 LMDB payload without pickle overhead, falling back to pickle."""
+        if len(val) >= 9 and val[:4] == b"RAW0":
+            h, w, c = struct.unpack("<HHB", val[4:9])
+            raw_arr = np.frombuffer(val, dtype=np.uint8, offset=9)
+            if raw_arr.size == h * w * c:
+                shape = (h, w) if c == 1 else (h, w, c)
+                return {"raw_array": raw_arr.reshape(shape)}
+        if val[:3] == b"\xff\xd8\xff" or val[:8] == b"\x89PNG\r\n\x1a\n":
+            return {"image": val}
+        return pickle.loads(val)
+
     def get_first_n_images_by_prefix(self, env, prefix_path: str, num_images: int = 16):
         """Retrieve up to num_images from LMDB matching prefix."""
         clean_prefix = prefix_path.replace("\\", "/")
@@ -637,8 +652,7 @@ class ACTION_SLOT_LMDBDataset(BaseDataset):
                     key_str = key.decode("utf-8")
 
                     if clean_prefix in key_str:
-                        sample = pickle.loads(val)
-                        results.append(sample)
+                        results.append(self._decode_lmdb_value(val))
                     else:
                         break
 
@@ -647,31 +661,49 @@ class ACTION_SLOT_LMDBDataset(BaseDataset):
 
         return results
 
-    @staticmethod
-    def _fetch_samples_by_keys(env, keys: List[str]) -> List[Any]:
-        """Fetch and unpickle exact keys from LMDB in a single read transaction."""
+    @classmethod
+    def _fetch_samples_by_keys(cls, env, keys: List[str]) -> List[Any]:
+        """Fetch and decode exact keys from LMDB in a single read transaction."""
         results = []
         with env.begin() as txn:
             for k in keys:
                 val = txn.get(k.encode("utf-8"))
                 if val is not None:
-                    results.append(pickle.loads(val))
+                    results.append(cls._decode_lmdb_value(val))
         return results
 
     def _decode_rgb_frames_cv2(
-        self, videos: List[Dict[str, Any]], target_hw: Tuple[int, int] = (256, 768)
+        self,
+        videos: List[Dict[str, Any]],
+        target_hw: Tuple[int, int] = (256, 768),
+        rgb_path: Optional[str] = None,
     ) -> torch.Tensor:
-        """Giải mã trực tiếp các JPEG bytes sang uint8 Tensor (T, 3, H, W) bằng OpenCV/libjpeg-turbo DCT 1/2."""
+        """Giải mã trực tiếp RAW0 / JPEG bytes sang uint8 Tensor (T, 3, H, W)."""
         target_h, target_w = target_hw
         n = min(len(videos), self.sequence_len)
         arr = np.empty((self.sequence_len, target_h, target_w, 3), dtype=np.uint8)
+        use_reduced = self._rgb_reduced_cache.get(rgb_path, True) if rgb_path is not None else True
+
         for i in range(n):
-            buf = np.frombuffer(videos[i]["image"], dtype=np.uint8)
-            mat = cv2.imdecode(buf, cv2.IMREAD_REDUCED_COLOR_2)
-            if mat is None or mat.shape[0] < target_h or mat.shape[1] < target_w:
+            sample = videos[i]
+            if "raw_array" in sample:
+                mat = sample["raw_array"]
+                if mat.shape[0] != target_h or mat.shape[1] != target_w:
+                    mat = cv2.resize(mat, (target_w, target_h), interpolation=cv2.INTER_LINEAR)
+                arr[i] = mat
+                continue
+
+            buf = np.frombuffer(sample["image"], dtype=np.uint8)
+            mat = cv2.imdecode(buf, cv2.IMREAD_REDUCED_COLOR_2) if use_reduced else cv2.imdecode(buf, cv2.IMREAD_COLOR)
+            if use_reduced and (mat is None or mat.shape[0] < target_h or mat.shape[1] < target_w):
+                # Repacked LMDB đã ở sẵn (256, 768): ghi nhớ để các frame sau decode 1 lần bằng IMREAD_COLOR
+                if rgb_path is not None:
+                    self._rgb_reduced_cache[rgb_path] = False
+                use_reduced = False
                 mat = cv2.imdecode(buf, cv2.IMREAD_COLOR)
+
             if mat is None:
-                pil_img = Image.open(io.BytesIO(videos[i]["image"])).convert("RGB").resize((target_w, target_h), Image.BILINEAR)
+                pil_img = Image.open(io.BytesIO(sample["image"])).convert("RGB").resize((target_w, target_h), Image.BILINEAR)
                 arr[i] = np.asarray(pil_img, dtype=np.uint8)
                 continue
             if mat.shape[0] != target_h or mat.shape[1] != target_w:
@@ -684,16 +716,26 @@ class ACTION_SLOT_LMDBDataset(BaseDataset):
     def _decode_bg_masks_cv2(
         self, bg_masks: List[Dict[str, Any]], target_hw: Tuple[int, int] = (32, 96)
     ) -> torch.Tensor:
-        """Giải mã trực tiếp PNG mask sang float32 Tensor (T_mask, 1, H, W) trong [0, 1]."""
+        """Giải mã trực tiếp RAW0 / PNG mask sang float32 Tensor (T_mask, 1, H, W) trong [0, 1]."""
         target_h, target_w = target_hw
         expected_len = max(1, self.sequence_len // self.mask_every_frame)
         n = min(len(bg_masks), expected_len)
         arr = np.empty((expected_len, 1, target_h, target_w), dtype=np.uint8)
         for i in range(n):
-            buf = np.frombuffer(bg_masks[i]["image"], dtype=np.uint8)
+            sample = bg_masks[i]
+            if "raw_array" in sample:
+                mat = sample["raw_array"]
+                if mat.ndim == 3:
+                    mat = mat[:, :, 0]
+                if mat.shape[0] != target_h or mat.shape[1] != target_w:
+                    mat = cv2.resize(mat, (target_w, target_h), interpolation=cv2.INTER_NEAREST)
+                arr[i, 0] = mat
+                continue
+
+            buf = np.frombuffer(sample["image"], dtype=np.uint8)
             mat = cv2.imdecode(buf, cv2.IMREAD_GRAYSCALE)
             if mat is None:
-                pil_m = Image.open(io.BytesIO(bg_masks[i]["image"])).convert("L").resize((target_w, target_h), Image.NEAREST)
+                pil_m = Image.open(io.BytesIO(sample["image"])).convert("L").resize((target_w, target_h), Image.NEAREST)
                 arr[i, 0] = np.asarray(pil_m, dtype=np.uint8)
                 continue
             if mat.shape[0] != target_h or mat.shape[1] != target_w:
@@ -747,7 +789,11 @@ class ACTION_SLOT_LMDBDataset(BaseDataset):
         }
 
         if self._use_fast_cv2:
-            data: Any = self._decode_rgb_frames_cv2(videos, self._fast_rgb_hw) if videos else []
+            data: Any = (
+                self._decode_rgb_frames_cv2(videos, self._fast_rgb_hw, rgb_path=path["rgb_path"])
+                if videos
+                else []
+            )
             if bg_masks:
                 target["bg_seg"] = self._decode_bg_masks_cv2(bg_masks, self._fast_bg_hw)
             return {"inputs": data, "targets": target}
@@ -756,12 +802,18 @@ class ACTION_SLOT_LMDBDataset(BaseDataset):
 
         if videos:
             for sample in videos:
-                img = Image.open(io.BytesIO(sample["image"])).convert("RGB")
+                if "raw_array" in sample:
+                    img = Image.fromarray(sample["raw_array"]).convert("RGB")
+                else:
+                    img = Image.open(io.BytesIO(sample["image"])).convert("RGB")
                 data.append(img)
 
         if bg_masks:
             for sample in bg_masks:
-                img = Image.open(io.BytesIO(sample["image"])).convert("L")
+                if "raw_array" in sample:
+                    img = Image.fromarray(sample["raw_array"]).convert("L")
+                else:
+                    img = Image.open(io.BytesIO(sample["image"])).convert("L")
                 target["bg_seg"].append(img)
 
         # Guarantee exact sequence length and background mask count across all batch items
