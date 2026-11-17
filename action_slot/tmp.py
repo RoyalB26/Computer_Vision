@@ -1,376 +1,242 @@
-"""Script trực quan hóa và giải thích `PanoramicRayPositionEncoding` trên một ảnh panoramic (256x768 -> grid 16x48).
-
-Cách dùng:
-    # Tự động lấy 1 frame thật từ LMDB TACO (hoặc tạo ảnh đường phố mẫu nếu không có LMDB)
-    python action_slot/tmp.py
-
-    # Hoặc chỉ định một ảnh bất kỳ
-    python action_slot/tmp.py --image path/to/frame.jpg --show
-"""
-
-import argparse
 import os
-import pickle
 import sys
-from typing import Dict, List, Optional, Tuple
-
+import argparse
+import pickle
+import lmdb
 import cv2
-import matplotlib.pyplot as plt
-import numpy as np
 import torch
-import torch.nn.functional as F
-
-# Bảo đảm import được action_slot.model dù chạy từ thư mục gốc hay trong action_slot/
-CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
-PROJECT_ROOT = os.path.abspath(os.path.join(CURRENT_DIR, ".."))
-for p in (PROJECT_ROOT, CURRENT_DIR):
-    if p not in sys.path:
-        sys.path.insert(0, p)
-
-from action_slot.model import (  # noqa: E402
-    PanoramicRayPositionEncoding,
-    build_2d_sincos_position_embedding,
-)
+import torch.nn as nn
+import numpy as np
 
 
-DEFAULT_LMDB_PATH = "D:/apps/Datasets/TACO/data/ap_Town07_lmdb/rgb_front"
-DEFAULT_OUT_PATH = os.path.join(CURRENT_DIR, "panoramic_ray_pe_explained.png")
-
-
-def load_sample_image(
-    image_path: Optional[str] = None,
-    lmdb_path: str = DEFAULT_LMDB_PATH,
-    lmdb_idx: int = 10,
-    target_hw: Tuple[int, int] = (256, 768),
-) -> Tuple[np.ndarray, str]:
-    """Đọc ảnh RGB kích thước (H, W, 3) uint8 từ file, LMDB TACO, hoặc ảnh giả lập."""
-    th, tw = target_hw
-
-    if image_path:
-        bgr = cv2.imread(image_path, cv2.IMREAD_COLOR)
-        if bgr is None:
-            raise FileNotFoundError(f"Không đọc được ảnh tại: {image_path}")
-        rgb = cv2.cvtColor(cv2.resize(bgr, (tw, th), interpolation=cv2.INTER_LINEAR), cv2.COLOR_BGR2RGB)
-        return rgb, f"Image file: {image_path}"
-
-    if lmdb_path and os.path.exists(lmdb_path):
-        try:
-            import lmdb
-
-            env = lmdb.open(lmdb_path, readonly=True, lock=False, readahead=False, meminit=False)
-            with env.begin(write=False) as txn:
-                cursor = txn.cursor()
-                if cursor.first():
-                    for _ in range(max(0, lmdb_idx)):
-                        if not cursor.next():
-                            cursor.first()
-                            break
-                    key, val = cursor.item()
-                    sample = pickle.loads(val)
-                    buf = np.frombuffer(sample["image"], dtype=np.uint8)
-                    bgr = cv2.imdecode(buf, cv2.IMREAD_COLOR)
-                    if bgr is not None:
-                        rgb = cv2.cvtColor(
-                            cv2.resize(bgr, (tw, th), interpolation=cv2.INTER_LINEAR),
-                            cv2.COLOR_BGR2RGB,
-                        )
-                        key_name = key.decode("utf-8", errors="ignore")
-                        env.close()
-                        return rgb, f"TACO LMDB ({key_name})"
-            env.close()
-        except Exception as exc:
-            print(f"[Info] Không đọc được LMDB ({exc}), chuyển sang ảnh đường phố mẫu.")
-
-    # Fallback: tạo ảnh đường phố panoramic 3:1 có đường chân trời và các xe trái/giữa/phải
-    rgb = np.zeros((th, tw, 3), dtype=np.uint8)
-    horizon_y = int(th * 0.45)
-    rgb[:horizon_y] = (145, 190, 235)  # Trời
-    rgb[horizon_y:] = (72, 76, 82)     # Mặt đường
-    # Vạch kẻ đường phối cảnh hội tụ về tâm chân trời
-    cx = tw // 2
-    for dx_bot, col in [(-320, (220, 220, 220)), (-110, (240, 200, 70)), (110, (240, 200, 70)), (320, (220, 220, 220))]:
-        cv2.line(rgb, (cx, horizon_y), (cx + dx_bot, th - 1), col, 2)
-    # Xe bên trái gần, xe phía trước xa, xe bên phải trung bình
-    cv2.rectangle(rgb, (75, 165), (165, 225), (210, 60, 60), -1)
-    cv2.rectangle(rgb, (365, 118), (403, 142), (60, 175, 90), -1)
-    cv2.rectangle(rgb, (585, 145), (660, 195), (45, 130, 225), -1)
-    return rgb, "Synthetic 3:1 Panoramic Road"
-
-
-def compute_cosine_similarity_map(emb: torch.Tensor, row: int, col: int) -> np.ndarray:
-    """Tính cosine similarity từ điểm (row, col) tới toàn bộ grid (H, W). emb shape: (1, D, H, W)."""
-    feat = emb.squeeze(0).float()  # (D, H, W)
-    norm_feat = F.normalize(feat, dim=0)
-    ref = norm_feat[:, row, col].view(-1, 1, 1)
-    sim = (norm_feat * ref).sum(dim=0)  # (H, W)
-    return sim.detach().cpu().numpy()
-
-
-def print_probe_explanation(
-    probes: List[Tuple[str, int, int]],
-    geom: np.ndarray,
-    sincos: np.ndarray,
-    ray_emb: np.ndarray,
-    full_pe: np.ndarray,
-    hfov_deg: float,
-    vfov_deg: float,
-    horizon_ratio: float,
-    grid_hw: Tuple[int, int],
-) -> None:
-    """In bảng phân tích chi tiết các đại lượng hình học tại 5 điểm thăm dò."""
-    H, W = grid_hw
-    print("=" * 102)
-    print(f"PHÂN TÍCH PanoramicRayPositionEncoding | Feature Grid: (H={H}, W={W}) | HFOV={hfov_deg}° | VFOV={vfov_deg}° | Horizon={horizon_ratio}")
-    print("=" * 102)
-    header = (
-        f"{'Điểm':<24} | {'(r,c)':<7} | {'theta':>7} | {'phi':>6} | "
-        f"{'Tia 3D (rx, ry, rz)':<23} | {'invD':>5} | {'logD':>5} | {'||sincos||':>10} | {'||PE||':>8}"
+def parse_args():
+    parser = argparse.ArgumentParser(description="Filter and visualize road foreground using bg_seg, color distance, LayerNorm, and ReLU.")
+    parser.add_argument(
+        "--input-dir",
+        type=str,
+        default="D:/apps/Datasets/TACO/data/ap_Town07_lmdb",
+        help="Path to LMDB directory containing rgb_front and mask_background folders.",
     )
-    print(header)
-    print("-" * len(header))
-    for label, r, c in probes:
-        rx, ry, rz, u, v, inv_d, log_d = geom[:, r, c]
-        theta_deg = u * 0.5 * hfov_deg
-        phi_deg = v * 0.5 * vfov_deg
-        norm_sc = float(np.linalg.norm(sincos[:, r, c]))
-        norm_pe = float(np.linalg.norm(full_pe[:, r, c]))
-        ray_str = f"({rx:+.2f}, {ry:+.2f}, {rz:+.2f})"
-        print(
-            f"{label:<24} | ({r:>2},{c:>2}) | {theta_deg:>+6.1f}° | {phi_deg:>+5.1f}° | "
-            f"{ray_str:<23} | {inv_d:>5.2f} | {log_d:>5.2f} | {norm_sc:>10.2f} | {norm_pe:>8.2f}"
-        )
-    print("-" * len(header))
-    print(
-        "Ghi chú:\n"
-        "  • (rx, ry, rz) luôn có chuẩn Euclid = 1: rx < 0 là bên trái, rx > 0 là bên phải, rz lớn là hướng thẳng phía trước.\n"
-        "  • invD (ground_inv_depth): bằng 0 ở đường chân trời & bầu trời (r/H <= horizon_ratio), tăng dần về 1 ở đáy ảnh (sát xe ego).\n"
-        "  • logD (ground_log_depth): thang nén log khoảng cách mặt đường (lớn ở chân trời = xa, nhỏ ở đáy ảnh = gần).\n"
-        "  • PE cuối = sincos + ray_scale * ray_mlp(geom), giúp SlotAttention có cả tần số góc cầu lẫn hình học 3D.\n"
+    parser.add_argument(
+        "--index",
+        type=int,
+        default=0,
+        help="Index of the frame/scenario to inspect (0-based).",
     )
-
-
-def visualize_panoramic_ray_pe(
-    rgb: np.ndarray,
-    source_desc: str,
-    grid_hw: Tuple[int, int] = (16, 48),
-    embed_dim: int = 256,
-    hfov_deg: float = 180.0,
-    vfov_deg: float = 60.0,
-    horizon_ratio: float = 0.45,
-    out_path: str = DEFAULT_OUT_PATH,
-    show: bool = False,
-) -> None:
-    H, W = grid_hw
-    img_h, img_w = rgb.shape[:2]
-
-    ray_pe = PanoramicRayPositionEncoding(
-        embed_dim=embed_dim,
-        hfov_deg=hfov_deg,
-        vfov_deg=vfov_deg,
-        horizon_ratio=horizon_ratio,
-        default_hw=(H, W),
+    parser.add_argument(
+        "--save-path",
+        type=str,
+        default=None,
+        help="Path to save result image. Default saves to artifact directory.",
     )
-    ray_pe.eval()
-
-    with torch.no_grad():
-        sincos_t, geom_t = ray_pe._build_spherical_grid(H, W, dtype=torch.float32)
-        ray_emb_t = ray_pe.ray_mlp(geom_t)
-        full_pe_t = ray_pe(H, W, dtype=torch.float32)
-        old_2d_pe_t = build_2d_sincos_position_embedding(H, W, embed_dim, dtype=torch.float32)
-
-    geom = geom_t.squeeze(0).numpy()       # (7, H, W)
-    sincos = sincos_t.squeeze(0).numpy()   # (D, H, W)
-    ray_emb = ray_emb_t.squeeze(0).numpy() # (D, H, W)
-    full_pe = full_pe_t.squeeze(0).numpy() # (D, H, W)
-
-    # 5 điểm thăm dò trên lưới (H=16, W=48)
-    r_horizon = min(H - 1, max(0, int(round(horizon_ratio * H))))
-    probes = [
-        ("A: Trai gan", min(H - 1, int(0.80 * H)), int(0.12 * W)),
-        ("B: Giua chan troi", r_horizon, W // 2),
-        ("C: Giua gan", min(H - 1, int(0.80 * H)), W // 2),
-        ("D: Phai gan", min(H - 1, int(0.80 * H)), int(0.88 * W)),
-        ("E: Bau troi", max(0, int(0.18 * H)), int(0.65 * W)),
-    ]
-    probe_colors = ["#ff4d4d", "#ffd23f", "#00e5ff", "#52e368", "#d580ff"]
-
-    print_probe_explanation(
-        probes, geom, sincos, ray_emb, full_pe, hfov_deg, vfov_deg, horizon_ratio, grid_hw
+    parser.add_argument(
+        "--no-gui",
+        action="store_true",
+        help="Do not attempt cv2.imshow (useful for headless/remote runs).",
     )
-
-    # Cosine similarity từ điểm C (Giữa gần) để so sánh PE cũ vs PE mới
-    _, ref_r, ref_c = probes[2]
-    sim_old = compute_cosine_similarity_map(old_2d_pe_t, ref_r, ref_c)
-    sim_new = compute_cosine_similarity_map(full_pe_t, ref_r, ref_c)
-
-    # Vẽ figure giải thích trực quan
-    fig = plt.figure(figsize=(18, 12), facecolor="#111418")
-    gs = fig.add_gridspec(4, 2, height_ratios=[1.15, 1.0, 1.0, 1.15], hspace=0.42, wspace=0.16)
-    plt.rcParams["text.color"] = "#eef2f6"
-    plt.rcParams["axes.edgecolor"] = "#3a414d"
-
-    def style_ax(ax, title: str):
-        ax.set_title(title, fontsize=11, fontweight="bold", color="#f5f7fa", pad=8)
-        ax.tick_params(colors="#b8c0cc", labelsize=8)
-
-    # --- Panel 1 (trên cùng, trải rộng 2 cột): Ảnh gốc + lưới (16x48) + chân trời + 5 điểm ---
-    ax0 = fig.add_subplot(gs[0, :])
-    ax0.imshow(rgb)
-    # Vẽ lưới feature stride-16 mờ
-    step_x = img_w / W
-    step_y = img_h / H
-    for gx in np.arange(0, img_w, step_x):
-        ax0.axvline(gx, color="white", alpha=0.12, lw=0.6)
-    for gy in np.arange(0, img_h, step_y):
-        ax0.axhline(gy, color="white", alpha=0.12, lw=0.6)
-    # Đường chân trời
-    hy = horizon_ratio * img_h
-    ax0.axhline(hy, color="#ffd23f", linestyle="--", lw=1.8, label=f"Horizon (y={horizon_ratio:.2f})")
-    # Đánh dấu 5 điểm thăm dò
-    label_offsets = [
-        (8, -10, "left"),     # A: Trái gần
-        (8, -10, "left"),     # B: Giữa chân trời
-        (0, -18, "center"),   # C: Giữa gần (đặt phía trên điểm để không đè vào D)
-        (-8, 12, "right"),    # D: Phải gần (đặt phía dưới-trái điểm)
-        (8, -8, "left"),      # E: Bầu trời
-    ]
-    for (lbl, r, c), col, (dx_lbl, dy_lbl, ha) in zip(probes, probe_colors, label_offsets):
-        px = (c + 0.5) * step_x
-        py = (r + 0.5) * step_y
-        rx, ry, rz, u, v, inv_d, _ = geom[:, r, c]
-        th_deg = u * 0.5 * hfov_deg
-        ax0.scatter([px], [py], s=95, color=col, edgecolors="black", linewidths=1.3, zorder=5)
-        ax0.text(
-            px + dx_lbl,
-            py + dy_lbl,
-            f"{lbl} ({th_deg:+.0f}°, invD={inv_d:.2f})",
-            color=col,
-            fontsize=8.5,
-            fontweight="bold",
-            ha=ha,
-            bbox=dict(boxstyle="round,pad=0.2", facecolor="#0d1117", alpha=0.82, edgecolor=col, lw=0.8),
-        )
-    ax0.set_xticks(np.linspace(0, img_w, 7))
-    ax0.set_xticklabels([f"{ang:+.0f}°" for ang in np.linspace(-hfov_deg / 2, hfov_deg / 2, 7)])
-    ax0.set_xlabel("Góc phương vị ngang theta (Azimuth)", color="#b8c0cc", fontsize=9)
-    ax0.set_ylabel("Pixel Y", color="#b8c0cc", fontsize=9)
-    ax0.legend(loc="upper left", facecolor="#161b22", edgecolor="#3a414d", fontsize=9)
-    style_ax(ax0, f"1. Ảnh đầu vào ({img_h}x{img_w}) + Feature Grid ({H}x{W}) | Nguồn: {source_desc}")
-
-    # --- Panel 2: ray_x (trái <-> phải) ---
-    ax1 = fig.add_subplot(gs[1, 0])
-    im1 = ax1.imshow(geom[0], cmap="coolwarm", vmin=-1.0, vmax=1.0, aspect="auto")
-    ax1.axhline(horizon_ratio * H - 0.5, color="yellow", ls="--", lw=1.2)
-    cb1 = fig.colorbar(im1, ax=ax1, fraction=0.03, pad=0.02)
-    cb1.ax.tick_params(colors="#b8c0cc", labelsize=8)
-    style_ax(ax1, "2a. Camera Ray X = sin(theta)*cos(phi)  [-1: Trái | 0: Thẳng | +1: Phải]")
-
-    # --- Panel 3: ground_inv_depth (chiều sâu mặt đường) ---
-    ax2 = fig.add_subplot(gs[1, 1])
-    im2 = ax2.imshow(geom[5], cmap="inferno", vmin=0.0, vmax=1.0, aspect="auto")
-    ax2.axhline(horizon_ratio * H - 0.5, color="cyan", ls="--", lw=1.2)
-    cb2 = fig.colorbar(im2, ax=ax2, fraction=0.03, pad=0.02)
-    cb2.ax.tick_params(colors="#b8c0cc", labelsize=8)
-    style_ax(ax2, "2b. Ground Inverse-Depth Proxy  [0: Trời/Chân trời | 1: Mặt đường sát xe]")
-
-    # --- Panel 4: Spherical Sin-Cos (tần số thấp vs tần số cao theo góc phương vị theta) ---
-    ax3 = fig.add_subplot(gs[2, 0])
-    # Ghép 2 nửa trên/dưới để quan sát cùng lúc: trên là sin(1*theta) (thô), dưới là sin(W*theta) (tinh)
-    dim_per_axis = embed_dim // 2
-    num_bands = dim_per_axis // 2
-    band_low = sincos[0]                   # sin(freq_0 * theta)
-    band_high = sincos[num_bands - 1]      # sin(freq_max * theta)
-    split_vis = np.vstack([band_low[: H // 2], band_high[H // 2 :]])
-    im3 = ax3.imshow(split_vis, cmap="RdBu_r", vmin=-1.0, vmax=1.0, aspect="auto")
-    ax3.axhline(H // 2 - 0.5, color="white", lw=1.5)
-    ax3.text(1.5, 2.0, "Nửa trên: sin(freq_thấp * theta) -> vùng Trái/Giữa/Phải", color="black", fontsize=8,
-             bbox=dict(facecolor="white", alpha=0.75, pad=1.5))
-    ax3.text(1.5, H - 2.2, "Nửa dưới: sin(freq_cao * theta) -> phân giải từng cột góc", color="black", fontsize=8,
-             bbox=dict(facecolor="white", alpha=0.75, pad=1.5))
-    cb3 = fig.colorbar(im3, ax=ax3, fraction=0.03, pad=0.02)
-    cb3.ax.tick_params(colors="#b8c0cc", labelsize=8)
-    style_ax(ax3, "3a. Spherical Sin-Cos Bands theo góc phương vị theta")
-
-    # --- Panel 5: Bird's-Eye View minh họa tia 3D (ray_x, ray_z) của 5 điểm thăm dò ---
-    ax4 = fig.add_subplot(gs[2, 1], facecolor="#0d1117")
-    arc_t = np.linspace(-0.5 * np.radians(hfov_deg), 0.5 * np.radians(hfov_deg), 200)
-    ax4.plot(np.sin(arc_t), np.cos(arc_t), color="#4b5563", ls="--", lw=1.2, label="Vòng cung FOV")
-    ax4.scatter([0.0], [0.0], color="white", s=70, zorder=5, label="Camera Ego (0,0)")
-    for (lbl, r, c), col in zip(probes, probe_colors):
-        rx, ry, rz, _, _, inv_d, _ = geom[:, r, c]
-        # Độ dài tia minh họa: gần xe thì ngắn, gần chân trời thì dài
-        vis_len = 0.35 + 0.65 * (1.0 - inv_d) if r >= r_horizon else 1.05
-        ax4.annotate(
-            "",
-            xy=(rx * vis_len, rz * vis_len),
-            xytext=(0.0, 0.0),
-            arrowprops=dict(arrowstyle="->", color=col, lw=2.0),
-        )
-        ax4.text(rx * vis_len * 1.06, rz * vis_len * 1.06, lbl.split(":")[0], color=col, fontsize=9, fontweight="bold")
-    ax4.set_xlim(-1.25, 1.25)
-    ax4.set_ylim(-0.15, 1.25)
-    ax4.set_xlabel("ray_x (Trái <-> Phải)", color="#b8c0cc", fontsize=8.5)
-    ax4.set_ylabel("ray_z (Hướng tiến phía trước)", color="#b8c0cc", fontsize=8.5)
-    ax4.grid(color="#222831", ls=":", lw=0.8)
-    ax4.legend(loc="lower right", facecolor="#161b22", edgecolor="#3a414d", fontsize=8)
-    style_ax(ax4, "3b. Góc nhìn BEV từ trên xuống: Hướng tia 3D & tầm xa ước lượng của A..E")
-
-    # --- Panel 6 & 7: So sánh Cosine Similarity từ điểm C (Giữa gần) ---
-    for ax, sim_map, title in [
-        (fig.add_subplot(gs[3, 0]), sim_old, "4a. Cosine Similarity từ điểm C: 2D Sin-Cos CŨ"),
-        (fig.add_subplot(gs[3, 1]), sim_new, "4b. Cosine Similarity từ điểm C: PanoramicRayPE MỚI"),
-    ]:
-        ax.imshow(rgb)
-        sim_up = cv2.resize(sim_map, (img_w, img_h), interpolation=cv2.INTER_LINEAR)
-        im_s = ax.imshow(sim_up, cmap="jet", vmin=-0.3, vmax=1.0, alpha=0.52)
-        px = (ref_c + 0.5) * step_x
-        py = (ref_r + 0.5) * step_y
-        ax.scatter([px], [py], s=110, color="#00e5ff", edgecolors="black", linewidths=1.5, zorder=5)
-        ax.axhline(hy, color="#ffd23f", ls="--", lw=1.2)
-        cb = fig.colorbar(im_s, ax=ax, fraction=0.03, pad=0.02)
-        cb.ax.tick_params(colors="#b8c0cc", labelsize=8)
-        style_ax(ax, title)
-
-    fig.suptitle(
-        "Giải thích trực quan PanoramicRayPositionEncoding trên một ảnh 256x768",
-        fontsize=14,
-        fontweight="bold",
-        color="#ffffff",
-        y=0.99,
+    parser.add_argument(
+        "--mean-mode",
+        type=str,
+        default="road",
+        choices=["road", "image", "spatial"],
+        help="How local_mean is computed: 'road' (mean color of black region), 'image' (mean of entire image), or 'spatial' (local moving average filter).",
     )
-    plt.savefig(out_path, dpi=160, bbox_inches="tight", facecolor=fig.get_facecolor())
-    print(f"[OK] Đã lưu hình minh họa tại: {out_path}")
-    if show:
-        plt.show()
-    plt.close(fig)
+    parser.add_argument(
+        "--norm-scope",
+        type=str,
+        default="road",
+        choices=["road", "full"],
+        help="Scope of LayerNorm: 'road' (normalizes statistics of the black road region) or 'full' (nn.LayerNorm over full [H, W]).",
+    )
+    return parser.parse_args()
+
+
+def load_sample_from_lmdb(input_dir: str, index: int):
+    rgb_dir = os.path.join(input_dir, "rgb_front")
+    bg_dir = os.path.join(input_dir, "mask_background")
+
+    if not os.path.exists(rgb_dir):
+        raise FileNotFoundError(f"RGB folder not found: {rgb_dir}")
+    if not os.path.exists(bg_dir):
+        raise FileNotFoundError(f"mask_background folder not found: {bg_dir}")
+
+    env_bg = lmdb.open(bg_dir, readonly=True, lock=False)
+    env_rgb = lmdb.open(rgb_dir, readonly=True, lock=False)
+
+    with env_bg.begin() as txn_bg, env_rgb.begin() as txn_rgb:
+        cur = txn_bg.cursor()
+        total_bg = txn_bg.stat()["entries"]
+        if index < 0 or index >= total_bg:
+            raise IndexError(f"Index {index} out of range [0, {total_bg - 1}]")
+
+        cur.first()
+        for _ in range(index):
+            if not cur.next():
+                raise IndexError(f"Cannot seek to index {index}")
+
+        bg_key = cur.key().decode("utf-8")
+        bg_raw = cur.value()
+
+        # Derive RGB key corresponding to BG key
+        rgb_key = bg_key.replace("/mask/background/", "/rgb/front/").rsplit(".", 1)[0] + ".jpg"
+        rgb_raw = txn_rgb.get(rgb_key.encode("utf-8"))
+
+        if rgb_raw is None:
+            cur_rgb = txn_rgb.cursor()
+            cur_rgb.first()
+            for _ in range(index):
+                cur_rgb.next()
+            rgb_key = cur_rgb.key().decode("utf-8")
+            rgb_raw = cur_rgb.value()
+
+    try:
+        rgb_obj = pickle.loads(rgb_raw)
+        rgb_bytes = rgb_obj["image"] if isinstance(rgb_obj, dict) and "image" in rgb_obj else rgb_obj
+    except Exception:
+        rgb_bytes = rgb_raw
+
+    try:
+        bg_obj = pickle.loads(bg_raw)
+        bg_bytes = bg_obj["image"] if isinstance(bg_obj, dict) and "image" in bg_obj else bg_obj
+    except Exception:
+        bg_bytes = bg_raw
+
+    rgb_bgr = cv2.imdecode(np.frombuffer(rgb_bytes, np.uint8), cv2.IMREAD_COLOR)
+    bg_gray = cv2.imdecode(np.frombuffer(bg_bytes, np.uint8), cv2.IMREAD_GRAYSCALE)
+
+    if rgb_bgr is None or bg_gray is None:
+        raise ValueError(f"Failed to decode image or mask for index {index}")
+
+    return rgb_bgr, bg_gray, bg_key, rgb_key
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Trực quan hóa PanoramicRayPositionEncoding cho 1 ảnh.")
-    parser.add_argument("--image", type=str, default=None, help="Đường dẫn ảnh đầu vào (tùy chọn).")
-    parser.add_argument("--lmdb", type=str, default=DEFAULT_LMDB_PATH, help="Thư mục LMDB nếu không truyền --image.")
-    parser.add_argument("--lmdb-idx", type=int, default=10, help="Index mẫu lấy từ LMDB.")
-    parser.add_argument("--hfov", type=float, default=180.0, help="Horizontal FOV (độ).")
-    parser.add_argument("--vfov", type=float, default=60.0, help="Vertical FOV (độ).")
-    parser.add_argument("--horizon", type=float, default=0.45, help="Tỉ lệ chiều cao đường chân trời [0..1].")
-    parser.add_argument("--out", type=str, default=DEFAULT_OUT_PATH, help="Đường dẫn file PNG xuất ra.")
-    parser.add_argument("--show", action="store_true", help="Mở cửa sổ matplotlib hiển thị trực tiếp.")
-    args = parser.parse_args()
+    args = parse_args()
+    print(f"[INFO] Loading sample index {args.index} from {args.input_dir}...")
+    rgb_bgr, bg_gray, bg_key, rgb_key = load_sample_from_lmdb(args.input_dir, args.index)
+    print(f"  BG Key : {bg_key} (shape={bg_gray.shape})")
+    print(f"  RGB Key: {rgb_key} (shape={rgb_bgr.shape})")
 
-    rgb, src_desc = load_sample_image(
-        image_path=args.image,
-        lmdb_path=args.lmdb,
-        lmdb_idx=args.lmdb_idx,
-    )
-    visualize_panoramic_ray_pe(
-        rgb=rgb,
-        source_desc=src_desc,
-        hfov_deg=args.hfov,
-        vfov_deg=args.vfov,
-        horizon_ratio=args.horizon,
-        out_path=args.out,
-        show=args.show,
-    )
+    # 1. Align mask resolution to RGB image resolution
+    h_rgb, w_rgb = rgb_bgr.shape[:2]
+    if bg_gray.shape[:2] != (h_rgb, w_rgb):
+        bg_aligned = cv2.resize(bg_gray, (w_rgb, h_rgb), interpolation=cv2.INTER_NEAREST)
+    else:
+        bg_aligned = bg_gray
+
+    # 2. Get black region (bg_seg <= 127) -> Road + Vehicles / Pedestrians
+    black_mask_np = (bg_aligned <= 127)
+    black_ratio = np.mean(black_mask_np)
+    print(f"[INFO] Black region ratio (bg_seg <= 127): {black_ratio * 100:.2f}% of image")
+
+    # 3. Convert RGB to PyTorch tensor in [0, 1]
+    rgb_rgb = cv2.cvtColor(rgb_bgr, cv2.COLOR_BGR2RGB)
+    x = torch.from_numpy(rgb_rgb).float() / 255.0  # (H, W, 3)
+    black_mask = torch.from_numpy(black_mask_np)   # (H, W), bool
+
+    # 4. Compute local_mean according to mode
+    if args.mean_mode == "road":
+        if black_mask.any():
+            local_mean = x[black_mask].mean(dim=0, keepdim=True).unsqueeze(0)  # (1, 1, 3)
+        else:
+            local_mean = x.mean(dim=(0, 1), keepdim=True)
+    elif args.mean_mode == "image":
+        local_mean = x.mean(dim=(0, 1), keepdim=True)  # (1, 1, 3)
+    else:  # spatial moving average
+        x_4d = x.permute(2, 0, 1).unsqueeze(0)  # (1, 3, H, W)
+        k_size = 31
+        local_mean = torch.nn.functional.avg_pool2d(
+            x_4d, kernel_size=k_size, stride=1, padding=k_size // 2
+        ).squeeze(0).permute(1, 2, 0)  # (H, W, 3)
+
+    # 5. Apply the color difference formula:
+    # torch.exp(5 * torch.abs(x - local_mean))
+    color_diff = torch.abs(x - local_mean)
+    exp_diff = torch.exp(5.0 * color_diff)
+    score_map = exp_diff.mean(dim=-1)  # (H, W)
+
+    # 6. Apply LayerNorm followed by ReLU
+    if args.norm_scope == "road":
+        # Standardize strictly over the road/black region distribution
+        vals = score_map[black_mask]
+        mean_val = vals.mean()
+        std_val = vals.std()
+        normalized_score = torch.zeros_like(score_map)
+        normalized_score[black_mask] = (score_map[black_mask] - mean_val) / (std_val + 1e-6)
+    else:
+        # Standard PyTorch nn.LayerNorm over full spatial dimensions [H, W]
+        ln = nn.LayerNorm([score_map.shape[0], score_map.shape[1]], elementwise_affine=False)
+        score_input = torch.where(black_mask, score_map, torch.zeros_like(score_map))
+        normalized_score = ln(score_input)
+
+    # Apply ReLU activation
+    relu_score = torch.relu(normalized_score)
+
+    # Ensure sky/buildings (non-black regions) remain zeroed out
+    filtered_score = torch.where(black_mask, relu_score, torch.zeros_like(relu_score))
+
+    active_road_ratio = (filtered_score[black_mask] > 0).float().mean().item()
+    print(f"[INFO] Active non-zero foreground ratio within road after ReLU: {active_road_ratio * 100:.2f}%")
+    print(f"       (The remaining {100 - active_road_ratio * 100:.2f}% of flat road background was filtered to 0)")
+
+    # 7. Normalize active response to [0, 255] for visual heatmap
+    max_val = filtered_score.max().item()
+    if max_val > 0:
+        norm_score = torch.clamp(filtered_score / max_val, 0.0, 1.0)
+    else:
+        norm_score = filtered_score
+
+    score_gray = (norm_score.numpy() * 255.0).astype(np.uint8)
+    heatmap_bgr = cv2.applyColorMap(score_gray, cv2.COLORMAP_JET)
+    heatmap_bgr[~black_mask_np] = 0  # Black out non-road areas
+
+    # Also zero out areas where ReLU produced 0 (flat road background) to show pure objects
+    road_zero_mask = (score_gray == 0) & black_mask_np
+    heatmap_bgr[road_zero_mask] = (20, 20, 20)  # Very dark gray for zeroed road
+
+    # Masked RGB image: keep original RGB on black region only
+    masked_rgb_bgr = rgb_bgr.copy()
+    masked_rgb_bgr[~black_mask_np] = 0
+
+    # Composite comparison panel
+    # [1] Original RGB | [2] bg_seg mask | [3] Black region only | [4] LayerNorm -> ReLU
+    bg_vis_bgr = cv2.cvtColor(bg_aligned, cv2.COLOR_GRAY2BGR)
+
+    cv2.putText(rgb_bgr, f"Index {args.index}: Original RGB", (15, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
+    cv2.putText(bg_vis_bgr, "bg_seg (Black: Road+Vehicles, White: Sky/Bldg)", (15, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
+    cv2.putText(masked_rgb_bgr, "Masked Road Region (bg_seg <= 127)", (15, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
+    cv2.putText(heatmap_bgr, "ReLU(LayerNorm(exp(5*|x-mean|)))", (15, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
+
+    top_row = np.hstack([rgb_bgr, bg_vis_bgr])
+    bottom_row = np.hstack([masked_rgb_bgr, heatmap_bgr])
+    combined_img = np.vstack([top_row, bottom_row])
+
+    # Save to disk
+    if args.save_path is None:
+        save_dir = "C:/Users/hbaog/.gemini/antigravity/brain/a3bfaf0a-3396-4e7f-99fb-957f36dc6ae3"
+        os.makedirs(save_dir, exist_ok=True)
+        save_path = os.path.join(save_dir, f"tmp_result_idx_{args.index}_ln_relu.png")
+    else:
+        save_path = args.save_path
+
+    cv2.imwrite(save_path, combined_img)
+    print(f"[SUCCESS] Saved filtered output visualization to: {save_path}")
+
+    # Display on screen if GUI is supported and not disabled
+    if not args.no_gui:
+        try:
+            screen_w = 1600
+            scale = screen_w / combined_img.shape[1]
+            disp_h = int(combined_img.shape[0] * scale)
+            resized_disp = cv2.resize(combined_img, (screen_w, disp_h), interpolation=cv2.INTER_AREA)
+
+            cv2.imshow(f"TACO bg_seg LN+ReLU - Index {args.index}", resized_disp)
+            print("[INFO] Displaying image on screen. Press any key in the window to close...")
+            cv2.waitKey(0)
+            cv2.destroyAllWindows()
+        except cv2.error as e:
+            print(f"[NOTICE] cv2.imshow not available in current environment: {e}")
+            print(f"[NOTICE] Image has been saved to {save_path}")
 
 
 if __name__ == "__main__":

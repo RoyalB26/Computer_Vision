@@ -20,6 +20,7 @@ try:
     from .model_parts.slot_attention import SlotAttention
     from .model_parts.Mamba.model import Mamba, MambaConfig
     from .loss import ActionSlotLoss
+    from .road_filter import filter_road_color_difference
 except ImportError:
     from model_parts.backbones import X3DBackbone, YoloV11Backbone
     from model_parts.heads import (
@@ -33,6 +34,7 @@ except ImportError:
     from model_parts.slot_attention import SlotAttention
     from model_parts.Mamba.model import Mamba, MambaConfig
     from loss import ActionSlotLoss
+    from road_filter import filter_road_color_difference
 try:
     from .transform import GPUBatchPhotometricAug
 except ImportError:
@@ -912,7 +914,10 @@ class ActionSlotModel(BaseModel):
         )
 
         # 4. Slot Attention
-        actual_slots = self.num_slots + 1 if bg_slot else self.num_slots
+        self.road_slot = bool(kwargs.get("road_slot", True))
+        num_aux_bg_slots = (1 if bg_slot else 0) + (1 if self.road_slot else 0)
+        actual_slots = self.num_slots + num_aux_bg_slots
+        self.actual_slots = actual_slots
         self.slot_attention = SlotAttention(
             num_slots=actual_slots,
             dim=self.slot_dim,
@@ -984,6 +989,8 @@ class ActionSlotModel(BaseModel):
             feat_recon_weight=feat_recon_weight if self.use_feat_recon else 0.0,
             action_attn_weight=float(kwargs.get("action_attn_weight", 1.0)),
             bg_attn_weight=float(kwargs.get("bg_attn_weight", 0.5)),
+            road_attn_weight=float(kwargs.get("road_attn_weight", 0.5)),
+            road_slot=self.road_slot,
             ego_loss_weight=float(kwargs.get("ego_loss_weight", 0.2)),
             dual_stream_aux_weight=float(kwargs.get("dual_stream_aux_weight", 0.2)),
             use_class_pos_weight=bool(kwargs.get("use_class_pos_weight", True)),
@@ -1341,6 +1348,18 @@ class ActionSlotModel(BaseModel):
         label['actor'] = torch.stack(label['actor'], dim = 0)
         label['bg_seg'] = torch.stack(label['bg_seg'], dim = 0)
 
+        # Compute road flat mask (where relu == 0 in road region) to supervise road slot
+        if self.road_slot and 'inputs' in pred and 'bg_seg' in label:
+            try:
+                target_h, target_w = self.slot_attention.resolution[1], self.slot_attention.resolution[2]
+                label['road_mask'] = filter_road_color_difference(
+                    pred['inputs'],
+                    label['bg_seg'],
+                    target_res=(target_h, target_w),
+                )
+            except Exception:
+                pass
+
         # Tính loss ở FP32 khi bật AMP để tránh lỗi unsafe autocast của BCELoss và giữ ổn định số học
         pred_fp32 = {
             k: (v.float() if isinstance(v, torch.Tensor) and v.is_floating_point() else v)
@@ -1402,6 +1421,7 @@ class ActionSlotModel(BaseModel):
             "target_feats": aux_preds.get("target_feats"),
             "var_logits": pred_var,
             "dir_logits": pred_dir,
+            "inputs": inputs,
         }
 
         return self._compute_losses(pred, targets)
@@ -1444,6 +1464,7 @@ class ActionSlotModel(BaseModel):
             "target_feats": aux_preds.get("target_feats"),
             "var_logits": pred_var,
             "dir_logits": pred_dir,
+            "inputs": inputs,
         }
 
         output = {}
