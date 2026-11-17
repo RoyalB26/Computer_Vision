@@ -53,7 +53,8 @@ data:
           photometric_aug: true
     batch_size: 4
     shuffle: true
-    num_workers: 4
+    num_workers: 8
+    persistent_worker: true
 
   val:
     dataset:
@@ -67,7 +68,8 @@ data:
         - type: "Action_Slot_Transform"
     batch_size: 4
     shuffle: true
-    num_workers: 4
+    num_workers: 8
+    persistent_worker: true
 
 # 3. Optimizer Configuration (đồng bộ với D:\v7\Action-slot: lr=5e-4, wd=0.07)
 optimizer:
