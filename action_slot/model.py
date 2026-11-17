@@ -888,7 +888,14 @@ class ActionSlotModel(BaseModel):
         label['actor'] = torch.stack(label['actor'], dim = 0)
         label['bg_seg'] = torch.stack(label['bg_seg'], dim = 0)
 
-        loss = self.loss_fn(pred, label, validate)
+        # Tính loss ở FP32 khi bật AMP để tránh lỗi unsafe autocast của BCELoss và giữ ổn định số học
+        pred_fp32 = {
+            k: (v.float() if isinstance(v, torch.Tensor) and v.is_floating_point() else v)
+            for k, v in pred.items()
+        }
+        device_type = "cuda" if next(self.parameters()).is_cuda else "cpu"
+        with torch.amp.autocast(device_type=device_type, enabled=False):
+            loss = self.loss_fn(pred_fp32, label, validate)
 
         # Attach predictions and ground truth for metric evaluation (e.g., train actor mAP)
         if isinstance(loss, dict):
