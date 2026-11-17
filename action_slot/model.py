@@ -270,7 +270,7 @@ class ActionSlotModel(BaseModel):
         pretrained_backbone = kwargs.get('pretrained_backbone', True)
         pretrained_backbone_path = kwargs.get('pretrained_backbone_path', None)
 
-        self.backbone = YoloV11Backbone(
+        self.backbone = X3DBackbone(
             pretrained=pretrained_backbone,
             pretrained_path=pretrained_backbone_path,
             finetune_last_n_stages=finetune_last_n_stages,

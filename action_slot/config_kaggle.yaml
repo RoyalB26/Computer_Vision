@@ -32,7 +32,7 @@ model:
   dropout: 0.5
   bce_pos_weight: 5.0
   use_class_pos_weight: true
-  resolution3d: [16, 16, 48]
+  resolution3d: [16, 8, 24]
   mamba_grad_scale: 5.0
   backbone_grad_scale: 1.0
   ego_loss_weight: 0.2
@@ -85,10 +85,10 @@ optimizer:
   weight_decay: 0.07
 
 # 4. Learning Rate Scheduler Configuration
-lr_scheduler:
-  type: "CosineAnnealingLR"
-  T_max: 100
-  eta_min: 0.00001
+# lr_scheduler:
+#   type: "CosineAnnealingLR"
+#   T_max: 100
+#   eta_min: 0.00001
 
 
 # 5. Evaluation Metrics Configuration
