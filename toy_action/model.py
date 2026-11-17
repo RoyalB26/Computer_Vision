@@ -23,6 +23,7 @@ from .loss import ActionSlotLoss
 from .model_parts.backbones import MoViNetA0Backbone, X3DBackbone, YoloV11Backbone
 from .model_parts.heads import (
     Allocated_Head,
+    DualStreamActionHead,
     FrameObjectCountHead,
     ObjectActionHead,
     ReduceAllocatedHead,
@@ -76,6 +77,152 @@ def build_2d_sincos_position_embedding(H: int, W: int, embed_dim: int, device=No
     # Đổi về format chuẩn ảnh: [1, embed_dim, H, W]
     pos_emb = pos_emb.view(H, W, embed_dim).permute(2, 0, 1).unsqueeze(0)
     return pos_emb
+
+
+class SlotTrajectoryEncoder(nn.Module):
+    """Extract spatial centroid, spread, and gated velocity directly from slot attention maps.
+
+    Produces:
+      1. Per-frame motion embeddings `(B, T, S, slot_dim)` to inject explicit
+         `(x, y, dx, dy, spread, confidence)` cues into temporal Mamba.
+      2. Video-level trajectory summary embeddings `(B, S, slot_dim)` encoding
+         active-frame weighted linear regression slope `(slope_x, slope_y)`,
+         gated mean velocity `(vel_x, vel_y)`, speed, spread, and attention mass.
+    """
+
+    FRAME_FEAT_DIM = 10
+    VIDEO_FEAT_DIM = 12
+
+    def __init__(self, slot_dim: int = 256, hidden_dim: int = 128):
+        super().__init__()
+        self.frame_proj = nn.Sequential(
+            nn.LayerNorm(self.FRAME_FEAT_DIM),
+            nn.Linear(self.FRAME_FEAT_DIM, hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, slot_dim),
+        )
+        self.video_proj = nn.Sequential(
+            nn.LayerNorm(self.VIDEO_FEAT_DIM),
+            nn.Linear(self.VIDEO_FEAT_DIM, hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, slot_dim),
+        )
+
+    @staticmethod
+    def _extract_stats(obj_attn: Tensor) -> Tuple[Tensor, Tensor]:
+        """Compute per-frame `(B, T, S, 10)` and video-level `(B, S, 12)` trajectory features."""
+        b, t, s, h, w = obj_attn.shape
+        device = obj_attn.device
+        attn = obj_attn.float()
+
+        # Sharpen attention spatially to suppress uniform background floor before centroiding
+        weights = attn.pow(2)
+        prob = weights / weights.sum(dim=(-2, -1), keepdim=True).clamp(min=1e-6)
+
+        ys = torch.linspace(-1.0, 1.0, steps=h, device=device, dtype=torch.float32)
+        xs = torch.linspace(-1.0, 1.0, steps=w, device=device, dtype=torch.float32)
+        grid_y, grid_x = torch.meshgrid(ys, xs, indexing="ij")
+        grid_x = grid_x.view(1, 1, 1, h, w)
+        grid_y = grid_y.view(1, 1, 1, h, w)
+
+        cx = (prob * grid_x).sum(dim=(-2, -1))  # (B, T, S)
+        cy = (prob * grid_y).sum(dim=(-2, -1))  # (B, T, S)
+        std_x = torch.sqrt((prob * (grid_x - cx[..., None, None]).pow(2)).sum(dim=(-2, -1)) + 1e-6)
+        std_y = torch.sqrt((prob * (grid_y - cy[..., None, None]).pow(2)).sum(dim=(-2, -1)) + 1e-6)
+
+        peak = attn.amax(dim=(-2, -1))  # (B, T, S)
+        mass = attn.mean(dim=(-2, -1))  # (B, T, S)
+
+        # Gated 1-step & 2-step finite differences (suppresses spawn-frame jumps)
+        dx = torch.zeros_like(cx)
+        dy = torch.zeros_like(cy)
+        pair_gate = torch.zeros_like(peak)
+        if t > 1:
+            pair_gate[:, 1:] = peak[:, 1:] * peak[:, :-1]
+            dx[:, 1:] = (cx[:, 1:] - cx[:, :-1]) * pair_gate[:, 1:]
+            dy[:, 1:] = (cy[:, 1:] - cy[:, :-1]) * pair_gate[:, 1:]
+
+        dx2 = torch.zeros_like(cx)
+        dy2 = torch.zeros_like(cy)
+        if t > 2:
+            gate2 = peak[:, 2:] * peak[:, :-2]
+            dx2[:, 2:] = 0.5 * (cx[:, 2:] - cx[:, :-2]) * gate2
+            dy2[:, 2:] = 0.5 * (cy[:, 2:] - cy[:, :-2]) * gate2
+
+        frame_feats = torch.stack(
+            [
+                cx * peak,
+                cy * peak,
+                dx,
+                dy,
+                dx2,
+                dy2,
+                std_x * peak,
+                std_y * peak,
+                peak,
+                mass,
+            ],
+            dim=-1,
+        )  # (B, T, S, 10)
+
+        # Video-level trajectory summary weighted by active object presence
+        max_peak = peak.amax(dim=1)
+        mean_peak = peak.mean(dim=1)
+        max_mass = mass.amax(dim=1)
+        mean_mass = mass.mean(dim=1)
+
+        w_t = peak.pow(2) + 1e-4
+        w_norm = w_t / w_t.sum(dim=1, keepdim=True)  # (B, T, S)
+        mean_std_x = (w_norm * std_x).sum(dim=1) * max_peak
+        mean_std_y = (w_norm * std_y).sum(dim=1) * max_peak
+
+        if t > 1:
+            t_grid = torch.linspace(-1.0, 1.0, steps=t, device=device, dtype=torch.float32).view(1, t, 1)
+            t_mean = (w_norm * t_grid).sum(dim=1, keepdim=True)
+            dt = t_grid - t_mean
+            t_var = (w_norm * dt.pow(2)).sum(dim=1).clamp(min=1e-4)
+
+            cx_mean = (w_norm * cx).sum(dim=1, keepdim=True)
+            cy_mean = (w_norm * cy).sum(dim=1, keepdim=True)
+            slope_x = ((w_norm * dt * (cx - cx_mean)).sum(dim=1) / t_var) * max_peak
+            slope_y = ((w_norm * dt * (cy - cy_mean)).sum(dim=1) / t_var) * max_peak
+
+            gate_sum = pair_gate[:, 1:].sum(dim=1) + 0.1
+            vel_x = dx[:, 1:].sum(dim=1) / gate_sum
+            vel_y = dy[:, 1:].sum(dim=1) / gate_sum
+        else:
+            slope_x = torch.zeros_like(max_peak)
+            slope_y = torch.zeros_like(max_peak)
+            vel_x = torch.zeros_like(max_peak)
+            vel_y = torch.zeros_like(max_peak)
+
+        slope_mag = torch.sqrt(slope_x.pow(2) + slope_y.pow(2) + 1e-6) * max_peak
+        speed = torch.sqrt(vel_x.pow(2) + vel_y.pow(2) + 1e-6) * max_peak
+
+        video_feats = torch.stack(
+            [
+                slope_x,
+                slope_y,
+                vel_x,
+                vel_y,
+                slope_mag,
+                speed,
+                mean_std_x,
+                mean_std_y,
+                max_peak,
+                mean_peak,
+                max_mass,
+                mean_mass,
+            ],
+            dim=-1,
+        )  # (B, S, 12)
+
+        return frame_feats.to(dtype=obj_attn.dtype), video_feats.to(dtype=obj_attn.dtype)
+
+    def forward(self, obj_attn: Tensor) -> Tuple[Tensor, Tensor]:
+        frame_feats, video_feats = self._extract_stats(obj_attn)
+        return self.frame_proj(frame_feats), self.video_proj(video_feats)
+
 
 @MODELS.register_module(name="ActionSlotModel")
 @MODELS.register_module(name="ToyActionSlotModel")
@@ -202,14 +349,30 @@ class ActionSlotModel(BaseModel):
 
         # 5. Classification Head & Per-Frame Object Count Head
         self.actor_loss_type = str(kwargs.get("actor_loss_type", "bce")).lower()
+        self.head_type = str(kwargs.get("head_type", "dual_stream")).lower()
         if self.actor_loss_type == "bce" and self.num_slots < num_actor_class:
-            self.head = ObjectActionHead(
-                in_channel=slot_dim,
-                num_actor_classes=num_actor_class,
-                num_slots=self.num_slots,
-                num_ego_classes=num_ego_class,
-                ego_channel=ego_c,
-            )
+            if self.head_type in ("dual", "dual_stream", "decoupled") and num_actor_class % (self.num_slots * 2) == 0:
+                num_variants = 2
+                num_actions = num_actor_class // (self.num_slots * num_variants)
+                self.head = DualStreamActionHead(
+                    in_channel=slot_dim,
+                    num_actor_classes=num_actor_class,
+                    num_slots=self.num_slots,
+                    num_variants=num_variants,
+                    num_actions=num_actions,
+                    hidden_dim=int(kwargs.get("head_hidden_dim", 128)),
+                    dropout=float(kwargs.get("head_dropout", 0.2)),
+                    num_ego_classes=num_ego_class,
+                    ego_channel=ego_c,
+                )
+            else:
+                self.head = ObjectActionHead(
+                    in_channel=slot_dim,
+                    num_actor_classes=num_actor_class,
+                    num_slots=self.num_slots,
+                    num_ego_classes=num_ego_class,
+                    ego_channel=ego_c,
+                )
         else:
             self.head = ReduceAllocatedHead(
                 in_channel=slot_dim,
@@ -267,6 +430,7 @@ class ActionSlotModel(BaseModel):
             action_attn_weight=float(kwargs.get("action_attn_weight", 1.0)),
             bg_attn_weight=float(kwargs.get("bg_attn_weight", 0.5)),
             feat_recon_weight=feat_recon_weight if self.use_feat_recon else 0.0,
+            dual_stream_aux_weight=float(kwargs.get("dual_stream_aux_weight", 0.5)),
             bg_mask=True,
             bg_slot=bg_slot,
         )
@@ -279,6 +443,14 @@ class ActionSlotModel(BaseModel):
             num_slot=self.num_slots,
         )
         self.mamba = Mamba(mambaCfg)
+        self.use_slot_trajectory = bool(kwargs.get("use_slot_trajectory", True))
+        if self.use_slot_trajectory:
+            self.traj_encoder = SlotTrajectoryEncoder(
+                slot_dim=self.slot_dim,
+                hidden_dim=int(kwargs.get("traj_hidden_dim", 128)),
+            )
+        else:
+            self.traj_encoder = None
         self.temporal_pool = str(kwargs.get("temporal_pool", "last_mean")).lower()
         self.mamba_grad_scale = float(kwargs.get("mamba_grad_scale", 10.0))
         self.backbone_grad_scale = float(kwargs.get("backbone_grad_scale", 2.0))
@@ -358,28 +530,42 @@ class ActionSlotModel(BaseModel):
             recon_feats, _ = self.feat_decoder(slots_seq_all, new_h, new_w)
             target_feats = x_vis_5d.detach()
 
+        # 4d. Reshape attention masks and extract explicit centroid & velocity cues
+        b, actual_slots, _ = attn_masks.shape
+        attn_masks = attn_masks.view(b, actual_slots, new_seq_len, new_h, new_w)  # (B, actual_slots, T, H, W)
+        attn_masks = attn_masks.permute(0, 2, 1, 3, 4).contiguous()  # (B, T, actual_slots, H, W)
+
+        video_motion_emb = None
+        if self.traj_encoder is not None:
+            obj_attn = attn_masks[:, :, :self.num_slots, :, :]  # (B, T, S, H, W)
+            frame_motion_emb, video_motion_emb = self.traj_encoder(obj_attn)
+            obj_slots_in = obj_slots + frame_motion_emb
+        else:
+            obj_slots_in = obj_slots
+
         # 5. Mamba temporal modeling over object slots: (B, T, S, slot_dim)
-        if self.training and obj_slots.requires_grad and self.mamba_grad_scale != 1.0:
-            mamba_in = _ScaleGrad.apply(obj_slots, 1.0 / self.mamba_grad_scale)
+        if self.training and obj_slots_in.requires_grad and self.mamba_grad_scale != 1.0:
+            mamba_in = _ScaleGrad.apply(obj_slots_in, 1.0 / self.mamba_grad_scale)
             mamba_out = _ScaleGrad.apply(self.mamba(mamba_in), self.mamba_grad_scale)
         else:
-            mamba_out = self.mamba(obj_slots)
+            mamba_out = self.mamba(obj_slots_in)
 
-        slots_seq = obj_slots + mamba_out  # (B, T, S, slot_dim)
+        # Decoupled appearance stream (pure visual slots) vs motion stream (Mamba + trajectory)
+        vis_slots = 0.5 * (obj_slots.mean(dim=1) + obj_slots.max(dim=1).values)
 
-        # Temporal aggregation -> (B, S, slot_dim)
         if self.temporal_pool == "last":
-            slots = slots_seq[:, -1, :, :]
+            motion_slots = mamba_out[:, -1, :, :]
         elif self.temporal_pool == "mean":
-            slots = slots_seq.mean(dim=1)
+            motion_slots = mamba_out.mean(dim=1)
         else:
-            slots = 0.5 * (slots_seq[:, -1, :, :] + slots_seq.mean(dim=1))
+            motion_slots = 0.5 * (mamba_out[:, -1, :, :] + mamba_out.mean(dim=1))
 
-        # 6. Reshape attention masks: (B, T, actual_slots, H, W)
-        b, actual_slots, _ = attn_masks.shape
-        attn_masks = attn_masks.view(b, actual_slots, new_seq_len, new_h, new_w) # (B, actual_slots, T, H, W)
-        attn_masks = attn_masks.permute(0, 2, 1, 3, 4)  # (B, T, actual_slots, H, W)
+        if video_motion_emb is not None:
+            motion_slots = motion_slots + video_motion_emb
 
+        slots = vis_slots + motion_slots  # Unified slot representation for generic callers
+
+        # 6. Upsample attention masks along time if backbone subsampled T
         if seq_len > new_seq_len:
             attn_flat = attn_masks.permute(0, 2, 1, 3, 4).reshape(b * actual_slots, 1, new_seq_len, new_h, new_w)
             attn_up = F.interpolate(attn_flat, size=(seq_len, new_h, new_w), mode="trilinear", align_corners=False)
@@ -390,6 +576,8 @@ class ActionSlotModel(BaseModel):
             "obj_cls": pred_obj_cls,
             "recon_feats": recon_feats,
             "target_feats": target_feats,
+            "vis_slots": vis_slots,
+            "motion_slots": motion_slots,
         }
         return slots, ego_x, attn_masks, aux_preds
 
@@ -414,6 +602,23 @@ class ActionSlotModel(BaseModel):
         logits_48 = fg_logits.view(B, 6, 4, 2).permute(0, 1, 3, 2).reshape(B, 48)
         return logits_48
 
+    def _run_head(
+        self,
+        slots: Tensor,
+        aux_preds: Dict[str, Optional[Tensor]],
+        ego_x: Optional[Tensor] = None,
+    ) -> Tuple[Optional[Tensor], Tensor, Optional[Tensor], Optional[Tensor]]:
+        """Dispatch either DualStreamActionHead or legacy single-stream heads."""
+        if isinstance(self.head, DualStreamActionHead):
+            head_out = self.head.forward_with_streams(
+                vis_slots=aux_preds["vis_slots"],
+                motion_slots=aux_preds["motion_slots"],
+                ego_x=ego_x,
+            )
+            return head_out["ego"], head_out["actor"], head_out["var_logits"], head_out["dir_logits"]
+        pred_ego, pred_actor = self.head(slots, ego_x=ego_x)
+        return pred_ego, pred_actor, None, None
+
     def forward_train(
         self,
         inputs: torch.Tensor,
@@ -424,7 +629,7 @@ class ActionSlotModel(BaseModel):
         slots, ego_x, attn_masks, aux_preds = self._extract_all_features(
             inputs, compute_recon=(self.feat_decoder is not None)
         )
-        pred_ego, pred_actor = self.head(slots, ego_x=ego_x)
+        pred_ego, pred_actor, pred_var, pred_dir = self._run_head(slots, aux_preds, ego_x=ego_x)
         pred_counts = aux_preds.get("obj_counts", None)
         pred_obj_cls = aux_preds.get("obj_cls", None)
 
@@ -436,6 +641,8 @@ class ActionSlotModel(BaseModel):
             "obj_cls": pred_obj_cls,
             "recon_feats": aux_preds.get("recon_feats", None),
             "target_feats": aux_preds.get("target_feats", None),
+            "var_logits": pred_var,
+            "dir_logits": pred_dir,
         }
 
         # If targets is provided as raw tensor (B, 48) or dict
@@ -472,7 +679,7 @@ class ActionSlotModel(BaseModel):
         slots, ego_x, attn_masks, aux_preds = self._extract_all_features(
             inputs, compute_recon=(self.feat_decoder is not None and targets is not None)
         )
-        pred_ego, pred_actor = self.head(slots, ego_x=ego_x)
+        pred_ego, pred_actor, pred_var, pred_dir = self._run_head(slots, aux_preds, ego_x=ego_x)
         pred_counts = aux_preds.get("obj_counts", None)
         pred_obj_cls = aux_preds.get("obj_cls", None)
 
@@ -484,6 +691,8 @@ class ActionSlotModel(BaseModel):
             "obj_cls": pred_obj_cls,
             "recon_feats": aux_preds.get("recon_feats", None),
             "target_feats": aux_preds.get("target_feats", None),
+            "var_logits": pred_var,
+            "dir_logits": pred_dir,
         }
 
         output: Dict[str, Any] = {}
@@ -527,7 +736,7 @@ class ActionSlotModel(BaseModel):
         """Inference forward pass with decoded text labels."""
         th = threshold if threshold is not None else self.threshold
         slots, ego_x, attn_masks, aux_preds = self._extract_all_features(inputs)
-        _, pred_actor = self.head(slots, ego_x=ego_x)
+        _, pred_actor, _, _ = self._run_head(slots, aux_preds, ego_x=ego_x)
         pred_counts = aux_preds.get("obj_counts", None)
         pred_obj_cls = aux_preds.get("obj_cls", None)
 

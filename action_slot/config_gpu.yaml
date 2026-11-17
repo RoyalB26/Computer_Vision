@@ -1,0 +1,126 @@
+# Configuration for Hand Digit Object Detection (Boxes + Labels) with Full Metrics & Gradient Tracking
+
+work_dir: "./work_dirs/action_slot"
+project_name: "action_slot"
+device: "cuda"  
+seed: 42
+tqdm: true
+
+custom_imports:
+  - "action_slot.model"
+  - "action_slot.dataset"
+  - "action_slot.transform"
+  - "action_slot.metrics"
+  - "action_slot.scheduler"
+  - "action_slot.hooks"
+
+# 1. Model Configuration: Hand Digit Detector with Deformable Slot Attention Head
+model:
+  type: "ActionSlotModel"
+  num_ego_class: 4
+  num_actor_class: 64
+  num_slots: 3
+  mamba_layers: 4
+  slot_dim: 256
+  ego_c: 128
+  bg_slot: true
+  use_feat_recon: true
+  feat_recon_weight: 0.15
+  action_attn_weight: 1.0
+  bg_attn_weight: 0.5
+  mamba_grad_scale: 1.0
+  backbone_grad_scale: 0.1
+  ego_loss_weight: 0.2
+  ego_backbone_grad_scale: 0.05
+  bce_pos_weight: 3.0
+  use_class_pos_weight: true
+  resolution3d: [16, 8, 24]
+  dropout: 0.5
+  unfreeze_all: true
+# 2. Dataset Configuration
+# Hỗ trợ cấu hình nhiều data_root dưới dạng danh sách (list) hoặc đường dẫn đơn (str)
+data:
+  train:
+    dataset:
+      type: "ACTION_SLOT_LMDBDataset"
+      data_root:
+        - "D:/apps/Datasets/TACO/data"
+        - "D:/apps/Datasets/TACO/part2"
+      split: "train"
+      sequence_len: 16
+      seed: 42
+      pipeline:
+        - type: "Action_Slot_Transform"
+          photometric_aug: true
+    batch_size: 2
+    shuffle: true
+    num_workers: 0
+
+  val:
+    dataset:
+      type: "ACTION_SLOT_LMDBDataset"
+      data_root:
+        - "D:/apps/Datasets/TACO/data"
+        - "D:/apps/Datasets/TACO/part2"
+      split: "val"
+      sequence_len: 16
+      seed: 42
+      pipeline:
+        - type: "Action_Slot_Transform"
+    batch_size: 2
+    shuffle: true
+    num_workers: 0
+
+# 3. Optimizer Configuration (đồng bộ với D:\v7\Action-slot: lr=5e-4, wd=0.07)
+optimizer:
+  type: "AdamW"
+  lr: 0.0005
+  weight_decay: 0.07
+
+# 4. Learning Rate Scheduler Configuration
+lr_scheduler:
+  type: "CosineAnnealingLR"
+  T_max: 100
+  eta_min: 0.00001
+
+# 5. Evaluation Metrics Configuration
+metrics:
+  taco_metric:
+    type: "TACOActionMetric"
+
+# 6. Comprehensive Tracking & Lifecycle Hooks
+hooks:
+  # Train Actor mAP Hook: Tính toán và log (train) mAP of the actor sau mỗi epoch
+  - type: "TrainActorMAPHook"
+
+  # Excel Tracker: Ghi nhận toàn bộ thông số chi tiết qua các sheets:
+  # - 'Epoch_Overview': Train/Val Loss, mAP, mAP_50, sub-group mAPs (c, b, p, c+, b+, p+), LR, thời gian
+  # - 'Gradients_Detail': Chuẩn Gradient Norm tổng và riêng biệt cho từng submodule kiến trúc
+  # - 'Detection': Phân phối phân loại và động lực học nếu có
+  # - 'Per_Class_Lastest': Bảng theo dõi chi tiết từng class (Epoch, class_id, name, support, predicted_pos, ap, precision, recall, f1, tp, fp, fn, tn)
+  - type: "ExcelTracker"
+    filename: "training_metrics.xlsx"       # Lưu trực tiếp vào thư mục work_dir
+    track_gradients: true                   # Bật tracking gradient chi tiết
+    grad_interval: 1                        # Chu kỳ lấy mẫu gradient (mỗi 1 batch)
+    track_detection: true                   # Bật tracking tab Detection phân tích động lực học mô hình
+    detection_interval: 5                   # Chu kỳ lấy mẫu phân tích detection (mỗi 5 batch)
+    auto_save: true                         # Tự động ghi ra file Excel sau mỗi epoch
+    resume: true                            # Tự động tiếp tục ghi tiếp vào sheet nếu file đã tồn tại
+    submodules: null
+
+  # Checkpoint Hook: Tự động lưu checkpoint định kỳ và lưu best.pth theo mAP_50 cao nhất
+  - type: "CheckpointHook"
+    interval: 1                             # Lưu checkpoint mỗi 1 epoch
+    save_best: "mAP_50"                     # Theo dõi và lưu best model theo mAP_50
+    mode: "max"                             # mAP càng cao càng tốt
+    max_keep_ckpts: 5                       # Giữ tối đa 5 checkpoint gần nhất để tiết kiệm dung lượng
+    filename_tmpl: "epoch_{}.pth"
+
+# 7. Training Engine Configuration
+train_cfg:
+  max_epochs: 1
+  val_interval: 1                           # Đánh giá validation và tính mAP ở MỌI epoch để tracking liên tục
+  log_interval: 2500                        # In log tiến trình mỗi 2500 batches
+  grad_clip: 1.0
+  accumulate: 4                             # Hiệu dụng batch = 2 * 4 = 8 để ổn định gradient
+  use_amp: false                            # Chạy FP32 chính xác cao

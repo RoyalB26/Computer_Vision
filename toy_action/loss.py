@@ -45,6 +45,7 @@ class ActionSlotLoss(nn.Module):
         action_attn_weight: float = 1.0,
         bg_attn_weight: float = 0.5,
         feat_recon_weight: float = 0.5,
+        dual_stream_aux_weight: float = 0.5,
         bg_mask: bool = True,
         bg_slot: bool = True,
         device: Optional[torch.device] = None,
@@ -63,6 +64,7 @@ class ActionSlotLoss(nn.Module):
         self.action_attn_weight = action_attn_weight
         self.bg_attn_weight = bg_attn_weight
         self.feat_recon_weight = float(feat_recon_weight)
+        self.dual_stream_aux_weight = float(dual_stream_aux_weight)
         self.bg_mask = bg_mask
         self.bg_slot = bg_slot
         self.device = device
@@ -217,6 +219,48 @@ class ActionSlotLoss(nn.Module):
             recon_feats, target_feats.detach().to(device=recon_feats.device, dtype=recon_feats.dtype)
         )
 
+    def dual_stream_aux_loss(
+        self,
+        pred_var: Optional[torch.Tensor],
+        pred_dir: Optional[torch.Tensor],
+        actor_gt: torch.Tensor,
+    ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
+        """Auxiliary BCE losses supervising Stream A (variants) and Stream B (directions)."""
+        if self.dual_stream_aux_weight <= 0 or (pred_var is None and pred_dir is None):
+            return None, None
+        b = actor_gt.shape[0]
+        if actor_gt.shape[1] % (self.num_slots * 2) != 0:
+            return None, None
+
+        gt_2x4 = actor_gt.view(b, self.num_slots, 2, -1) > 0.5  # (B, S, 2, 4)
+        pos_w_val = min(self.bce_pos_weight, 3.0) if self.bce_pos_weight > 1.0 else None
+
+        loss_var = None
+        if pred_var is not None:
+            var_gt = gt_2x4.any(dim=-1).to(device=pred_var.device, dtype=pred_var.dtype)
+            pos_w = (
+                torch.full((pred_var.shape[-1],), pos_w_val, device=pred_var.device, dtype=pred_var.dtype)
+                if pos_w_val is not None
+                else None
+            )
+            loss_var = self.dual_stream_aux_weight * F.binary_cross_entropy_with_logits(
+                pred_var, var_gt, pos_weight=pos_w, reduction="mean"
+            )
+
+        loss_dir = None
+        if pred_dir is not None:
+            dir_gt = gt_2x4.any(dim=-2).to(device=pred_dir.device, dtype=pred_dir.dtype)
+            pos_w = (
+                torch.full((pred_dir.shape[-1],), pos_w_val, device=pred_dir.device, dtype=pred_dir.dtype)
+                if pos_w_val is not None
+                else None
+            )
+            loss_dir = self.dual_stream_aux_weight * F.binary_cross_entropy_with_logits(
+                pred_dir, dir_gt, pos_weight=pos_w, reduction="mean"
+            )
+
+        return loss_var, loss_dir
+
     def forward(
         self,
         pred: Dict[str, torch.Tensor],
@@ -283,6 +327,11 @@ class ActionSlotLoss(nn.Module):
             pred.get("recon_feats", None),
             pred.get("target_feats", None),
         )
+        loss_stream_var, loss_stream_dir = self.dual_stream_aux_loss(
+            pred.get("var_logits", None),
+            pred.get("dir_logits", None),
+            actor_gt,
+        )
 
         total_loss = loss_actor
         for v in attn_losses.values():
@@ -293,6 +342,10 @@ class ActionSlotLoss(nn.Module):
             total_loss = total_loss + loss_obj_cls
         if loss_recon is not None:
             total_loss = total_loss + loss_recon
+        if loss_stream_var is not None:
+            total_loss = total_loss + loss_stream_var
+        if loss_stream_dir is not None:
+            total_loss = total_loss + loss_stream_dir
 
         loss_dict: Dict[str, torch.Tensor] = {
             "loss": total_loss,
@@ -304,5 +357,9 @@ class ActionSlotLoss(nn.Module):
             loss_dict["loss_obj_cls"] = loss_obj_cls
         if loss_recon is not None:
             loss_dict["loss_feat_recon"] = loss_recon
+        if loss_stream_var is not None:
+            loss_dict["loss_stream_var"] = loss_stream_var
+        if loss_stream_dir is not None:
+            loss_dict["loss_stream_dir"] = loss_stream_dir
         loss_dict.update(attn_losses)
         return loss_dict

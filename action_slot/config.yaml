@@ -29,7 +29,7 @@ model:
   action_attn_weight: 1.0
   bg_attn_weight: 0.5
   mamba_grad_scale: 1.0
-  backbone_grad_scale: 1.0
+  backbone_grad_scale: 0.1
   ego_loss_weight: 0.2
   ego_backbone_grad_scale: 0.05
   bce_pos_weight: 5.0

@@ -37,8 +37,9 @@ model:
   backbone_grad_scale: 1.0
   ego_loss_weight: 0.2
   ego_backbone_grad_scale: 0.05
+  backbone_grad_scale: 0.5
   pretrained_backbone: true
-  finetune_last_n_stages: 2
+  finetune_last_n_stages: 1
 # 2. Dataset Configuration
 # Hỗ trợ cấu hình nhiều data_root dưới dạng danh sách (list) hoặc đường dẫn đơn (str)
 data:

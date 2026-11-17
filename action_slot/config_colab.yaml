@@ -32,6 +32,7 @@ model:
   backbone_grad_scale: 1.0
   ego_loss_weight: 0.2
   ego_backbone_grad_scale: 0.05
+
   bce_pos_weight: 5.0
   use_class_pos_weight: true
   dropout: 0.5

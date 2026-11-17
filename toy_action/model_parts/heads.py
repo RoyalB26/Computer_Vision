@@ -155,6 +155,115 @@ class ObjectActionHead(nn.Module):
         return y_ego, y_actor
 
 
+class DualStreamActionHead(nn.Module):
+    """Decoupled dual-stream head separating appearance (symbol/cardinality) from motion (direction).
+
+    Stream A (Appearance): takes visual slots `(B, S, D)` -> predicts `[single, group+]` `(B, S, 2)`.
+    Stream B (Motion): weight-shared across all `S` slots, takes motion slots `(B, S, D)` ->
+        predicts `[gotop, gobottom, goleft, goright]` `(B, S, 4)`.
+    Interaction: Hadamard product `(vis_h * motion_h)` -> residual `(B, S, 2, 4)` combined
+    with additive log-odds `var_logits + dir_logits` to form `(B, 48)` logits.
+    """
+
+    def __init__(
+        self,
+        in_channel: int,
+        num_actor_classes: int = 48,
+        num_slots: int = 6,
+        num_variants: int = 2,
+        num_actions: int = 4,
+        hidden_dim: int = 128,
+        dropout: float = 0.2,
+        num_ego_classes: int = 0,
+        ego_channel: int = 0,
+        **kwargs,
+    ):
+        super().__init__()
+        expected_classes = num_slots * num_variants * num_actions
+        if num_actor_classes != expected_classes:
+            raise ValueError(
+                f"num_actor_classes ({num_actor_classes}) must equal num_slots * num_variants * num_actions ({expected_classes})."
+            )
+        self.num_ego_classes = num_ego_classes
+        self.num_actor_classes = num_actor_classes
+        self.num_slots = num_slots
+        self.num_variants = num_variants
+        self.num_actions = num_actions
+
+        if self.num_ego_classes > 0:
+            c = ego_channel if ego_channel > 0 else in_channel
+            self.fc_ego = nn.Sequential(
+                nn.ReLU(inplace=False),
+                nn.Linear(c, num_ego_classes),
+            )
+        else:
+            self.fc_ego = None
+
+        # Stream A: Appearance & cardinality [single, group+]
+        self.slot_embed = nn.Parameter(torch.randn(1, num_slots, in_channel) * 0.02)
+        self.vis_norm = nn.LayerNorm(in_channel)
+        self.vis_proj = nn.Sequential(
+            nn.Linear(in_channel, hidden_dim),
+            nn.GELU(),
+            nn.Dropout(p=dropout),
+        )
+        self.var_head = nn.Linear(hidden_dim, num_variants)
+
+        # Stream B: Shared motion direction classifier [gotop, gobottom, goleft, goright]
+        self.motion_norm = nn.LayerNorm(in_channel)
+        self.motion_proj = nn.Sequential(
+            nn.Linear(in_channel, hidden_dim),
+            nn.GELU(),
+            nn.Dropout(p=dropout),
+        )
+        self.dir_head = nn.Linear(hidden_dim, num_actions)
+
+        # Multiplicative (Hadamard) stream interaction residual
+        self.inter_head = nn.Linear(hidden_dim, num_variants * num_actions)
+
+    def forward_with_streams(
+        self,
+        vis_slots: torch.Tensor,
+        motion_slots: Optional[torch.Tensor] = None,
+        ego_x: Optional[torch.Tensor] = None,
+    ) -> dict:
+        """Compute final 48-class logits together with decoupled variant and direction logits."""
+        if motion_slots is None:
+            motion_slots = vis_slots
+
+        b = vis_slots.shape[0]
+        s = self.num_slots
+        vis_in = vis_slots[:, :s, :] + self.slot_embed
+        motion_in = motion_slots[:, :s, :]
+
+        vis_h = self.vis_proj(self.vis_norm(vis_in))  # (B, S, H)
+        motion_h = self.motion_proj(self.motion_norm(motion_in))  # (B, S, H)
+
+        var_logits = self.var_head(vis_h)  # (B, S, 2)
+        dir_logits = self.dir_head(motion_h)  # (B, S, 4)
+        inter_logits = self.inter_head(vis_h * motion_h).view(b, s, self.num_variants, self.num_actions)
+
+        logits_2x4 = var_logits.unsqueeze(-1) + dir_logits.unsqueeze(-2) + inter_logits
+        y_actor = logits_2x4.reshape(b, self.num_actor_classes)
+        y_ego = self.fc_ego(ego_x) if self.fc_ego is not None and ego_x is not None else None
+
+        return {
+            "ego": y_ego,
+            "actor": y_actor,
+            "var_logits": var_logits,
+            "dir_logits": dir_logits,
+        }
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        ego_x: Optional[torch.Tensor] = None,
+        motion_slots: Optional[torch.Tensor] = None,
+    ) -> Tuple[Optional[torch.Tensor], torch.Tensor]:
+        out = self.forward_with_streams(x, motion_slots=motion_slots, ego_x=ego_x)
+        return out["ego"], out["actor"]
+
+
 class FrameObjectCountHead(nn.Module):
     """Per-frame object count predictor operating on temporal object slots (B, T, S, D)."""
 

@@ -31,16 +31,26 @@ class ActionSlotLoss(nn.Module):
         attention_res=None,
         bce_pos_weight=10,
         num_slots: int = 32,
+        actions_per_slot=None,
         feat_recon_weight: float = 0.15,
         action_attn_weight: float = 1.0,
         bg_attn_weight: float = 0.5,
         ego_loss_weight: float = 0.2,
+        dual_stream_aux_weight: float = 0.5,
         use_class_pos_weight: bool = True,
         device=None,
     ):
         super(ActionSlotLoss, self).__init__()
         self.num_actor_class = num_actor_class
         self.num_slots = num_slots
+        if actions_per_slot is not None:
+            self.actions_per_slot = list(actions_per_slot)
+        elif num_slots == 3 and num_actor_class == 64:
+            self.actions_per_slot = [24, 24, 16]
+        elif num_slots > 0 and num_actor_class % num_slots == 0:
+            self.actions_per_slot = [num_actor_class // num_slots] * num_slots
+        else:
+            self.actions_per_slot = None
         self.attention_res = attention_res
         self.bce_pos_weight = bce_pos_weight
         self.feat_recon_weight = float(feat_recon_weight)
@@ -51,6 +61,7 @@ class ActionSlotLoss(nn.Module):
         self.action_attn_weight = float(action_attn_weight)
         self.bg_attn_weight = float(bg_attn_weight)
         self.ego_loss_weight = float(ego_loss_weight)
+        self.dual_stream_aux_weight = float(dual_stream_aux_weight)
         self.use_class_pos_weight = bool(use_class_pos_weight)
 
         self.seq_len = 16
@@ -299,6 +310,53 @@ class ActionSlotLoss(nn.Module):
             target_feats.detach().to(device=recon_feats.device, dtype=recon_feats.dtype),
         )
 
+    def dual_stream_aux_loss(self, pred_var, pred_dir, actor_gt):
+        """Auxiliary BCE losses supervising Stream A (single/group+) and Stream B (directions)."""
+        if self.dual_stream_aux_weight <= 0 or (pred_var is None and pred_dir is None):
+            return None, None
+        if self.actions_per_slot is None or sum(self.actions_per_slot) != actor_gt.shape[1]:
+            return None, None
+
+        b = actor_gt.shape[0]
+        num_variants = 2
+        var_gt_list = []
+        dir_gt_list = []
+        offset = 0
+        for a_cnt in self.actions_per_slot:
+            n_dir = a_cnt // num_variants
+            gt_i = actor_gt[:, offset : offset + a_cnt].view(b, num_variants, n_dir) > 0.5
+            var_gt_list.append(gt_i.any(dim=-1))   # (B, 2)
+            dir_gt_list.append(gt_i.any(dim=-2))   # (B, n_dir)
+            offset += a_cnt
+
+        pos_w_val = min(float(self.bce_pos_weight), 3.0) if float(self.bce_pos_weight) > 1.0 else None
+
+        loss_var = None
+        if pred_var is not None:
+            var_gt = torch.stack(var_gt_list, dim=1).to(device=pred_var.device, dtype=pred_var.dtype)
+            pos_w = (
+                torch.full((pred_var.shape[-1],), pos_w_val, device=pred_var.device, dtype=pred_var.dtype)
+                if pos_w_val is not None
+                else None
+            )
+            loss_var = self.dual_stream_aux_weight * F.binary_cross_entropy_with_logits(
+                pred_var, var_gt, pos_weight=pos_w, reduction="mean"
+            )
+
+        loss_dir = None
+        if pred_dir is not None:
+            dir_gt = torch.cat(dir_gt_list, dim=1).to(device=pred_dir.device, dtype=pred_dir.dtype)
+            pos_w = (
+                torch.full((pred_dir.shape[-1],), pos_w_val, device=pred_dir.device, dtype=pred_dir.dtype)
+                if pos_w_val is not None
+                else None
+            )
+            loss_dir = self.dual_stream_aux_weight * F.binary_cross_entropy_with_logits(
+                pred_dir, dir_gt, pos_weight=pos_w, reduction="mean"
+            )
+
+        return loss_var, loss_dir
+
     def forward(self, pred, label, validate=False):
 
         # actor = label['actor']  # shape: (B, 64)
@@ -323,13 +381,22 @@ class ActionSlotLoss(nn.Module):
         ego_loss = self.ego_loss(pred['ego'], label['ego'])
         actor_loss = self.actor_loss(pred['actor'], label['actor'])
         feat_recon_loss = self.feat_recon_loss(pred.get('recon_feats'), pred.get('target_feats'))
+        loss_stream_var, loss_stream_dir = self.dual_stream_aux_loss(
+            pred.get('var_logits'), pred.get('dir_logits'), label['actor']
+        )
         attention_loss = {}
         if pred.get('attn') is not None and isinstance(label, dict) and 'bg_seg' in label:
             attention_loss = self.attn_loss(pred['attn'], label, validate)
 
-        loss = {"loss_ego": self.ego_loss_weight * ego_loss, "loss_actor": actor_loss}
+        loss = {"loss_actor": actor_loss}
+        if ego_loss is not None:
+            loss["loss_ego"] = self.ego_loss_weight * ego_loss
         if feat_recon_loss is not None:
             loss["loss_feat_recon"] = feat_recon_loss
+        if loss_stream_var is not None:
+            loss["loss_stream_var"] = loss_stream_var
+        if loss_stream_dir is not None:
+            loss["loss_stream_dir"] = loss_stream_dir
         for k, v in attention_loss.items():
             if v is not None and "loss" in k:
                 loss[k] = v
