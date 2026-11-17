@@ -33,6 +33,7 @@ if project_root not in sys.path:
 from BaseModel.utils import Config
 from BaseModel.model import build_model
 from toy_action.dataset import ALL_CLASSES, IDX_TO_CLASS, SYMBOLS, SYMBOL_VARIANTS
+from toy_action.vis_3d import export_3d_attention_html
 
 # Distinct vibrant color palette for up to 32 slots (RGB)
 SLOT_PALETTE: List[Tuple[int, int, int]] = [
@@ -335,6 +336,8 @@ def run_inference(
     config_path: str = "toy_action/config.yaml",
     checkpoint_path: Optional[str] = None,
     output_path: str = "toy_action/sample_output/attn_inference_grid.png",
+    output_3d_path: Optional[str] = None,
+    export_3d: bool = True,
     threshold: float = 0.35,
     top_k_slots: int = 6,
     filter_background: bool = True,
@@ -514,10 +517,35 @@ def run_inference(
     os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
     cv2.imwrite(output_path, cv2.cvtColor(grid_img, cv2.COLOR_RGB2BGR))
 
+    html_3d_saved = None
+    if export_3d and attn_tensor is not None:
+        if output_3d_path is None:
+            out_dir = os.path.dirname(os.path.abspath(output_path))
+            stem = os.path.splitext(os.path.basename(output_path))[0]
+            output_3d_path = os.path.join(out_dir, f"{stem}_3d.html")
+        top_preds_list = [(IDX_TO_CLASS[int(idx)], float(probs[int(idx)] * 100.0)) for idx in top_indices[:6]]
+        sym_list = SYMBOLS if num_obj_slots == len(SYMBOLS) else None
+        html_3d_saved = export_3d_attention_html(
+            attn=attn,
+            num_obj_slots=num_obj_slots,
+            active_slot_indices=active_slot_indices,
+            slot_label_names=slot_label_names,
+            slot_palette=SLOT_PALETTE,
+            output_html_path=output_3d_path,
+            overlaid_frames=overlaid_frames,
+            bg_slot_attn=bg_slot_attn,
+            pred_labels=pred_labels,
+            gt_label=gt_label,
+            top_preds=top_preds_list,
+            symbols=sym_list,
+        )
+
     print(f"\n[BACKGROUND-FILTERED MULTI-COLOR ATTENTION GRID SAVED]")
     print(f"Output Image : {output_path}")
     print(f"Resolution   : {grid_img.shape[1]}x{grid_img.shape[0]} (4x4 Grid + Bottom Slot Legend)")
     print(f"Background   : Filtered to clean white canvas. Only moving objects & slot colors shown.")
+    if html_3d_saved:
+        print(f"Interactive 3D HTML : {html_3d_saved}")
     print("=" * 60)
 
 
@@ -546,6 +574,17 @@ def main():
         type=str,
         default="toy_action/sample_output/attn_inference_grid.png",
         help="Destination path for the composite attention visualization image",
+    )
+    parser.add_argument(
+        "--output-3d",
+        type=str,
+        default=None,
+        help="Destination path for interactive 3D HTML (defaults to <output_stem>_3d.html)",
+    )
+    parser.add_argument(
+        "--no-3d",
+        action="store_true",
+        help="Disable exporting interactive 3D HTML volume",
     )
     parser.add_argument(
         "--threshold",
@@ -577,6 +616,8 @@ def main():
         config_path=args.config,
         checkpoint_path=args.checkpoint,
         output_path=args.output,
+        output_3d_path=args.output_3d,
+        export_3d=(not args.no_3d),
         threshold=args.threshold,
         top_k_slots=args.top_k_slots,
         filter_background=(not args.no_filter_bg),

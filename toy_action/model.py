@@ -8,6 +8,7 @@ Implements:
 """
 
 from typing import Any, Dict, List, Optional, Tuple, Union
+import math
 import numpy as np
 import torch
 import torch.nn as nn
@@ -224,6 +225,136 @@ class SlotTrajectoryEncoder(nn.Module):
         return self.frame_proj(frame_feats), self.video_proj(video_feats)
 
 
+class SlotAttentionTubeEncoder(nn.Module):
+    """Translation-invariant Masked 3D Feature & Attention Color Tube encoder.
+
+    Builds a per-slot 3D volume combining:
+      1. 11 motion/geometry channels: `[clean_attn, attn_diff, 3x3_corr]`
+      2. Optional `vis_dim` masked visual feature channels (`soft_attn * vis_proj(x_vis)`),
+         allowing a single 3D CNN to predict both object identity/cardinality and motion.
+    """
+
+    def __init__(
+        self,
+        slot_dim: int = 256,
+        hidden_dim: int = 128,
+        bg_floor: float = 0.08,
+        dropout: float = 0.2,
+        use_tube_vis: bool = True,
+        vis_dim: int = 32,
+    ):
+        super().__init__()
+        self.bg_floor = float(bg_floor)
+        self.use_tube_vis = bool(use_tube_vis)
+        self.vis_dim = int(vis_dim) if self.use_tube_vis else 0
+
+        if self.use_tube_vis and self.vis_dim > 0:
+            self.vis_proj = nn.Sequential(
+                nn.Conv3d(slot_dim, self.vis_dim, kernel_size=1, bias=False),
+                nn.GroupNorm(math.gcd(self.vis_dim, 16), self.vis_dim),
+                nn.GELU(),
+            )
+        else:
+            self.vis_proj = None
+
+        in_channels = 11 + self.vis_dim
+        gn_hidden = math.gcd(hidden_dim, 16)
+
+        self.conv_net = nn.Sequential(
+            nn.Conv3d(in_channels, 48 if self.use_tube_vis else 32, kernel_size=3, padding=1, bias=False),
+            nn.GroupNorm(8, 48 if self.use_tube_vis else 32),
+            nn.GELU(),
+            nn.Conv3d(48 if self.use_tube_vis else 32, 64, kernel_size=3, stride=(1, 2, 2), padding=1, bias=False),
+            nn.GroupNorm(8, 64),
+            nn.GELU(),
+            nn.Conv3d(64, 128, kernel_size=3, stride=(2, 2, 2), padding=1, bias=False),
+            nn.GroupNorm(16, 128),
+            nn.GELU(),
+            nn.Conv3d(128, hidden_dim, kernel_size=3, padding=1, bias=False),
+            nn.GroupNorm(gn_hidden, hidden_dim),
+            nn.GELU(),
+        )
+        self.out_proj = nn.Sequential(
+            nn.LayerNorm(hidden_dim * 2),
+            nn.Dropout(p=dropout),
+            nn.Linear(hidden_dim * 2, hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, slot_dim),
+        )
+
+    def _build_color_tube(
+        self,
+        obj_attn: Tensor,
+        bg_attn: Optional[Tensor] = None,
+        x_vis: Optional[Tensor] = None,
+    ) -> Tensor:
+        """Build `(B*S, 11 [+ vis_dim], T, H, W)` volume for shared 3D Conv encoding."""
+        b, t, s, h, w = obj_attn.shape
+        attn = obj_attn.float()
+
+        # Background filtering matching inference.py's soft threshold + foreground mask
+        clean = F.relu(attn - self.bg_floor) / max(1.0 - self.bg_floor, 1e-4)
+        if bg_attn is not None:
+            fg_weight = (1.0 - bg_attn.float()).clamp(0.0, 1.0)
+            clean = clean * fg_weight
+
+        # Reshape to (B*S, T, H, W) so all slots share the exact same motion filters
+        clean_bs = clean.permute(0, 2, 1, 3, 4).reshape(b * s, t, h, w)
+
+        attn_diff = torch.zeros_like(clean_bs)
+        local_corr = torch.zeros((b * s, 9, t, h, w), device=clean.device, dtype=clean.dtype)
+        if t > 1:
+            prev_f = clean_bs[:, :-1]  # (B*S, T-1, H, W)
+            curr_f = clean_bs[:, 1:]   # (B*S, T-1, H, W)
+            attn_diff[:, 1:] = curr_f - prev_f
+
+            patches = F.unfold(
+                curr_f.reshape(b * s * (t - 1), 1, h, w),
+                kernel_size=3,
+                padding=1,
+            )  # (B*S*(T-1), 9, H*W)
+            patches = patches.view(b * s, t - 1, 9, h, w).permute(0, 2, 1, 3, 4)
+            local_corr[:, :, 1:] = patches * prev_f.unsqueeze(1)
+
+        parts = [clean_bs.unsqueeze(1), attn_diff.unsqueeze(1), local_corr]
+
+        if self.vis_proj is not None:
+            if x_vis is not None:
+                vis_low = self.vis_proj(x_vis)  # (B, vis_dim, T, H, W)
+                vis_exp = vis_low.unsqueeze(1).expand(-1, s, -1, -1, -1, -1).reshape(b * s, self.vis_dim, t, h, w)
+                # Blend raw and cleaned attn so gradients stay alive from epoch 0
+                soft_fg_attn = 0.5 * attn + 0.5 * clean
+                if bg_attn is not None:
+                    soft_fg = 0.5 + 0.5 * (1.0 - bg_attn.float()).clamp(0.0, 1.0)
+                    soft_fg_attn = soft_fg_attn * soft_fg
+                soft_attn = soft_fg_attn.permute(0, 2, 1, 3, 4).reshape(b * s, 1, t, h, w)
+                masked_vis = soft_attn.to(dtype=vis_exp.dtype) * vis_exp
+            else:
+                masked_vis = torch.zeros(
+                    (b * s, self.vis_dim, t, h, w),
+                    device=obj_attn.device,
+                    dtype=self.conv_net[0].weight.dtype,
+                )
+            parts.insert(0, masked_vis.float())
+
+        return torch.cat(parts, dim=1)
+
+    def forward(
+        self,
+        obj_attn: Tensor,
+        bg_attn: Optional[Tensor] = None,
+        x_vis: Optional[Tensor] = None,
+    ) -> Tensor:
+        b, _, s, _, _ = obj_attn.shape
+        tube = self._build_color_tube(obj_attn, bg_attn=bg_attn, x_vis=x_vis)
+        proj_dtype = self.conv_net[0].weight.dtype
+        feat_3d = self.conv_net(tube.to(dtype=proj_dtype))
+        avg_pool = F.adaptive_avg_pool3d(feat_3d, 1).flatten(1)
+        max_pool = F.adaptive_max_pool3d(feat_3d, 1).flatten(1)
+        pooled = torch.cat([avg_pool, max_pool], dim=-1)
+        return self.out_proj(pooled).view(b, s, -1).to(dtype=obj_attn.dtype)
+
+
 @MODELS.register_module(name="ActionSlotModel")
 @MODELS.register_module(name="ToyActionSlotModel")
 class ActionSlotModel(BaseModel):
@@ -436,13 +567,17 @@ class ActionSlotModel(BaseModel):
         )
 
         # Mamba operates strictly over the S object slots (excluding bg_slot)
-        mambaCfg = MambaConfig(
-            d_model=self.slot_dim,
-            n_layer=int(kwargs.get("mamba_layers", 1)),
-            d_state=int(kwargs.get("mamba_d_state", 16)),
-            num_slot=self.num_slots,
-        )
-        self.mamba = Mamba(mambaCfg)
+        self.use_mamba = bool(kwargs.get("use_mamba", True))
+        if self.use_mamba:
+            mambaCfg = MambaConfig(
+                d_model=self.slot_dim,
+                n_layer=int(kwargs.get("mamba_layers", 1)),
+                d_state=int(kwargs.get("mamba_d_state", 16)),
+                num_slot=self.num_slots,
+            )
+            self.mamba = Mamba(mambaCfg)
+        else:
+            self.mamba = None
         self.use_slot_trajectory = bool(kwargs.get("use_slot_trajectory", True))
         if self.use_slot_trajectory:
             self.traj_encoder = SlotTrajectoryEncoder(
@@ -451,6 +586,20 @@ class ActionSlotModel(BaseModel):
             )
         else:
             self.traj_encoder = None
+        self.use_attn_tube = bool(kwargs.get("use_attn_tube", True))
+        self.use_tube_vis = bool(kwargs.get("use_tube_vis", True))
+        self.tube_only_head = bool(kwargs.get("tube_only_head", True))
+        if self.use_attn_tube:
+            self.tube_encoder = SlotAttentionTubeEncoder(
+                slot_dim=self.slot_dim,
+                hidden_dim=int(kwargs.get("tube_hidden_dim", 128)),
+                bg_floor=float(kwargs.get("tube_bg_floor", 0.08)),
+                dropout=float(kwargs.get("tube_dropout", 0.2)),
+                use_tube_vis=self.use_tube_vis,
+                vis_dim=int(kwargs.get("tube_vis_dim", 32)),
+            )
+        else:
+            self.tube_encoder = None
         self.temporal_pool = str(kwargs.get("temporal_pool", "last_mean")).lower()
         self.mamba_grad_scale = float(kwargs.get("mamba_grad_scale", 10.0))
         self.backbone_grad_scale = float(kwargs.get("backbone_grad_scale", 2.0))
@@ -530,40 +679,60 @@ class ActionSlotModel(BaseModel):
             recon_feats, _ = self.feat_decoder(slots_seq_all, new_h, new_w)
             target_feats = x_vis_5d.detach()
 
-        # 4d. Reshape attention masks and extract explicit centroid & velocity cues
+        # 4d. Reshape attention masks and extract explicit centroid/velocity + 3D color tube cues
         b, actual_slots, _ = attn_masks.shape
         attn_masks = attn_masks.view(b, actual_slots, new_seq_len, new_h, new_w)  # (B, actual_slots, T, H, W)
         attn_masks = attn_masks.permute(0, 2, 1, 3, 4).contiguous()  # (B, T, actual_slots, H, W)
 
+        obj_attn = attn_masks[:, :, :self.num_slots, :, :]  # (B, T, S, H, W)
+        bg_attn = attn_masks[:, :, -1:, :, :] if (self.bg_slot and actual_slots > self.num_slots) else None
+
         video_motion_emb = None
         if self.traj_encoder is not None:
-            obj_attn = attn_masks[:, :, :self.num_slots, :, :]  # (B, T, S, H, W)
             frame_motion_emb, video_motion_emb = self.traj_encoder(obj_attn)
             obj_slots_in = obj_slots + frame_motion_emb
         else:
             obj_slots_in = obj_slots
 
-        # 5. Mamba temporal modeling over object slots: (B, T, S, slot_dim)
-        if self.training and obj_slots_in.requires_grad and self.mamba_grad_scale != 1.0:
-            mamba_in = _ScaleGrad.apply(obj_slots_in, 1.0 / self.mamba_grad_scale)
-            mamba_out = _ScaleGrad.apply(self.mamba(mamba_in), self.mamba_grad_scale)
+        tube_motion_emb = (
+            self.tube_encoder(obj_attn, bg_attn=bg_attn, x_vis=x_vis)
+            if self.tube_encoder is not None
+            else None
+        )
+
+        if self.tube_only_head and tube_motion_emb is not None and self.mamba is None and self.traj_encoder is None:
+            # Way 1: Masked 3D Feature Tube predicts both object (single/group+) and action directly
+            vis_slots = tube_motion_emb
+            motion_slots = tube_motion_emb
+            slots = tube_motion_emb
         else:
-            mamba_out = self.mamba(obj_slots_in)
+            # Decoupled appearance stream (visual slots) vs motion stream (Mamba / trajectory / 3D tube)
+            vis_slots = 0.5 * (obj_slots.mean(dim=1) + obj_slots.max(dim=1).values)
 
-        # Decoupled appearance stream (pure visual slots) vs motion stream (Mamba + trajectory)
-        vis_slots = 0.5 * (obj_slots.mean(dim=1) + obj_slots.max(dim=1).values)
+            motion_slots: Optional[Tensor] = None
+            if self.mamba is not None:
+                # 5. Mamba temporal modeling over object slots: (B, T, S, slot_dim)
+                if self.training and obj_slots_in.requires_grad and self.mamba_grad_scale != 1.0:
+                    mamba_in = _ScaleGrad.apply(obj_slots_in, 1.0 / self.mamba_grad_scale)
+                    mamba_out = _ScaleGrad.apply(self.mamba(mamba_in), self.mamba_grad_scale)
+                else:
+                    mamba_out = self.mamba(obj_slots_in)
 
-        if self.temporal_pool == "last":
-            motion_slots = mamba_out[:, -1, :, :]
-        elif self.temporal_pool == "mean":
-            motion_slots = mamba_out.mean(dim=1)
-        else:
-            motion_slots = 0.5 * (mamba_out[:, -1, :, :] + mamba_out.mean(dim=1))
+                if self.temporal_pool == "last":
+                    motion_slots = mamba_out[:, -1, :, :]
+                elif self.temporal_pool == "mean":
+                    motion_slots = mamba_out.mean(dim=1)
+                else:
+                    motion_slots = 0.5 * (mamba_out[:, -1, :, :] + mamba_out.mean(dim=1))
 
-        if video_motion_emb is not None:
-            motion_slots = motion_slots + video_motion_emb
+            if video_motion_emb is not None:
+                motion_slots = video_motion_emb if motion_slots is None else (motion_slots + video_motion_emb)
+            if tube_motion_emb is not None:
+                motion_slots = tube_motion_emb if motion_slots is None else (motion_slots + tube_motion_emb)
+            if motion_slots is None:
+                motion_slots = torch.zeros_like(vis_slots)
 
-        slots = vis_slots + motion_slots  # Unified slot representation for generic callers
+            slots = vis_slots + motion_slots  # Unified slot representation for generic callers
 
         # 6. Upsample attention masks along time if backbone subsampled T
         if seq_len > new_seq_len:

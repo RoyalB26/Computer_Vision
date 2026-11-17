@@ -16,6 +16,7 @@ Usage:
 import argparse
 import glob
 import importlib
+import importlib.util
 import json
 import os
 import pickle
@@ -36,6 +37,20 @@ for p in (project_root, action_slot_dir):
 from BaseModel.model import build_model
 from BaseModel.utils import Config
 from action_slot.metrics.taco_labels import TACO_ACTOR_LABELS, TACO_EGO_LABELS
+
+def _load_export_3d_attention_html():
+    vis_3d_path = os.path.join(project_root, "toy_action", "vis_3d.py")
+    if not os.path.isfile(vis_3d_path):
+        return None
+    spec = importlib.util.spec_from_file_location("toy_action_vis_3d", vis_3d_path)
+    if spec is None or spec.loader is None:
+        return None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return getattr(module, "export_3d_attention_html", None)
+
+
+export_3d_attention_html = _load_export_3d_attention_html()
 
 IMAGE_EXTS = (".jpg", ".jpeg", ".png", ".bmp")
 
@@ -501,6 +516,8 @@ def run_inference(
     config_path: str = "action_slot/config.yaml",
     checkpoint_path: Optional[str] = None,
     output_path: Optional[str] = None,
+    output_3d_path: Optional[str] = None,
+    export_3d: bool = True,
     threshold: float = 0.35,
     alpha: float = 0.60,
     clip_idx: Optional[int] = None,
@@ -713,9 +730,47 @@ def run_inference(
     os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
     cv2.imwrite(output_path, cv2.cvtColor(grid_img, cv2.COLOR_RGB2BGR))
 
+    html_3d_saved = None
+    if export_3d and export_3d_attention_html is not None and attn_tensor is not None:
+        if output_3d_path is None:
+            out_dir = os.path.dirname(os.path.abspath(output_path))
+            stem = os.path.splitext(os.path.basename(output_path))[0]
+            output_3d_path = os.path.join(out_dir, f"{stem}_3d.html")
+        top_preds_list = [
+            (
+                TACO_ACTOR_LABELS[int(idx)] if int(idx) < len(TACO_ACTOR_LABELS) else f"Class_{int(idx)}",
+                float(actor_probs[int(idx)] * 100.0),
+            )
+            for idx in top_indices[:6]
+        ]
+        gt_str = (
+            ", ".join(TACO_ACTOR_LABELS[i] for i in sorted(gt_actor_set) if i < len(TACO_ACTOR_LABELS))
+            if gt_actor_set
+            else None
+        )
+        bg_attn_np = attn[:, total_slots - 1, :, :] if has_bg_slot else None
+        taco_syms = ["Car", "Bike", "Ped"] if num_obj_slots == 3 else None
+        html_3d_saved = export_3d_attention_html(
+            attn=attn,
+            num_obj_slots=num_obj_slots,
+            active_slot_indices=[s for s in active_slot_indices if s < num_obj_slots],
+            slot_label_names=slot_label_names,
+            slot_palette=SLOT_PALETTE,
+            output_html_path=output_3d_path,
+            overlaid_frames=overlaid_frames,
+            bg_slot_attn=bg_attn_np,
+            pred_labels=detected_str,
+            gt_label=gt_str,
+            top_preds=top_preds_list,
+            symbols=taco_syms,
+            thumb_size=(192, 64),
+        )
+
     print(f"\n[ORIGINAL-BACKGROUND SLOT ATTENTION GRID SAVED]")
     print(f"Output Image : {output_path}")
     print(f"Resolution   : {grid_img.shape[1]}x{grid_img.shape[0]} (4x4 Grid + Slot Legend)")
+    if html_3d_saved:
+        print(f"Interactive 3D HTML : {html_3d_saved}")
     print("=" * 68)
 
 
@@ -750,6 +805,17 @@ def main():
         type=str,
         default="work_dirs/action_slot/attn_inference_grid.png",
         help="Output path for 4x4 montage grid image",
+    )
+    parser.add_argument(
+        "--output-3d",
+        type=str,
+        default=None,
+        help="Destination path for interactive 3D HTML (defaults to <output_stem>_3d.html)",
+    )
+    parser.add_argument(
+        "--no-3d",
+        action="store_true",
+        help="Disable exporting interactive 3D HTML volume",
     )
     parser.add_argument(
         "--threshold",
@@ -787,6 +853,8 @@ def main():
         config_path=args.config,
         checkpoint_path=args.checkpoint,
         output_path=args.output,
+        output_3d_path=args.output_3d,
+        export_3d=(not args.no_3d),
         threshold=args.threshold,
         alpha=args.alpha,
         clip_idx=args.clip_idx,

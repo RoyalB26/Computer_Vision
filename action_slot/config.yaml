@@ -42,6 +42,15 @@ model:
   dual_stream_aux_weight: 0.2
   use_slot_trajectory: true
   use_motion_weighted_traj: true
+  use_mamba: true
+  use_attn_tube: true
+  use_tube_vis: true
+  tube_vis_dim: 32
+  use_tube_coord_conv: true
+  use_tube_depth: true
+  use_ego_comp: true
+  use_ego_film: true
+  tube_only_head: false
   finetune_last_n_stages: 2  # Chỉ fine-tune 2 stage cuối của backbone (đặt unfreeze_all: true nếu muốn mở toàn bộ như v7)
 
 # 2. Dataset Configuration

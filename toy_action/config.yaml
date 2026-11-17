@@ -31,17 +31,22 @@ model:
   backbone_grad_scale: 0.25
   bce_pos_weight: 3.0
   use_obj_count_loss: false
-  obj_count_weight: 0.0
+  obj_count_weight: 0.5
   obj_cls_weight: 0.0
   obj_cls_pos_weight: 0.0
-  action_attn_weight: 0.0
-  bg_attn_weight: 0.0
+  action_attn_weight: 0.5
+  bg_attn_weight: 0.5
   use_feat_recon: true
   feat_recon_weight: 0.15
   dropout: 0.5
   resolution3d: [16, 14, 14]
   pretrained_backbone: true
-  use_slot_trajectory: true
+  use_mamba: false
+  use_slot_trajectory: false
+  use_attn_tube: true
+  use_tube_vis: true
+  tube_vis_dim: 32
+  tube_only_head: true
   # ============================================================================
   # Backbone Freezing Strategy:
   # X3D-M có 5 blocks [0: Stem, 1: Stage1, 2: Stage2, 3: Stage3, 4: Stage4].
