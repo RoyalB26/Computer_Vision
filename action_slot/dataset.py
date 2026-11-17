@@ -146,7 +146,7 @@ class ACTION_SLOT_LMDBDataset(BaseDataset):
                     parts = line.split()
                     if len(parts) >= 3 and p.startswith(parts[1]) and len(parts[1]) > len(best_mnt):
                         best_mnt, best_fs = parts[1], parts[2]
-            return best_fs.startswith("fuse") or best_fs in ("nfs", "nfs4", "cifs", "smbfs")
+            return best_fs.startswith("fuse") or best_fs in ("nfs", "nfs4", "cifs", "smbfs", "overlay")
         except Exception:
             return False
 

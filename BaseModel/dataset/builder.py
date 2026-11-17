@@ -88,6 +88,7 @@ def build_dataloader(
     if num_workers <= 0:
         kwargs.pop("persistent_workers", None)
         kwargs.pop("prefetch_factor", None)
+        kwargs.pop("multiprocessing_context", None)
         init_fn = None
     else:
         if worker_init_fn is not None:
@@ -104,6 +105,12 @@ def build_dataloader(
             kwargs["persistent_workers"] = bool(shuffle or sampler is not None)
         if "prefetch_factor" not in kwargs:
             kwargs["prefetch_factor"] = 2
+        # Tránh deadlock futex_do_wait do fork sau khi CUDA / OpenCV đã khởi tạo
+        if "multiprocessing_context" not in kwargs and hasattr(torch.multiprocessing, "get_context"):
+            import platform
+            if platform.system().lower() == "linux":
+                # 'forkserver' an toàn hơn 'fork' vì tạo process sạch không dính lock CUDA/OpenMP
+                kwargs["multiprocessing_context"] = "forkserver"
 
     return DataLoader(
         dataset=dataset,
