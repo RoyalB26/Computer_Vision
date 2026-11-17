@@ -165,7 +165,7 @@ class DualStreamActionHead(nn.Module):
         actions_per_slot: Optional[List[int]] = None,
         num_variants: int = 2,
         hidden_dim: int = 128,
-        dropout: float = 0.2,
+        dropout: float = 0.35,
         num_ego_classes: int = 0,
         ego_channel: int = 0,
         **kwargs,

@@ -36,6 +36,12 @@ model:
   use_class_pos_weight: true
   resolution3d: [16, 8, 24]
   dropout: 0.5
+  head_type: "dual_stream"
+  head_dropout: 0.35
+  slot_head_dropout: 0.2
+  dual_stream_aux_weight: 0.2
+  use_slot_trajectory: true
+  use_motion_weighted_traj: true
   finetune_last_n_stages: 2  # Chỉ fine-tune 2 stage cuối của backbone (đặt unfreeze_all: true nếu muốn mở toàn bộ như v7)
 
 # 2. Dataset Configuration

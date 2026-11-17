@@ -253,19 +253,15 @@ class TemporalDifferenceBlock(nn.Module):
 
 
 class SlotTrajectoryEncoder(nn.Module):
-    """Extract 2D spatial trajectory + 3D depth proxy (`-log(scale) + offset`) from slot attention maps.
+    """Extract motion-weighted 2D spatial trajectory + 3D depth proxy (`-log(scale) + offset`).
 
-    Depth formulation:
-      - Physics base proxy: `depth_base = -log(scale + eps)` from apparent spread
-        `scale = sqrt(std_x^2 + std_y^2)`, so object scale changes reflect relative
-        depth velocity `dZ/Z` independently of true object size.
-      - Learnable residual offset: a compact zero-initialized MLP over `[vis_ctx, geom_ctx]`
-        predicting bounded `depth_offset = scale_bound * tanh(...)` to compensate for
-        perspective distortion, partial occlusion, or aspect-ratio changes.
+    Uses local temporal feature-difference energy from `vis_feats_5d` to downweight
+    stationary background/parked vehicles before computing slot centroids, spreads,
+    and depth, preventing parked objects in shared TACO slots from anchoring moving ones.
     """
 
-    FRAME_FEAT_DIM = 16
-    VIDEO_FEAT_DIM = 16
+    FRAME_FEAT_DIM = 17
+    VIDEO_FEAT_DIM = 17
     GEOM_CTX_DIM = 7
 
     def __init__(
@@ -274,9 +270,16 @@ class SlotTrajectoryEncoder(nn.Module):
         hidden_dim: int = 128,
         offset_vis_dim: int = 32,
         depth_offset_scale: float = 1.0,
+        use_motion_weighting: bool = True,
     ):
         super().__init__()
         self.depth_offset_scale = float(depth_offset_scale)
+        self.use_motion_weighting = bool(use_motion_weighting)
+
+        # Learnable soft motion gate (floor ~0.25 at init so static scenes never collapse)
+        self.motion_floor_logit = nn.Parameter(torch.tensor(-1.1))
+        self.motion_gate_temp = nn.Parameter(torch.tensor(2.0))
+        self.motion_gate_bias = nn.Parameter(torch.tensor(1.0))
 
         # Compact bottleneck from visual slot features to predict residual depth offset
         self.offset_vis_norm = nn.LayerNorm(slot_dim)
@@ -305,16 +308,46 @@ class SlotTrajectoryEncoder(nn.Module):
             nn.Linear(hidden_dim, slot_dim),
         )
 
+    def _compute_motion_weight(
+        self, vis_feats_5d: Optional[Tensor]
+    ) -> Tuple[Optional[Tensor], Optional[Tensor]]:
+        """Compute per-pixel motion score `(B, T, 1, H, W)` and soft gate weight from feature diffs."""
+        if not self.use_motion_weighting or vis_feats_5d is None or vis_feats_5d.shape[1] <= 1:
+            return None, None
+
+        vf = vis_feats_5d.detach().float()
+        diff = (vf[:, 1:] - vf[:, :-1]).pow(2).mean(dim=-1).sqrt()  # (B, T-1, H, W)
+        bwd = torch.cat([diff[:, :1], diff], dim=1)
+        fwd = torch.cat([diff, diff[:, -1:]], dim=1)
+        energy = 0.5 * (bwd + fwd)
+
+        rel_energy = energy / (energy.mean(dim=(-2, -1), keepdim=True) + 1e-6)
+        motion_score = torch.sigmoid(self.motion_gate_temp * (rel_energy - self.motion_gate_bias))
+        floor = torch.sigmoid(self.motion_floor_logit)
+        motion_weight = floor + (1.0 - floor) * motion_score
+        return motion_weight.unsqueeze(2), motion_score.unsqueeze(2)
+
     def _compute_base_geometry(
-        self, obj_attn: Tensor
-    ) -> Tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor]:
-        """Compute spatial centroids, spreads, scale, base depth, peak, and mass in fp32."""
+        self,
+        obj_attn: Tensor,
+        motion_weight: Optional[Tensor] = None,
+        motion_score: Optional[Tensor] = None,
+    ) -> Tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor]:
+        """Compute motion-weighted centroids, spreads, scale, base depth, peak, mass, and dyn_ratio."""
         b, t, s, h, w = obj_attn.shape
         device = obj_attn.device
         attn = obj_attn.float()
 
-        weights = attn.pow(2)
-        prob = weights / weights.sum(dim=(-2, -1), keepdim=True).clamp(min=1e-6)
+        static_w = attn.pow(2)
+        prob_static = static_w / static_w.sum(dim=(-2, -1), keepdim=True).clamp(min=1e-6)
+
+        if motion_weight is not None:
+            dyn_w = static_w * motion_weight
+            prob = dyn_w / dyn_w.sum(dim=(-2, -1), keepdim=True).clamp(min=1e-6)
+            dyn_ratio = (prob_static * motion_score).sum(dim=(-2, -1))  # (B, T, S)
+        else:
+            prob = prob_static
+            dyn_ratio = torch.ones((b, t, s), device=device, dtype=torch.float32)
 
         ys = torch.linspace(-1.0, 1.0, steps=h, device=device, dtype=torch.float32)
         xs = torch.linspace(-1.0, 1.0, steps=w, device=device, dtype=torch.float32)
@@ -331,18 +364,22 @@ class SlotTrajectoryEncoder(nn.Module):
         mass = attn.mean(dim=(-2, -1))  # (B, T, S)
         scale = torch.sqrt(std_x.pow(2) + std_y.pow(2) + 1e-4)
         depth_base = -torch.log(scale + 1e-3)
-        return cx, cy, std_x, std_y, scale, depth_base, peak, mass
+        return cx, cy, std_x, std_y, scale, depth_base, peak, mass, dyn_ratio
 
     def forward(
         self,
         obj_attn: Tensor,
         obj_slots: Optional[Tensor] = None,
+        vis_feats_5d: Optional[Tensor] = None,
     ) -> Tuple[Tensor, Tensor, Tensor]:
         b, t, s, _, _ = obj_attn.shape
         device = obj_attn.device
         out_dtype = obj_slots.dtype if obj_slots is not None else obj_attn.dtype
 
-        cx, cy, std_x, std_y, scale, depth_base, peak, mass = self._compute_base_geometry(obj_attn)
+        motion_weight, motion_score = self._compute_motion_weight(vis_feats_5d)
+        cx, cy, std_x, std_y, scale, depth_base, peak, mass, dyn_ratio = self._compute_base_geometry(
+            obj_attn, motion_weight=motion_weight, motion_score=motion_score
+        )
 
         geom_ctx = torch.stack(
             [
@@ -412,9 +449,10 @@ class SlotTrajectoryEncoder(nn.Module):
                 peak,
                 mass,
                 depth_offset * peak,
+                dyn_ratio * peak,
             ],
             dim=-1,
-        )  # (B, T, S, 16)
+        )  # (B, T, S, 17)
 
         # Video-level 3D trajectory summary
         max_peak = peak.amax(dim=1)
@@ -427,6 +465,7 @@ class SlotTrajectoryEncoder(nn.Module):
         mean_depth = (w_norm * depth).sum(dim=1) * max_peak
         mean_std_x = (w_norm * std_x).sum(dim=1) * max_peak
         mean_std_y = (w_norm * std_y).sum(dim=1) * max_peak
+        mean_dyn_ratio = (w_norm * dyn_ratio).sum(dim=1) * max_peak
 
         if t > 1:
             t_grid = torch.linspace(-1.0, 1.0, steps=t, device=device, dtype=torch.float32).view(1, t, 1)
@@ -476,9 +515,10 @@ class SlotTrajectoryEncoder(nn.Module):
                 mean_peak,
                 max_mass,
                 mean_mass,
+                mean_dyn_ratio,
             ],
             dim=-1,
-        )  # (B, S, 16)
+        )  # (B, S, 17)
 
         proj_dtype = self.frame_proj[1].weight.dtype
         frame_emb = self.frame_proj(frame_feats.to(dtype=proj_dtype)).to(dtype=out_dtype)
@@ -626,7 +666,7 @@ class ActionSlotModel(BaseModel):
                 num_slots=self.num_slots,
                 actions_per_slot=self.actions_per_slot,
                 hidden_dim=int(kwargs.get("head_hidden_dim", 128)),
-                dropout=float(kwargs.get("head_dropout", 0.2)),
+                dropout=float(kwargs.get("head_dropout", 0.35)),
             )
         else:
             self.head = ObjectActionHead(
@@ -638,6 +678,7 @@ class ActionSlotModel(BaseModel):
                 actions_per_slot=self.actions_per_slot,
             )
         self.drop = nn.Dropout(p=dropout)
+        self.slot_drop = nn.Dropout(p=float(kwargs.get("slot_head_dropout", 0.2)))
 
         # DINOSAUR-style Spatial Broadcast Feature Decoder
         self.use_feat_recon = bool(kwargs.get("use_feat_recon", True))
@@ -663,7 +704,7 @@ class ActionSlotModel(BaseModel):
             action_attn_weight=float(kwargs.get("action_attn_weight", 1.0)),
             bg_attn_weight=float(kwargs.get("bg_attn_weight", 0.5)),
             ego_loss_weight=float(kwargs.get("ego_loss_weight", 0.2)),
-            dual_stream_aux_weight=float(kwargs.get("dual_stream_aux_weight", 0.5)),
+            dual_stream_aux_weight=float(kwargs.get("dual_stream_aux_weight", 0.2)),
             use_class_pos_weight=bool(kwargs.get("use_class_pos_weight", True)),
         )
 
@@ -682,6 +723,7 @@ class ActionSlotModel(BaseModel):
                 hidden_dim=int(kwargs.get("traj_hidden_dim", 128)),
                 offset_vis_dim=int(kwargs.get("depth_offset_vis_dim", 32)),
                 depth_offset_scale=float(kwargs.get("depth_offset_scale", 1.0)),
+                use_motion_weighting=bool(kwargs.get("use_motion_weighted_traj", True)),
             )
         else:
             self.traj_encoder = None
@@ -765,6 +807,7 @@ class ActionSlotModel(BaseModel):
             elif self.backbone_grad_scale != 1.0:
                 slot_in = _ScaleGrad.apply(feats, self.backbone_grad_scale)
         x_vis = self.conv3d(slot_in)
+        x_vis_raw_5d = x_vis.permute(0, 2, 3, 4, 1).contiguous()
         if self.temporal_diff is not None:
             x_vis = self.temporal_diff(x_vis)
         x_vis_5d = x_vis.permute(0, 2, 3, 4, 1).contiguous()
@@ -797,7 +840,9 @@ class ActionSlotModel(BaseModel):
         pred_depth = None
         if self.traj_encoder is not None:
             obj_attn = attn_masks[:, :, :self.num_slots, :, :]  # (B, T, S, H, W)
-            frame_motion_emb, video_motion_emb, pred_depth = self.traj_encoder(obj_attn, obj_slots=obj_slots)
+            frame_motion_emb, video_motion_emb, pred_depth = self.traj_encoder(
+                obj_attn, obj_slots=obj_slots, vis_feats_5d=x_vis_raw_5d
+            )
             obj_slots_in = obj_slots + frame_motion_emb
         else:
             obj_slots_in = obj_slots
@@ -920,12 +965,12 @@ class ActionSlotModel(BaseModel):
         """Dispatch DualStreamActionHead or legacy single-stream head."""
         if isinstance(self.head, DualStreamActionHead):
             head_out = self.head.forward_with_streams(
-                vis_slots=aux_preds["vis_slots"],
-                motion_slots=aux_preds["motion_slots"],
+                vis_slots=self.slot_drop(aux_preds["vis_slots"]),
+                motion_slots=self.slot_drop(aux_preds["motion_slots"]),
                 ego_x=ego_x,
             )
             return head_out["ego"], head_out["actor"], head_out["var_logits"], head_out["dir_logits"]
-        pred_ego, pred_actor = self.head(slots, ego_x=ego_x)
+        pred_ego, pred_actor = self.head(self.slot_drop(slots), ego_x=ego_x)
         return pred_ego, pred_actor, None, None
 
     def forward_train(

@@ -8,6 +8,7 @@ a 4x4 montage grid (3:1 aspect ratio) with a slot-to-color legend, and prints eg
 
 Usage:
     python action_slot/inference.py --input-dir "D:/apps/Datasets/TACO/ap_Town01/t10/varient_scenario/54/rgb/front"
+    python action_slot/inference.py --input-dir "D:/apps/Datasets/TACO/data/ap_Town07_lmdb" --index 0
     python action_slot/inference.py --input-dir "..." --checkpoint work_dirs/action_slot/best.pth
     python action_slot/inference.py --input-dir "..." --checkpoint best.pth --show-bg-slot
 """
@@ -15,9 +16,11 @@ Usage:
 import argparse
 import glob
 import importlib
+import json
 import os
+import pickle
 import sys
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import cv2
 import numpy as np
@@ -189,6 +192,171 @@ def load_strided_frames(
     raise FileNotFoundError(f"No image frames ({IMAGE_EXTS}) or .mp4 found in: {input_dir}")
 
 
+def _is_lmdb_town_dir(input_dir: str) -> bool:
+    """Return True if `input_dir` is an LMDB town folder (contains rgb_front/data.mdb)."""
+    return os.path.isdir(input_dir) and os.path.isfile(os.path.join(input_dir, "rgb_front", "data.mdb"))
+
+
+def _decode_lmdb_rgb(raw_bytes: bytes) -> np.ndarray:
+    """Decode pickled LMDB entry (raw_array or JPEG image bytes) into an RGB uint8 ndarray."""
+    val = pickle.loads(raw_bytes)
+    if isinstance(val, dict) and "raw_array" in val:
+        arr = np.asarray(val["raw_array"])
+        if arr.ndim == 2:
+            arr = cv2.cvtColor(arr, cv2.COLOR_GRAY2RGB)
+        return arr
+    img_bytes = val["image"] if isinstance(val, dict) else val
+    buf = np.frombuffer(img_bytes, dtype=np.uint8)
+    bgr = cv2.imdecode(buf, cv2.IMREAD_COLOR)
+    if bgr is None:
+        raise ValueError("Failed to decode RGB image bytes from LMDB.")
+    return cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+
+
+def _load_lmdb_strided_frames(
+    lmdb_dir: str,
+    index: int = 0,
+    sequence_len: int = 16,
+    clip_idx: Optional[int] = None,
+) -> Tuple[List[np.ndarray], List[str], str, str, str]:
+    """Load 16 strided RGB frames for scenario `index` from a TACO LMDB town folder.
+
+    Returns:
+        (frames_rgb, frame_tags, sampling_info, scenario_key, scenario_prefix)
+    """
+    import lmdb
+
+    rgb_lmdb_path = os.path.join(lmdb_dir, "rgb_front")
+    bg_lmdb_path = os.path.join(lmdb_dir, "mask_background")
+    index_lmdb_path = bg_lmdb_path if os.path.isfile(os.path.join(bg_lmdb_path, "data.mdb")) else rgb_lmdb_path
+    use_bg_index = index_lmdb_path == bg_lmdb_path
+
+    scenario_stems: Dict[str, List[str]] = {}
+    env_idx = lmdb.open(index_lmdb_path, readonly=True, lock=False, readahead=True, meminit=False)
+    try:
+        with env_idx.begin(write=False) as txn:
+            cursor = txn.cursor()
+            for k_bytes in cursor.iternext(keys=True, values=False):
+                k_str = k_bytes.decode("utf-8", errors="ignore").replace("\\", "/")
+                parts = k_str.split("/")
+                # Expected: <sub_town>/variant_scenario/<vid_id>/(mask/background|rgb/front)/<frame>.(png|jpg)
+                if len(parts) < 4:
+                    continue
+                scenario_prefix = "/".join(parts[:-3])
+                frame_file = parts[-1]
+                scenario_stems.setdefault(scenario_prefix, []).append(frame_file)
+    finally:
+        env_idx.close()
+
+    if not scenario_stems:
+        raise ValueError(f"No scenarios found in LMDB: {index_lmdb_path}")
+
+    sorted_scenarios = sorted(scenario_stems.keys())
+    if index < 0 or index >= len(sorted_scenarios):
+        raise IndexError(
+            f"Scenario index {index} out of range for {lmdb_dir} (valid: 0..{len(sorted_scenarios) - 1})."
+        )
+
+    scenario_prefix = sorted_scenarios[index]
+    raw_files = scenario_stems[scenario_prefix]
+    if all(_parse_frame_number(f) is not None for f in raw_files):
+        raw_files.sort(key=lambda f: int(os.path.splitext(os.path.basename(f))[0]))
+    else:
+        raw_files.sort()
+
+    rgb_keys = [
+        f"{scenario_prefix}/rgb/front/{os.path.splitext(f)[0]}.jpg" if use_bg_index else f"{scenario_prefix}/rgb/front/{f}"
+        for f in raw_files
+    ]
+    sampled_keys, sampling_info = sample_strided_frames(
+        rgb_keys, sequence_len=sequence_len, clip_idx=clip_idx
+    )
+
+    frames: List[np.ndarray] = []
+    env_rgb = lmdb.open(rgb_lmdb_path, readonly=True, lock=False, readahead=True, meminit=False)
+    try:
+        with env_rgb.begin(write=False) as txn:
+            for rk in sampled_keys:
+                raw_val = txn.get(rk.encode("utf-8"))
+                if raw_val is None and rk.endswith(".jpg"):
+                    alt_rk = rk[:-4] + ".png"
+                    raw_val = txn.get(alt_rk.encode("utf-8"))
+                if raw_val is None:
+                    raise KeyError(f"RGB key not found in {rgb_lmdb_path}: {rk}")
+                frames.append(_decode_lmdb_rgb(raw_val))
+    finally:
+        env_rgb.close()
+
+    frame_tags = [os.path.splitext(os.path.basename(k))[0] for k in sampled_keys]
+    town_name = os.path.basename(os.path.normpath(lmdb_dir)).replace("_lmdb", "")
+    sp_parts = scenario_prefix.split("/")
+    scenario_key = f"{town_name}/{sp_parts[0]}/{sp_parts[-1]}" if len(sp_parts) >= 2 else f"{town_name}/{scenario_prefix}"
+    sampling_info = f"lmdb[{index}/{len(sorted_scenarios)}] {scenario_prefix} | {sampling_info}"
+    return frames, frame_tags, sampling_info, scenario_key, scenario_prefix
+
+
+def _infer_scenario_key_from_path(input_dir: str) -> Optional[str]:
+    """Best-effort extraction of `Town/sub/id` key from a standard RGB folder path."""
+    parts = os.path.normpath(input_dir).replace("\\", "/").split("/")
+    for i, part in enumerate(parts):
+        if part in ("variant_scenario", "varient_scenario") and i >= 2 and i + 1 < len(parts):
+            town = parts[i - 2].replace("_lmdb", "")
+            sub = parts[i - 1]
+            vid_id = parts[i + 1]
+            return f"{town}/{sub}/{vid_id}"
+    return None
+
+
+def _lookup_ground_truth(
+    scenario_key: Optional[str],
+    lmdb_dir: Optional[str] = None,
+    scenario_prefix: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Look up ground-truth ego/actor labels from taco_{train,val}_label.json and retrieve_gt_all.jsonl."""
+    gt_info: Dict[str, Any] = {"scenario_key": scenario_key}
+
+    if scenario_key:
+        for split_name, fname in (("val", "taco_val_label.json"), ("train", "taco_train_label.json")):
+            json_path = os.path.join(action_slot_dir, fname)
+            if not os.path.isfile(json_path):
+                continue
+            try:
+                with open(json_path, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                if scenario_key in data:
+                    entry = data[scenario_key]
+                    gt_info["split"] = split_name
+                    gt_info["ego"] = entry.get("ego")
+                    gt_info["agents"] = entry.get("agents")
+                    break
+            except Exception:
+                pass
+
+    if lmdb_dir and scenario_prefix:
+        jsonl_path = os.path.join(lmdb_dir, "retrieve_gt_all.jsonl")
+        if os.path.isfile(jsonl_path):
+            town_name = os.path.basename(os.path.normpath(lmdb_dir)).replace("_lmdb", "")
+            target_path = f"{town_name}/{scenario_prefix}".replace("\\", "/")
+            try:
+                with open(jsonl_path, "r", encoding="utf-8") as f:
+                    for line in f:
+                        line = line.strip()
+                        if not line:
+                            continue
+                        rec = json.loads(line)
+                        if rec.get("scenario_path", "").replace("\\", "/") == target_path:
+                            gt_info["retrieve_gt"] = [
+                                tok.strip()
+                                for tok in rec.get("content", "").splitlines()
+                                if tok.strip() and tok.strip() != "x"
+                            ]
+                            break
+            except Exception:
+                pass
+
+    return gt_info
+
+
 def overlay_multi_slot_attention(
     rgb_frame: np.ndarray,
     slot_attns_2d: np.ndarray,
@@ -336,6 +504,7 @@ def run_inference(
     threshold: float = 0.35,
     alpha: float = 0.60,
     clip_idx: Optional[int] = None,
+    index: int = 0,
     show_bg_slot: bool = False,
     device_str: str = "cuda",
 ) -> None:
@@ -382,9 +551,20 @@ def run_inference(
     target_h, target_w = int(video_size[0]), int(video_size[1])
 
     print(f"Sampling {sequence_len} strided frames from: {input_dir}")
-    frames_rgb, frame_tags, sampling_info = load_strided_frames(
-        input_dir=input_dir, sequence_len=sequence_len, clip_idx=clip_idx
-    )
+    scenario_key: Optional[str] = None
+    scenario_prefix: Optional[str] = None
+    lmdb_dir: Optional[str] = None
+    if _is_lmdb_town_dir(input_dir):
+        lmdb_dir = input_dir
+        frames_rgb, frame_tags, sampling_info, scenario_key, scenario_prefix = _load_lmdb_strided_frames(
+            lmdb_dir=input_dir, index=index, sequence_len=sequence_len, clip_idx=clip_idx
+        )
+    else:
+        frames_rgb, frame_tags, sampling_info = load_strided_frames(
+            input_dir=input_dir, sequence_len=sequence_len, clip_idx=clip_idx
+        )
+        scenario_key = _infer_scenario_key_from_path(input_dir)
+    gt_info = _lookup_ground_truth(scenario_key, lmdb_dir=lmdb_dir, scenario_prefix=scenario_prefix)
     print(f"Sampling strategy: {sampling_info}")
     print(f"Sampled frame IDs : {frame_tags}")
 
@@ -406,12 +586,38 @@ def run_inference(
     top_indices = np.argsort(actor_probs)[::-1][:10]
     detected = [i for i in range(len(actor_probs)) if actor_probs[i] >= threshold]
 
+    gt_ego_idx = gt_info.get("ego")
+    gt_agents = gt_info.get("agents") or []
+    gt_actor_set = {i for i, v in enumerate(gt_agents) if v > 0.5}
+
     print("=" * 68)
+    print("[GROUND TRUTH LABELS]")
+    if scenario_key:
+        split_tag = f" ({gt_info['split']})" if "split" in gt_info else ""
+        print(f"Scenario Key         : {scenario_key}{split_tag}")
+    if gt_ego_idx is not None:
+        gt_ego_name = TACO_EGO_LABELS[gt_ego_idx] if 0 <= gt_ego_idx < len(TACO_EGO_LABELS) else f"Ego_{gt_ego_idx}"
+        print(f"Ground-Truth Ego     : {gt_ego_name} (id={gt_ego_idx})")
+    if gt_agents:
+        gt_actor_names = [
+            f"{TACO_ACTOR_LABELS[i]} (id={i})" if i < len(TACO_ACTOR_LABELS) else f"Class_{i}"
+            for i in sorted(gt_actor_set)
+        ]
+        print(f"Ground-Truth Actors  : {', '.join(gt_actor_names) if gt_actor_names else '(None)'}")
+    if "retrieve_gt" in gt_info:
+        print(f"Retrieve GT Tags     : {', '.join(gt_info['retrieve_gt'])}")
+    if gt_ego_idx is None and not gt_agents and "retrieve_gt" not in gt_info:
+        print("Ground-Truth         : (Not found in taco_train/val_label.json or retrieve_gt_all.jsonl)")
+
+    print("-" * 68)
     print("[MODEL INFERENCE PREDICTIONS]")
     if ego_probs is not None:
         ego_idx = int(np.argmax(ego_probs))
         ego_name = TACO_EGO_LABELS[ego_idx] if ego_idx < len(TACO_EGO_LABELS) else f"Ego_{ego_idx}"
-        print(f"Predicted Ego Action : {ego_name} ({ego_probs[ego_idx] * 100:.2f}%)")
+        ego_match = ""
+        if gt_ego_idx is not None:
+            ego_match = " [MATCH]" if ego_idx == gt_ego_idx else " [MISMATCH]"
+        print(f"Predicted Ego Action : {ego_name} ({ego_probs[ego_idx] * 100:.2f}%){ego_match}")
 
     detected_str = ", ".join(f"{TACO_ACTOR_LABELS[i]} ({actor_probs[i]*100:.1f}%)" for i in detected)
     print(f"Detected Actor Labels (threshold >= {threshold}):")
@@ -421,7 +627,16 @@ def run_inference(
         cls_name = TACO_ACTOR_LABELS[idx] if idx < len(TACO_ACTOR_LABELS) else f"Class_{idx}"
         conf = actor_probs[idx] * 100.0
         mark = "[DETECTED]" if actor_probs[idx] >= threshold else "          "
-        print(f"  {rank:2d}. {mark} {cls_name:<12} : {conf:6.2f}%")
+        gt_mark = " [GT]" if idx in gt_actor_set else ""
+        print(f"  {rank:2d}. {mark} {cls_name:<12} : {conf:6.2f}%{gt_mark}")
+    if gt_actor_set:
+        missed_gt = [i for i in sorted(gt_actor_set) if i not in set(top_indices.tolist())]
+        if missed_gt:
+            missed_str = ", ".join(
+                f"{TACO_ACTOR_LABELS[i]} ({actor_probs[i]*100:.2f}%)" if i < len(TACO_ACTOR_LABELS) else f"Class_{i}"
+                for i in missed_gt
+            )
+            print(f"Other GT Actors (< Top 10): {missed_str}")
     print("=" * 68)
 
     # Extract slot attention maps: (1, T, actual_slots, H_feat, W_feat)
@@ -509,8 +724,14 @@ def main():
     parser.add_argument(
         "--input-dir",
         type=str,
-        default=r"D:\apps\Datasets\TACO\ap_Town01\t10\varient_scenario\54\rgb\front",
-        help="Path to scenario RGB folder (e.g. .../varient_scenario/54/rgb/front) or .mp4 file",
+        default=r"D:\apps\Datasets\TACO\data\ap_Town07_lmdb",
+        help="Path to LMDB town folder (e.g. D:/apps/Datasets/TACO/data/ap_Town07_lmdb), RGB folder, or .mp4 file",
+    )
+    parser.add_argument(
+        "--index",
+        type=int,
+        default=0,
+        help="0-based scenario index when --input-dir is an LMDB town folder",
     )
     parser.add_argument(
         "--config",
@@ -569,6 +790,7 @@ def main():
         threshold=args.threshold,
         alpha=args.alpha,
         clip_idx=args.clip_idx,
+        index=args.index,
         show_bg_slot=args.show_bg_slot,
         device_str=args.device,
     )
