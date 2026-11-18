@@ -272,3 +272,100 @@ class VisDroneMAP(BaseMetric):
             results[f"AP50_{clean_name}"] = per_class_ap50.get(c, 0.0)
 
         return results
+
+
+@METRICS.register_module(name="ClassCountingMetric", force=True)
+@METRICS.register_module(name="CountingMetric", force=True)
+class ClassCountingMetric(BaseMetric):
+    """Đánh giá chất lượng đếm số lượng class (Class Counting).
+
+    Tính toán:
+      - val_mae: Mean Absolute Error trung bình trên tất cả class.
+      - val_rmse: Root Mean Squared Error trung bình trên tất cả class.
+      - val_acc: Tỉ lệ dự đoán đúng chính xác số lượng (làm tròn số nguyên).
+      - Per-class MAE cho từng class cụ thể.
+    """
+
+    def __init__(
+        self,
+        num_classes: int = 10,
+        class_names: Optional[List[str]] = None,
+        **kwargs,
+    ):
+        self.num_classes = num_classes
+        if class_names is not None:
+            self.class_names = class_names
+        else:
+            self.class_names = [
+                "pedestrian",
+                "people",
+                "bicycle",
+                "car",
+                "van",
+                "truck",
+                "tricycle",
+                "awning-tricycle",
+                "bus",
+                "motorcycle",
+            ][:num_classes]
+        self.reset()
+
+    def reset(self) -> None:
+        self.total_abs_error = torch.zeros(self.num_classes, dtype=torch.float64)
+        self.total_sq_error = torch.zeros(self.num_classes, dtype=torch.float64)
+        self.total_exact_match = torch.zeros(self.num_classes, dtype=torch.float64)
+        self.sample_count = 0
+
+    def update(self, preds: Any, targets: Any) -> None:
+        if isinstance(preds, (list, tuple)):
+            preds = torch.stack(preds, dim=0)
+        if isinstance(targets, (list, tuple)):
+            if len(targets) > 0 and isinstance(targets[0], dict):
+                b = len(targets)
+                gt = torch.zeros((b, self.num_classes), dtype=torch.float32)
+                for i, t in enumerate(targets):
+                    if "counts" in t:
+                        gt[i] = t["counts"]
+                    elif "labels" in t and len(t["labels"]) > 0:
+                        for c in range(self.num_classes):
+                            gt[i, c] = (t["labels"] == c).sum().float()
+                targets = gt
+            else:
+                targets = torch.stack(targets, dim=0)
+
+        p = preds.detach().cpu().float()
+        t = targets.detach().cpu().float()
+
+        if p.dim() == 1:
+            p = p.unsqueeze(0)
+        if t.dim() == 1:
+            t = t.unsqueeze(0)
+
+        p = p[:, :self.num_classes]
+        t = t[:, :self.num_classes]
+
+        b = p.shape[0]
+        self.sample_count += b
+        self.total_abs_error += torch.abs(p - t).sum(dim=0).double()
+        self.total_sq_error += ((p - t) ** 2).sum(dim=0).double()
+        self.total_exact_match += (p.round() == t).sum(dim=0).double()
+
+    def compute(self) -> Dict[str, float]:
+        if self.sample_count == 0:
+            return {"val_mae": 0.0, "val_rmse": 0.0, "val_acc": 0.0}
+
+        mae_per_class = (self.total_abs_error / self.sample_count).numpy()
+        rmse_per_class = np.sqrt((self.total_sq_error / self.sample_count).numpy())
+        acc_per_class = (self.total_exact_match / self.sample_count).numpy()
+
+        results = {
+            "val_mae": float(mae_per_class.mean()),
+            "val_rmse": float(rmse_per_class.mean()),
+            "val_acc": float(acc_per_class.mean()),
+        }
+
+        for i, name in enumerate(self.class_names):
+            results[f"mae_{name}"] = float(mae_per_class[i])
+
+        return results
+
