@@ -8,7 +8,14 @@ import torch.nn.functional as F
 import torchvision.ops
 from torch import Tensor
 try:
-    from .model_parts.backbones import X3DBackbone, YoloV11Backbone
+    from .model_parts.backbones import (
+        X3DBackbone,
+        YoloV11Backbone,
+        MoViNetA0Backbone,
+        MobileNetV3Backbone,
+        MobileNetV3NanoBackbone,
+        MobileNetV3SmallBackbone,
+    )
     from .model_parts.heads import (
         Allocated_Head,
         DualStreamActionHead,
@@ -22,7 +29,14 @@ try:
     from .loss import ActionSlotLoss
     from .road_filter import filter_road_color_difference
 except ImportError:
-    from model_parts.backbones import X3DBackbone, YoloV11Backbone
+    from model_parts.backbones import (
+        X3DBackbone,
+        YoloV11Backbone,
+        MoViNetA0Backbone,
+        MobileNetV3Backbone,
+        MobileNetV3NanoBackbone,
+        MobileNetV3SmallBackbone,
+    )
     from model_parts.heads import (
         Allocated_Head,
         DualStreamActionHead,
@@ -847,15 +861,69 @@ class ActionSlotModel(BaseModel):
         pretrained_backbone = kwargs.get('pretrained_backbone', True)
         pretrained_backbone_path = kwargs.get('pretrained_backbone_path', None)
 
-        self.backbone = X3DBackbone(
-            pretrained=pretrained_backbone,
-            pretrained_path=pretrained_backbone_path,
-            finetune_last_n_stages=finetune_last_n_stages,
-            freeze_stages=freeze_stages,
-            freeze_all=freeze_all,
-            unfreeze_all=unfreeze_all,
-            freeze_bn=freeze_bn,
-        )
+        backbone_type = str(kwargs.get("backbone_type", "movinet")).lower()
+        if backbone_type in ("mobilenetv3_nano", "mobilenet_v3_nano", "mobilenet-v3-nano", "mobilenetv3-nano", "nano"):
+            self.backbone = MobileNetV3NanoBackbone(
+                pretrained=pretrained_backbone,
+                pretrained_path=pretrained_backbone_path,
+                finetune_last_n_stages=finetune_last_n_stages,
+                freeze_stages=freeze_stages,
+                freeze_all=freeze_all,
+                unfreeze_all=unfreeze_all,
+                freeze_bn=freeze_bn,
+            )
+        elif backbone_type in ("mobilenetv3_small", "mobilenet_v3_small", "mobilenet-v3-small", "mobilenetv3-small", "small"):
+            self.backbone = MobileNetV3SmallBackbone(
+                pretrained=pretrained_backbone,
+                pretrained_path=pretrained_backbone_path,
+                finetune_last_n_stages=finetune_last_n_stages,
+                freeze_stages=freeze_stages,
+                freeze_all=freeze_all,
+                unfreeze_all=unfreeze_all,
+                freeze_bn=freeze_bn,
+            )
+        elif backbone_type in ("mobilenetv3", "mobilenet_v3", "mobilenet"):
+            width_mult = float(kwargs.get("width_mult", 0.5))
+            self.backbone = MobileNetV3Backbone(
+                width_mult=width_mult,
+                pretrained=pretrained_backbone,
+                pretrained_path=pretrained_backbone_path,
+                finetune_last_n_stages=finetune_last_n_stages,
+                freeze_stages=freeze_stages,
+                freeze_all=freeze_all,
+                unfreeze_all=unfreeze_all,
+                freeze_bn=freeze_bn,
+            )
+        elif backbone_type in ("yolo", "yolov11", "yolo11"):
+            self.backbone = YoloV11Backbone(
+                pretrained=pretrained_backbone,
+                pretrained_path=pretrained_backbone_path,
+                finetune_last_n_stages=finetune_last_n_stages,
+                freeze_stages=freeze_stages,
+                freeze_all=freeze_all,
+                unfreeze_all=unfreeze_all,
+                freeze_bn=freeze_bn,
+            )
+        elif backbone_type in ("x3d", "x3d_m", "x3dm"):
+            self.backbone = X3DBackbone(
+                pretrained=pretrained_backbone,
+                pretrained_path=pretrained_backbone_path,
+                finetune_last_n_stages=finetune_last_n_stages,
+                freeze_stages=freeze_stages,
+                freeze_all=freeze_all,
+                unfreeze_all=unfreeze_all,
+                freeze_bn=freeze_bn,
+            )
+        else:
+            self.backbone = MoViNetA0Backbone(
+                pretrained=pretrained_backbone,
+                pretrained_path=pretrained_backbone_path,
+                finetune_last_n_stages=finetune_last_n_stages,
+                freeze_stages=freeze_stages,
+                freeze_all=freeze_all,
+                unfreeze_all=unfreeze_all,
+                freeze_bn=freeze_bn,
+            )
         in_c = self.backbone.out_channels
 
         self.use_temporal_diff = bool(kwargs.get("use_temporal_diff", True))

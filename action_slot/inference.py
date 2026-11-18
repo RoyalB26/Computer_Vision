@@ -100,14 +100,19 @@ def sample_strided_frames(
     frame_paths: List[str],
     sequence_len: int = 16,
     clip_idx: Optional[int] = None,
+    all_frames: bool = False,
 ) -> Tuple[List[str], str]:
     """Sample `sequence_len` strided frame paths matching `ACTION_SLOT_LMDBDataset._build_scenario_clips`.
 
     Defaults to selecting the middle clip (`len(clips) // 2`), matching validation sampling.
+    If `all_frames=True` or `sequence_len >= len(frame_paths)`, returns all frames.
     """
     n_rgb = len(frame_paths)
     if n_rgb == 0:
         raise ValueError("No image frames found to sample.")
+
+    if all_frames or sequence_len >= n_rgb:
+        return frame_paths, f"all_frames (total={n_rgb})"
 
     clips: List[List[str]] = []
     max_num = 50
@@ -164,8 +169,9 @@ def load_strided_frames(
     input_dir: str,
     sequence_len: int = 16,
     clip_idx: Optional[int] = None,
+    all_frames: bool = False,
 ) -> Tuple[List[np.ndarray], List[str], str]:
-    """Loads 16 RGB frames from either an image folder or a video file."""
+    """Loads RGB frames from either an image folder or a video file."""
     if os.path.isfile(input_dir):
         mp4_files = [input_dir]
         frame_files = []
@@ -177,7 +183,7 @@ def load_strided_frames(
 
     if frame_files:
         sampled_paths, sampling_info = sample_strided_frames(
-            frame_files, sequence_len=sequence_len, clip_idx=clip_idx
+            frame_files, sequence_len=sequence_len, clip_idx=clip_idx, all_frames=all_frames
         )
         frames: List[np.ndarray] = []
         for p in sampled_paths:
@@ -190,19 +196,25 @@ def load_strided_frames(
 
     if mp4_files:
         cap = cv2.VideoCapture(mp4_files[0])
-        all_frames: List[np.ndarray] = []
+        all_video_frames: List[np.ndarray] = []
         while True:
             ret, bgr = cap.read()
             if not ret:
                 break
-            all_frames.append(cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB))
+            all_video_frames.append(cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB))
         cap.release()
-        if not all_frames:
+        if not all_video_frames:
             raise ValueError(f"Video {mp4_files[0]} contains 0 frames.")
-        idxs = np.linspace(0, len(all_frames) - 1, sequence_len).round().astype(int).tolist()
-        frames = [all_frames[i] for i in idxs]
-        frame_tags = [f"{i:06d}" for i in idxs]
-        return frames, frame_tags, f"video_uniform (total={len(all_frames)})"
+
+        if all_frames or sequence_len >= len(all_video_frames):
+            frames = all_video_frames
+            frame_tags = [f"{i:06d}" for i in range(len(all_video_frames))]
+            return frames, frame_tags, f"video_all_frames (total={len(all_video_frames)})"
+        else:
+            idxs = np.linspace(0, len(all_video_frames) - 1, sequence_len).round().astype(int).tolist()
+            frames = [all_video_frames[i] for i in idxs]
+            frame_tags = [f"{i:06d}" for i in idxs]
+            return frames, frame_tags, f"video_uniform (total={len(all_video_frames)})"
 
     raise FileNotFoundError(f"No image frames ({IMAGE_EXTS}) or .mp4 found in: {input_dir}")
 
@@ -233,8 +245,9 @@ def _load_lmdb_strided_frames(
     index: int = 0,
     sequence_len: int = 16,
     clip_idx: Optional[int] = None,
+    all_frames: bool = False,
 ) -> Tuple[List[np.ndarray], List[str], str, str, str]:
-    """Load 16 strided RGB frames for scenario `index` from a TACO LMDB town folder.
+    """Load strided or full RGB frames for scenario `index` from a TACO LMDB town folder.
 
     Returns:
         (frames_rgb, frame_tags, sampling_info, scenario_key, scenario_prefix)
@@ -284,7 +297,7 @@ def _load_lmdb_strided_frames(
         for f in raw_files
     ]
     sampled_keys, sampling_info = sample_strided_frames(
-        rgb_keys, sequence_len=sequence_len, clip_idx=clip_idx
+        rgb_keys, sequence_len=sequence_len, clip_idx=clip_idx, all_frames=all_frames
     )
 
     frames: List[np.ndarray] = []
@@ -426,12 +439,17 @@ def create_16_frame_grid_with_legend(
     frame_tags: List[str],
     active_slot_indices: List[int],
     slot_label_names: Dict[int, str],
-    rows: int = 4,
+    rows: Optional[int] = None,
     cols: int = 4,
     cell_size: Tuple[int, int] = (384, 128),
+    start_frame_idx: int = 0,
+    title_suffix: str = "",
 ) -> np.ndarray:
-    """Combines 16 frames into a 4x4 grid (preserving 3:1 aspect ratio) with frame badges and legend."""
+    """Combines up to 16 frames into a 4-column montage grid (preserving 3:1 aspect ratio) with frame badges and legend."""
     cell_w, cell_h = cell_size
+    n_frames = len(frames_overlaid)
+    if rows is None:
+        rows = max(1, (n_frames + cols - 1) // cols)
     grid_h = rows * cell_h
     grid_w = cols * cell_w
     grid = np.zeros((grid_h, grid_w, 3), dtype=np.uint8)
@@ -441,8 +459,9 @@ def create_16_frame_grid_with_legend(
         c = idx % cols
         img = cv2.resize(frame, (cell_w, cell_h), interpolation=cv2.INTER_AREA if frame.shape[1] > cell_w else cv2.INTER_LINEAR)
 
-        tag = frame_tags[idx] if idx < len(frame_tags) else f"{idx:02d}"
-        text = f"F{idx:02d} ({tag})"
+        global_idx = start_frame_idx + idx
+        tag = frame_tags[idx] if idx < len(frame_tags) else f"{global_idx:02d}"
+        text = f"F{global_idx:02d} ({tag})"
         box_w = min(cell_w - 8, 12 + len(text) * 8)
         cv2.rectangle(img, (4, 4), (box_w, 24), (0, 0, 0), -1)
         cv2.putText(
@@ -466,12 +485,13 @@ def create_16_frame_grid_with_legend(
     legend_h = 40 + rows_legend * 28
     legend_bar = np.full((legend_h, grid_w, 3), 245, dtype=np.uint8)
 
+    legend_title = f"Action-Slot Attention Overlay (Original Frame Background{title_suffix}):"
     cv2.putText(
         legend_bar,
-        "Action-Slot Attention Overlay (Original Frame Background):",
+        legend_title,
         (12, 24),
         cv2.FONT_HERSHEY_SIMPLEX,
-        0.55,
+        0.52,
         (30, 30, 30),
         1,
         cv2.LINE_AA,
@@ -524,7 +544,9 @@ def run_inference(
     index: int = 0,
     show_bg_slot: bool = False,
     device_str: str = "cuda",
-) -> None:
+    sequence_len: Optional[int] = None,
+    all_frames: bool = False,
+) -> List[str]:
     device = torch.device(device_str if torch.cuda.is_available() and device_str == "cuda" else "cpu")
     print(f"Loading configuration from: {config_path}")
     cfg = Config.fromfile(config_path)
@@ -560,25 +582,40 @@ def run_inference(
         print("No checkpoint specified or found. Using model default/pretrained weights.")
 
     # Resolve target spatial/temporal dimensions from config
-    sequence_len = int(cfg.data["val"]["dataset"].get("sequence_len", 16))
+    if all_frames:
+        seq_len_to_use = None
+        print(f"Loading ALL available frames from: {input_dir}")
+    elif sequence_len is not None:
+        seq_len_to_use = int(sequence_len)
+        print(f"Sampling {seq_len_to_use} strided frames from: {input_dir}")
+    else:
+        seq_len_to_use = int(cfg.data["val"]["dataset"].get("sequence_len", 16))
+        print(f"Sampling {seq_len_to_use} strided frames from: {input_dir}")
+
     video_size = (256, 768)
     val_pipeline = cfg.data["val"]["dataset"].get("pipeline", [])
     if val_pipeline and isinstance(val_pipeline[0], dict) and "video_size" in val_pipeline[0]:
         video_size = tuple(val_pipeline[0]["video_size"])
     target_h, target_w = int(video_size[0]), int(video_size[1])
 
-    print(f"Sampling {sequence_len} strided frames from: {input_dir}")
     scenario_key: Optional[str] = None
     scenario_prefix: Optional[str] = None
     lmdb_dir: Optional[str] = None
     if _is_lmdb_town_dir(input_dir):
         lmdb_dir = input_dir
         frames_rgb, frame_tags, sampling_info, scenario_key, scenario_prefix = _load_lmdb_strided_frames(
-            lmdb_dir=input_dir, index=index, sequence_len=sequence_len, clip_idx=clip_idx
+            lmdb_dir=input_dir,
+            index=index,
+            sequence_len=seq_len_to_use or 16,
+            clip_idx=clip_idx,
+            all_frames=all_frames,
         )
     else:
         frames_rgb, frame_tags, sampling_info = load_strided_frames(
-            input_dir=input_dir, sequence_len=sequence_len, clip_idx=clip_idx
+            input_dir=input_dir,
+            sequence_len=seq_len_to_use or 16,
+            clip_idx=clip_idx,
+            all_frames=all_frames,
         )
         scenario_key = _infer_scenario_key_from_path(input_dir)
     gt_info = _lookup_ground_truth(scenario_key, lmdb_dir=lmdb_dir, scenario_prefix=scenario_prefix)
@@ -715,26 +752,62 @@ def run_inference(
         for t in range(len(resized_rgb))
     ]
 
-    grid_img = create_16_frame_grid_with_legend(
-        frames_overlaid=overlaid_frames,
-        frame_tags=frame_tags,
-        active_slot_indices=active_slot_indices,
-        slot_label_names=slot_label_names,
-        rows=4,
-        cols=4,
-        cell_size=(384, 128),
-    )
+    chunk_size = 16
+    total_frames = len(overlaid_frames)
+    saved_paths: List[str] = []
 
-    if not output_path:
-        output_path = os.path.join("work_dirs", "action_slot", "attn_inference_grid.png")
-    os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
-    cv2.imwrite(output_path, cv2.cvtColor(grid_img, cv2.COLOR_RGB2BGR))
+    base_out = output_path or os.path.join("work_dirs", "action_slot", "attn_inference_grid.png")
+    out_dir = os.path.dirname(os.path.abspath(base_out))
+    os.makedirs(out_dir, exist_ok=True)
+    stem, ext = os.path.splitext(os.path.basename(base_out))
+    if not ext:
+        ext = ".png"
+
+    if total_frames <= chunk_size:
+        grid_img = create_16_frame_grid_with_legend(
+            frames_overlaid=overlaid_frames,
+            frame_tags=frame_tags,
+            active_slot_indices=active_slot_indices,
+            slot_label_names=slot_label_names,
+            rows=4,
+            cols=4,
+            cell_size=(384, 128),
+            start_frame_idx=0,
+        )
+        cv2.imwrite(base_out, cv2.cvtColor(grid_img, cv2.COLOR_RGB2BGR))
+        saved_paths.append(base_out)
+        print(f"\n[ORIGINAL-BACKGROUND SLOT ATTENTION GRID SAVED]")
+        print(f"Output Image : {base_out}")
+        print(f"Resolution   : {grid_img.shape[1]}x{grid_img.shape[0]} (4x4 Grid + Slot Legend)")
+    else:
+        # seq_len > 16: split into multiple chunks like attn_inference_grid_0_16, attn_inference_grid_16_32, attn_inference_grid_32_44
+        print(f"\n[ORIGINAL-BACKGROUND SLOT ATTENTION GRID SAVED (SPLIT CHUNKS)]")
+        print(f"Total Frames : {total_frames} -> Splitting into 16-frame grid images...")
+        for start_idx in range(0, total_frames, chunk_size):
+            end_idx = min(start_idx + chunk_size, total_frames)
+            chunk_frames = overlaid_frames[start_idx:end_idx]
+            chunk_tags = frame_tags[start_idx:end_idx]
+
+            grid_chunk = create_16_frame_grid_with_legend(
+                frames_overlaid=chunk_frames,
+                frame_tags=chunk_tags,
+                active_slot_indices=active_slot_indices,
+                slot_label_names=slot_label_names,
+                cols=4,
+                cell_size=(384, 128),
+                start_frame_idx=start_idx,
+                title_suffix=f" [Frames {start_idx}..{end_idx}]",
+            )
+
+            chunk_filename = f"{stem}_{start_idx}_{end_idx}{ext}"
+            chunk_path = os.path.join(out_dir, chunk_filename)
+            cv2.imwrite(chunk_path, cv2.cvtColor(grid_chunk, cv2.COLOR_RGB2BGR))
+            saved_paths.append(chunk_path)
+            print(f"  -> Saved chunk {start_idx}_{end_idx:02d}: {chunk_path} ({grid_chunk.shape[1]}x{grid_chunk.shape[0]})")
 
     html_3d_saved = None
     if export_3d and export_3d_attention_html is not None and attn_tensor is not None:
         if output_3d_path is None:
-            out_dir = os.path.dirname(os.path.abspath(output_path))
-            stem = os.path.splitext(os.path.basename(output_path))[0]
             output_3d_path = os.path.join(out_dir, f"{stem}_3d.html")
         top_preds_list = [
             (
@@ -766,12 +839,10 @@ def run_inference(
             thumb_size=(192, 64),
         )
 
-    print(f"\n[ORIGINAL-BACKGROUND SLOT ATTENTION GRID SAVED]")
-    print(f"Output Image : {output_path}")
-    print(f"Resolution   : {grid_img.shape[1]}x{grid_img.shape[0]} (4x4 Grid + Slot Legend)")
     if html_3d_saved:
         print(f"Interactive 3D HTML : {html_3d_saved}")
     print("=" * 68)
+    return saved_paths
 
 
 def main():
@@ -846,6 +917,19 @@ def main():
         default="cuda",
         help="Device for inference ('cuda' or 'cpu')",
     )
+    parser.add_argument(
+        "--sequence-len",
+        "--seq-len",
+        type=int,
+        default=None,
+        help="Number of frames to sample (e.g. 16, 32, 44). If None, uses config sequence_len.",
+    )
+    parser.add_argument(
+        "--all-frames",
+        "--full-frames",
+        action="store_true",
+        help="Sample all available frames in the scenario/video without subsampling",
+    )
 
     args = parser.parse_args()
     run_inference(
@@ -861,6 +945,8 @@ def main():
         index=args.index,
         show_bg_slot=args.show_bg_slot,
         device_str=args.device,
+        sequence_len=args.sequence_len,
+        all_frames=args.all_frames,
     )
 
 

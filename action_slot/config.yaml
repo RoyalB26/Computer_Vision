@@ -20,7 +20,7 @@ model:
   num_ego_class: 4
   num_actor_class: 64
   num_slots: 3
-  mamba_layers: 4
+  mamba_layers: 2
   slot_dim: 256
   ego_c: 128
   bg_slot: true
@@ -34,7 +34,7 @@ model:
   ego_backbone_grad_scale: 0.05
   bce_pos_weight: 5.0
   use_class_pos_weight: true
-  resolution3d: [16, 8, 24]
+  resolution3d: [32, 8, 24]
   dropout: 0.5
   head_type: "dual_stream"
   head_dropout: 0.35
@@ -51,8 +51,9 @@ model:
   use_ego_comp: true
   use_ego_film: true
   tube_only_head: false
+  backbone_type: "mobilenetv3_nano"  # Tùy chọn backbone: "mobilenetv3_nano" (thuần Conv2d không cần neck, 288ch), "mobilenetv3_small", "movinet", "yolov11", "x3d"
   finetune_last_n_stages: 2  # Chỉ fine-tune 2 stage cuối của backbone (đặt unfreeze_all: true nếu muốn mở toàn bộ như v7)
-
+  fuse_neck: false
 # 2. Dataset Configuration
 # Hỗ trợ cấu hình nhiều data_root dưới dạng danh sách (list) hoặc đường dẫn đơn (str)
 data:
@@ -63,7 +64,7 @@ data:
         - "D:/apps/Datasets/TACO/data"
         - "D:/apps/Datasets/TACO/part2"
       split: "train"
-      sequence_len: 16
+      sequence_len: 32
       seed: 42
       pipeline:
         - type: "Action_Slot_Transform"
@@ -79,7 +80,7 @@ data:
         - "D:/apps/Datasets/TACO/data"
         - "D:/apps/Datasets/TACO/part2"
       split: "val"
-      sequence_len: 16
+      sequence_len: 32
       seed: 42
       pipeline:
         - type: "Action_Slot_Transform"

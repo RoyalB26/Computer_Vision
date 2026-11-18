@@ -33,6 +33,9 @@ def filter_road_color_difference(
     if videos.dim() != 5:
         raise ValueError(f"Expected 5D tensor (B, T, 3, H, W) for videos, got {videos.shape}")
 
+    if videos.shape[1] == 3 and videos.shape[2] != 3:
+        videos = videos.permute(0, 2, 1, 3, 4)
+
     B, T, C, H, W = videos.shape
     H_feat, W_feat = target_res
 
