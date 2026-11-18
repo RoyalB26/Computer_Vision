@@ -35,8 +35,6 @@ class ActionSlotLoss(nn.Module):
         feat_recon_weight: float = 0.15,
         action_attn_weight: float = 1.0,
         bg_attn_weight: float = 0.5,
-        road_attn_weight: float = 0.5,
-        road_slot: bool = True,
         ego_loss_weight: float = 0.2,
         dual_stream_aux_weight: float = 0.5,
         use_class_pos_weight: bool = True,
@@ -59,8 +57,6 @@ class ActionSlotLoss(nn.Module):
 
         self.bg_mask = True
         self.bg_slot = True
-        self.road_slot = bool(road_slot)
-        self.road_attn_weight = float(road_attn_weight)
         self.obj_mask = False
         self.action_attn_weight = float(action_attn_weight)
         self.bg_attn_weight = float(bg_attn_weight)
@@ -232,35 +228,7 @@ class ActionSlotLoss(nn.Module):
 
             action_attn = attn[:, :, :self.num_slots, :, :]
             step = max(1, l // max(1, bg_seg.shape[1]))
-
-            # Determine background and road slot locations:
-            # When road_slot=True, total slots = num_slots + 2
-            # slot -2: road slot (flat road background where relu == 0)
-            # slot -1: sky/building background slot (bg_seg == 1.0)
-            if self.road_slot and n >= self.num_slots + 2:
-                bg_slot_idx = -1
-                road_slot_idx = -2
-            else:
-                bg_slot_idx = -1
-                road_slot_idx = None
-
-            bg_attn = attn[:, ::step, bg_slot_idx, :, :][:, :bg_seg.shape[1], :, :].reshape(b, -1, h, w)
-
-            # Road slot supervision: force road_slot to focus on flat road (relu == 0)
-            road_attn_loss = None
-            if road_slot_idx is not None and self.road_attn_weight > 0 and 'road_mask' in label:
-                road_mask = label['road_mask']  # (B, L, H, W)
-                road_attn = attn[:, :, road_slot_idx, :, :]
-                if (h, w) != road_mask.shape[-2:]:
-                    road_mask_up = F.interpolate(
-                        road_mask.float(), size=(h, w), mode='nearest'
-                    )
-                else:
-                    road_mask_up = road_mask.float()
-                road_attn_loss = self.obj_bce(
-                    road_attn.clamp(1e-6, 1.0 - 1e-6),
-                    road_mask_up.clamp(0.0, 1.0),
-                )
+            bg_attn = attn[:, ::step, -1, :, :][:, :bg_seg.shape[1], :, :].reshape(b, -1, h, w)
 
             mask_64 = (label['actor'] == 0.0)  # shape: (B, 64), True where class is absent
             c1 = mask_64[:, 0:24].all(dim=1)   # Suppress Car slot only when ALL car classes are 0
@@ -301,8 +269,6 @@ class ActionSlotLoss(nn.Module):
             loss['loss_attn_suppress'] = attn_loss
         if bg_attn_loss is not None:
             loss['loss_bg_attn'] = self.bg_attn_weight * bg_attn_loss
-        if 'road_attn_loss' in locals() and road_attn_loss is not None:
-            loss['loss_road_attn'] = self.road_attn_weight * road_attn_loss
 
         if validate:
             loss['action_inter'] = None

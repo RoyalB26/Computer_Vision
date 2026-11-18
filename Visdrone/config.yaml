@@ -1,6 +1,6 @@
-# Configuration for VisDrone Object Counting using Attention Slot
+# Configuration for VisDrone Object Detection
 
-work_dir: "./work_dirs/visdrone_counting"
+work_dir: "./work_dirs/visdrone_detection"
 device: "cuda"  
 seed: 42
 tqdm: true
@@ -11,54 +11,49 @@ custom_imports:
   - "Visdrone.metrics"
   - "Visdrone.tracker"
 
-# 1. Model Configuration: Attention Slot Class Counter with Flat BG Filter Mask
+# 1. Model Configuration: Modular VisDrone Detector with FPN
 model:
   type: "VisDroneDetector"
   num_classes: 10
-  dim: 256
-  stride: 1
-  exp_factor: 5.0
-  count_loss_weight: 1.0
-  bg_attn_weight: 1.0
-  fg_attn_weight: 1.0
-  suppress_weight: 0.1
-
+  dim: 32
+  total_head: 4
+  images_size: 640
+  num_ref: 16
 # 2. Dataset Configuration
 data:
   train:
     dataset:
       type: "CustomLMDBDataset"
-      data_root: "D:/apps/Datasets/VisDrone/train_data.lmdb"
+      data_root:  "/content/visdron.lmdb"
       split: "train"
       split_ratio: 0.8
       seed: 42
       pipeline:
         - type: "Resize"
-          size: [960, 960]
+          size: [640, 640]
         - type: "ToTensor"
-    batch_size: 4
+    batch_size: 16
     shuffle: true
-    num_workers: 1
+    num_workers: 8
 
   val:
     dataset:
       type: "CustomLMDBDataset"
-      data_root: "D:/apps/Datasets/VisDrone/train_data.lmdb"
+      data_root:  "/content/visdron.lmdb"
       split: "val"
       split_ratio: 0.8
       seed: 42
       pipeline:
         - type: "Resize"
-          size: [960, 960]
+          size: [640, 640]
         - type: "ToTensor"
-    batch_size: 4
+    batch_size: 16
     shuffle: false
-    num_workers: 1
+    num_workers: 4
 
-# 3. Optimizer Configuration
 optimizer:
   type: "AdamW"
-  lr: 0.0005
+  lr: 0.001
   weight_decay: 0.0001
 
 # 4. LR Scheduler Configuration
@@ -67,48 +62,71 @@ lr_scheduler:
   T_max: 100
   eta_min: 0.00001
 
-# 5. Metrics Configuration: Class Counting Evaluation (MAE, RMSE, Acc)
+# 5. Metrics Configuration: mAP Evaluation (mAP_50, mAP_75, mAP_50:95)
 metrics:
-  counting:
-    type: "ClassCountingMetric"
+  mAP:
+    type: "MeanAveragePrecision"
     num_classes: 10
+    iou_thresholds: [0.5, 0.55, 0.6, 0.65, 0.7, 0.75, 0.8, 0.85, 0.9, 0.95]
 
-# 6. Tracking & Lifecycle Hooks
+# 6. Comprehensive Tracking & Lifecycle Hooks
 hooks:
+  # Excel Tracker: Ghi nhận toàn bộ thông số chi tiết qua 3 sheets:
+  # - 'Epoch_Overview': Train/Val Loss, sub-losses (cls, box, ortho, focal components), mAP_50, mAP_75, mAP_50_95, LR, thời gian
+  # - 'Gradients_Detail': Chuẩn Gradient Norm tổng và riêng biệt cho từng submodule kiến trúc
+  # - 'Detection': Phân phối phân loại (cls mean, max, min, prob), hình học box (cx, cy, w, h), độ trực giao slot & entropy attention
   - type: "ExcelTracker"
-    filename: "training_metrics.xlsx"
-    track_gradients: true
-    grad_interval: 50
-    track_detection: false
-    auto_save: true
-    resume: true
+    filename: "training_metrics.xlsx"       # Lưu trực tiếp vào thư mục work_dir
+    track_gradients: true                   # Bật tracking gradient chi tiết
+    grad_interval: 100                        # Chu kỳ lấy mẫu gradient (mỗi 1 batch)
+    track_detection: true                   # Bật tracking tab Detection phân tích động lực học mô hình
+    detection_interval: 50                   # Chu kỳ lấy mẫu phân tích detection (mỗi 5 batch)
+    auto_save: true                         # Tự động ghi ra file Excel sau mỗi epoch
+    resume: true                            # Tự động tiếp tục ghi tiếp vào sheet nếu file đã tồn tại
     submodules:
-      - "backbone"
-      - "proj_p3"
-      - "proj_p4"
-      - "proj_p5"
-      - "slot_attention"
-      - "slot_attention.to_q"
-      - "slot_attention.to_k"
-      - "slot_attention.to_v"
-      - "slot_attention.FC1"
-      - "slot_attention.FC2"
-      - "slot_attention.fc1"
-      - "slot_attention.fc2"
-      - "fc_actor"
+      # --- Nhóm 1: Trích xuất đặc trưng (Backbone & FPN) ---
+      - "backbone"                          # MobileNetV3-small multi-stage extractor
+      - "fpn"                               # Toàn bộ Feature Pyramid Network
+      - "fpn.lat_c12"                       # FPN Lateral 1x1 Conv từ C12 (576 -> 16)
+      - "fpn.smooth_p5"                     # FPN Smooth Conv 3x3 cho P5 (10x10)
+      - "fpn.smooth_p2"                     # FPN Smooth Conv 3x3 cho Map Pred (80x80)
+      - "fpn.smooth_p1"                     # FPN Smooth Conv 3x3 cho Feat Deform (160x160)
 
+      # --- Nhóm 2: Cơ chế Slot Attention & Projections ---
+      - "to_q"                              # Slot Query Linear Projection
+      - "to_k"                              # Key Linear Projection
+      - "to_v"                              # Value Linear Projection
+      - "fc1"                               # Slot MLP First Layer
+      - "fc2"                               # Slot MLP Second Layer
+      - "FC1"                               # Spatial Feature Transformation First Layer
+      - "FC2"                               # Spatial Feature Transformation Second Layer
+      - "LN"                                # Spatial Feature LayerNorm
+      - "norm_out"                          # Slot Attention Output LayerNorm
+
+      # --- Nhóm 3: Deformable Slot Detection Head ---
+      - "head"                              # Toàn bộ Deformable Head
+      - "head.pred_proj"                    # Projection Conv cho Map Pred (80x80)
+      - "head.slot_embed"                   # Class Slot Identity Embeddings
+      - "head.slot_modulator"               # Slot Modulation MLP (gamma & beta)
+      - "head.value_proj"                   # Feat Deform Value Projection
+      - "head.sampling_offsets"             # Deformable Sampling Offsets Linear
+      - "head.attention_weights"            # Deformable Attention Weights Linear
+      - "head.output_proj"                  # Deformable Multi-head Output Projection
+      - "head.fc_box_slots"                 # 10 decoupled MLP Box Prediction Heads
+      - "head.fc_obj_slots"                 # 10 decoupled MLP Objectness / Class Heads
+
+  # Checkpoint Hook: Tự động lưu checkpoint định kỳ và lưu best.pth theo mAP_50 cao nhất
   - type: "CheckpointHook"
-    interval: 1
-    save_best: "val_mae"
-    mode: "min"
-    max_keep_ckpts: 5
+    interval: 10                             # Lưu checkpoint mỗi 1 epoch
+    save_best: "mAP_50"                     # Theo dõi và lưu best model theo mAP_50
+    mode: "max"                             # mAP càng cao càng tốt
+    max_keep_ckpts: 5                       # Giữ tối đa 5 checkpoint gần nhất để tiết kiệm dung lượng
     filename_tmpl: "epoch_{}.pth"
 
 # 7. Training Engine Configuration
 train_cfg:
   max_epochs: 100
-  val_interval: 5
-  log_interval: 20000
-  grad_clip: 5.0
-  use_amp: false
-  accumulate : 8
+  val_interval: 10                           # Đánh giá validation và tính mAP ở MỌI epoch để tracking liên tục
+  log_interval: 2500                          # In log tiến trình 6 lần mỗi epoch (150 batches / 25)
+  grad_clip: 1.0                            # Gradient clipping chuẩn 1.0 chống gradient explosion
+  use_amp: false                            # Chạy FP32 chính xác cao

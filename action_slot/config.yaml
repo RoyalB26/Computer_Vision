@@ -20,7 +20,7 @@ model:
   num_ego_class: 4
   num_actor_class: 64
   num_slots: 3
-  mamba_layers: 2
+  mamba_layers: 4
   slot_dim: 256
   ego_c: 128
   bg_slot: true
@@ -34,7 +34,7 @@ model:
   ego_backbone_grad_scale: 0.05
   bce_pos_weight: 5.0
   use_class_pos_weight: true
-  resolution3d: [32, 8, 24]
+  resolution3d: [16, 8, 24]
   dropout: 0.5
   head_type: "dual_stream"
   head_dropout: 0.35
@@ -42,12 +42,6 @@ model:
   dual_stream_aux_weight: 0.2
   use_slot_trajectory: true
   use_motion_weighted_traj: true
-  traj_dropout: 0.25                # Dropout chống overfit trong các tầng chiếu MLP quỹ đạo
-  traj_mask_tail_prob: 0.30         # Kỹ thuật MAE/Anticipation: xác suất che 1-5 frame cuối để ép đoán hành động sớm
-  traj_mask_head_prob: 0.20         # Kỹ thuật Inpainting: xác suất che 1-5 frame đầu để ép suy luận từ quá khứ bị mất
-  traj_max_mask_ratio: 0.35         # Tỷ lệ frame tối đa bị che (35% số frame)
-  traj_coord_jitter: 0.015          # Nhiễu Gauss nhẹ vào tâm và độ sâu khi train để tránh học thuộc tọa độ
-  traj_branch_drop: 0.10            # Stochastic drop nhánh quỹ đạo khi train để cân bằng appearance và motion
   use_mamba: true
   use_attn_tube: true
   use_tube_vis: true
@@ -57,9 +51,8 @@ model:
   use_ego_comp: true
   use_ego_film: true
   tube_only_head: false
-  backbone_type: "movinet"  # Tùy chọn backbone: "mobilenetv3_nano" (thuần Conv2d không cần neck, 288ch), "mobilenetv3_small", "movinet", "yolov11", "x3d"
   finetune_last_n_stages: 2  # Chỉ fine-tune 2 stage cuối của backbone (đặt unfreeze_all: true nếu muốn mở toàn bộ như v7)
-  fuse_neck: false
+
 # 2. Dataset Configuration
 # Hỗ trợ cấu hình nhiều data_root dưới dạng danh sách (list) hoặc đường dẫn đơn (str)
 data:
@@ -70,7 +63,7 @@ data:
         - "D:/apps/Datasets/TACO/data"
         - "D:/apps/Datasets/TACO/part2"
       split: "train"
-      sequence_len: 32
+      sequence_len: 16
       seed: 42
       pipeline:
         - type: "Action_Slot_Transform"
@@ -86,7 +79,7 @@ data:
         - "D:/apps/Datasets/TACO/data"
         - "D:/apps/Datasets/TACO/part2"
       split: "val"
-      sequence_len: 32
+      sequence_len: 16
       seed: 42
       pipeline:
         - type: "Action_Slot_Transform"

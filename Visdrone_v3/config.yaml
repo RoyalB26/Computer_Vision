@@ -1,0 +1,97 @@
+# Configuration for VisDrone Object Detection WITHOUT Slot Attention
+work_dir: "./work_dirs/visdrone_v3"
+device: "cuda"  
+seed: 42
+tqdm: true
+accumulate: 1
+
+custom_imports:
+  - "Visdrone_v3.model"
+  - "Visdrone_v3.dataset"
+  - "Visdrone_v3.metrics"
+
+# 1. Model Configuration: Standard MobileNetV3 FPN Detector (No Slot)
+model:
+  type: "VisDroneDetectorV3"
+  num_classes: 10
+  dim: 64
+  images_size: 640
+
+# 2. Dataset Configuration
+data:
+  train:
+    dataset:
+      type: "VisDroneV3Dataset"
+      data_root: "D:/apps/Datasets/VisDrone/VisDrone_data.lmdb"
+      split: "train"
+      split_ratio: 0.8
+      seed: 42
+      pipeline:
+        - type: "Resize"
+          size: [640, 640]
+        - type: "ToTensor"
+    batch_size: 1
+    shuffle: true
+    num_workers: 6
+
+  val:
+    dataset:
+      type: "VisDroneV3Dataset"
+      data_root: "D:/apps/Datasets/VisDrone/VisDrone_data.lmdb"
+      split: "val"
+      split_ratio: 0.8
+      seed: 42
+      pipeline:
+        - type: "Resize"
+          size: [640, 640]
+        - type: "ToTensor"
+    batch_size: 16
+    shuffle: false
+    num_workers: 2
+
+# 3. Optimizer Configuration
+optimizer:
+  type: "AdamW"
+  lr: 0.0005
+  weight_decay: 0.0001
+
+# 4. LR Scheduler Configuration
+lr_scheduler:
+  type: "CosineAnnealingLR"
+  T_max: 100
+  eta_min: 0.00001
+
+metrics:
+  mAP:
+    type: "VisDroneMAP"
+    num_classes: 10
+    box_format: "cxcywh"
+
+hooks:
+  - type: "ExcelTracker"
+    filename: "training_metrics.xlsx"
+    track_gradients: true
+    grad_interval: 1
+    submodules:       
+      # --- Các khối cấp 1 ---
+      - "backbone"
+      - "downsample"
+      - "up_sample_cls"
+      - "head"
+      # --- Chi tiết các nhánh trong Head ---
+      - "head.cls_head"     # Nhánh phân loại
+      - "head.box_head"     # Nhánh dự đoán bbox (offset + size)
+      - "head.obj_conv"     # Nhánh đặc trưng objectness
+      - "head.obj_out"      # Lớp output objectness
+      # --- Chi tiết các tầng Cross-Attention ---
+      - "up_sample_cls.attn1"      # Cross-Attention tầng 40x40
+      - "up_sample_cls.attn2"      # Cross-Attention tầng 80x80
+      - "up_sample_cls.attn_last"   # Cross-Attention tầng 160x160
+
+# 5. Training Engine Configuration
+train_cfg:
+  max_epochs: 100
+  val_interval: 5
+  log_interval: 200
+  grad_clip: 1.0
+  use_amp: true
