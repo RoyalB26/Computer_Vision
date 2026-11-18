@@ -912,7 +912,7 @@ class ActionSlotModel(BaseModel):
         )
 
         # 4. Slot Attention
-        actual_slots = self.num_slots + 1 if bg_slot else self.num_slots
+        actual_slots = self.num_slots + 2 if bg_slot else self.num_slots
         self.slot_attention = SlotAttention(
             num_slots=actual_slots,
             dim=self.slot_dim,

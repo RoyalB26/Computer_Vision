@@ -272,3 +272,91 @@ class VisDroneMAP(BaseMetric):
             results[f"AP50_{clean_name}"] = per_class_ap50.get(c, 0.0)
 
         return results
+
+
+@METRICS.register_module(name="ClassCountingMetric", force=True)
+@METRICS.register_module(name="CountingMetric", force=True)
+class ClassCountingMetric(BaseMetric):
+    """Metric đánh giá bài toán đếm số lượng 10 class VisDrone.
+    
+    Tính toán:
+      - val_mae: Mean Absolute Error trung bình trên tất cả class và mẫu
+      - val_rmse: Root Mean Squared Error
+      - val_acc: Tỷ lệ làm tròn dự đoán trùng khớp tuyệt đối với nhãn thực tế
+      - mae_<class_name>: MAE riêng biệt cho từng class
+    """
+
+    def __init__(
+        self,
+        num_classes: int = 10,
+        class_names: Optional[List[str]] = None,
+        **kwargs,
+    ):
+        self.num_classes = num_classes
+        self.class_names = class_names or [
+            "pedestrian",
+            "people",
+            "bicycle",
+            "car",
+            "van",
+            "truck",
+            "tricycle",
+            "awning-tricycle",
+            "bus",
+            "motorcycle",
+        ]
+        self.reset()
+
+    def reset(self) -> None:
+        self.all_preds = []
+        self.all_targets = []
+
+    def update(self, preds: Any, targets: Any) -> None:
+        if isinstance(preds, torch.Tensor):
+            p = preds.detach().cpu().float().numpy()
+        else:
+            p = np.asarray(preds, dtype=np.float32)
+
+        if isinstance(targets, torch.Tensor):
+            t = targets.detach().cpu().float().numpy()
+        else:
+            t = np.asarray(targets, dtype=np.float32)
+
+        if p.ndim == 1:
+            p = p[None, :]
+        if t.ndim == 1:
+            t = t[None, :]
+
+        self.all_preds.append(p)
+        self.all_targets.append(t)
+
+    def compute(self) -> Dict[str, float]:
+        if not self.all_preds:
+            return {"val_mae": 0.0, "val_rmse": 0.0, "val_acc": 0.0}
+
+        preds = np.concatenate(self.all_preds, axis=0)      # (N, num_classes)
+        targets = np.concatenate(self.all_targets, axis=0)  # (N, num_classes)
+
+        abs_diff = np.abs(preds - targets)
+        mae = float(np.mean(abs_diff))
+        rmse = float(np.sqrt(np.mean((preds - targets) ** 2)))
+
+        # Accuracy dựa trên việc làm tròn tới số nguyên gần nhất
+        preds_rounded = np.round(np.clip(preds, 0, None))
+        acc = float(np.mean(preds_rounded == targets))
+
+        results = {
+            "val_mae": round(mae, 4),
+            "val_rmse": round(rmse, 4),
+            "val_acc": round(acc, 4),
+        }
+
+        # Per-class MAE
+        class_mae = np.mean(abs_diff, axis=0)
+        for c in range(self.num_classes):
+            c_name = self.class_names[c] if c < len(self.class_names) else f"class_{c}"
+            clean_name = c_name.replace(" ", "_")
+            results[f"mae_{clean_name}"] = round(float(class_mae[c]), 4)
+
+        return results
+

@@ -29,10 +29,10 @@ model:
   action_attn_weight: 1.0
   bg_attn_weight: 0.5
   mamba_grad_scale: 1.0
-  backbone_grad_scale: 0.1
+  backbone_grad_scale: 1.0
   ego_loss_weight: 0.2
   ego_backbone_grad_scale: 0.05
-  bce_pos_weight: 5.0
+  bce_pos_weight: 3.0
   use_class_pos_weight: true
   resolution3d: [16, 8, 24]
   dropout: 0.5
@@ -40,9 +40,9 @@ model:
   head_dropout: 0.35
   slot_head_dropout: 0.2
   dual_stream_aux_weight: 0.2
-  use_slot_trajectory: true
+  use_slot_trajectory: false
   use_motion_weighted_traj: true
-  use_mamba: true
+  use_mamba: false
   use_attn_tube: true
   use_tube_vis: true
   tube_vis_dim: 32
@@ -50,9 +50,8 @@ model:
   use_tube_depth: true
   use_ego_comp: true
   use_ego_film: true
-  tube_only_head: false
-  finetune_last_n_stages: 2  # Chỉ fine-tune 2 stage cuối của backbone (đặt unfreeze_all: true nếu muốn mở toàn bộ như v7)
-
+  tube_only_head: true
+  unfreeze_all: true
 # 2. Dataset Configuration
 # Hỗ trợ cấu hình nhiều data_root dưới dạng danh sách (list) hoặc đường dẫn đơn (str)
 data:
