@@ -20,7 +20,7 @@ model:
   num_ego_class: 4
   num_actor_class: 64
   num_slots: 3
-  mamba_layers: 4
+  mamba_layers: 2
   slot_dim: 256
   ego_c: 128
   bg_slot: true
@@ -35,14 +35,20 @@ model:
   bce_pos_weight: 3.0
   use_class_pos_weight: true
   resolution3d: [16, 8, 24]
+  traj_dropout: 0.25                # Dropout chống overfit trong các tầng chiếu MLP quỹ đạo
+  traj_mask_tail_prob: 0.30         # Kỹ thuật MAE/Anticipation: xác suất che 1-5 frame cuối để ép đoán hành động sớm
+  traj_mask_head_prob: 0.20         # Kỹ thuật Inpainting: xác suất che 1-5 frame đầu để ép suy luận từ quá khứ bị mất
+  traj_max_mask_ratio: 0.35         # Tỷ lệ frame tối đa bị che (35% số frame)
+  traj_coord_jitter: 0.015          # Nhiễu Gauss nhẹ vào tâm và độ sâu khi train để tránh học thuộc tọa độ
+  traj_branch_drop: 0.10            # Stochastic drop nhánh quỹ đạo khi train để cân bằng appearance và motion
   dropout: 0.5
   head_type: "dual_stream"
   head_dropout: 0.35
   slot_head_dropout: 0.2
   dual_stream_aux_weight: 0.2
-  use_slot_trajectory: false
+  use_slot_trajectory: true
   use_motion_weighted_traj: true
-  use_mamba: false
+  use_mamba: true
   use_attn_tube: true
   use_tube_vis: true
   tube_vis_dim: 32
@@ -50,8 +56,9 @@ model:
   use_tube_depth: true
   use_ego_comp: true
   use_ego_film: true
-  tube_only_head: true
+  tube_only_head: false
   unfreeze_all: true
+  backbone_type: "x3d"
 # 2. Dataset Configuration
 # Hỗ trợ cấu hình nhiều data_root dưới dạng danh sách (list) hoặc đường dẫn đơn (str)
 data:
@@ -59,7 +66,7 @@ data:
     dataset:
       type: "ACTION_SLOT_LMDBDataset"
       data_root:
-        - "/content/data"
+        - "C:/ws/content/data"
       split: "train"
       sequence_len: 16
       seed: 42
@@ -75,7 +82,7 @@ data:
     dataset:
       type: "ACTION_SLOT_LMDBDataset"
       data_root:
-        - "/content/data"
+        - "C:/ws/content/data"
       split: "val"
       sequence_len: 16
       seed: 42
@@ -86,7 +93,7 @@ data:
     num_workers: 8
     persistent_worker: true
 
-# 3. Optimizer Configuration (đồng bộ với D:\v7\Action-slot: lr=5e-4, wd=0.07)
+# 3. Optimizer Configuration (đồng bộ với D:/v7/Action-slot: lr=5e-4, wd=0.07)
 optimizer:
   type: "AdamW"
   lr: 0.0005

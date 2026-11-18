@@ -42,6 +42,12 @@ model:
   dual_stream_aux_weight: 0.2
   use_slot_trajectory: true
   use_motion_weighted_traj: true
+  traj_dropout: 0.25                # Dropout chống overfit trong các tầng chiếu MLP quỹ đạo
+  traj_mask_tail_prob: 0.30         # Kỹ thuật MAE/Anticipation: xác suất che 1-5 frame cuối để ép đoán hành động sớm
+  traj_mask_head_prob: 0.20         # Kỹ thuật Inpainting: xác suất che 1-5 frame đầu để ép suy luận từ quá khứ bị mất
+  traj_max_mask_ratio: 0.35         # Tỷ lệ frame tối đa bị che (35% số frame)
+  traj_coord_jitter: 0.015          # Nhiễu Gauss nhẹ vào tâm và độ sâu khi train để tránh học thuộc tọa độ
+  traj_branch_drop: 0.10            # Stochastic drop nhánh quỹ đạo khi train để cân bằng appearance và motion
   use_mamba: true
   use_attn_tube: true
   use_tube_vis: true
@@ -51,7 +57,7 @@ model:
   use_ego_comp: true
   use_ego_film: true
   tube_only_head: false
-  backbone_type: "mobilenetv3_nano"  # Tùy chọn backbone: "mobilenetv3_nano" (thuần Conv2d không cần neck, 288ch), "mobilenetv3_small", "movinet", "yolov11", "x3d"
+  backbone_type: "movinet"  # Tùy chọn backbone: "mobilenetv3_nano" (thuần Conv2d không cần neck, 288ch), "mobilenetv3_small", "movinet", "yolov11", "x3d"
   finetune_last_n_stages: 2  # Chỉ fine-tune 2 stage cuối của backbone (đặt unfreeze_all: true nếu muốn mở toàn bộ như v7)
   fuse_neck: false
 # 2. Dataset Configuration

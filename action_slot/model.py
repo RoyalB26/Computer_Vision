@@ -1,6 +1,7 @@
 """COCO / Hand Digit Object Detection Model predicting bounding boxes and class labels with FPN."""
 from typing import Any, Dict, List, Optional, Tuple
 import math
+import random
 import numpy as np
 import torch
 import torch.nn as nn
@@ -294,6 +295,11 @@ class SlotTrajectoryEncoder(nn.Module):
     Uses local temporal feature-difference energy from `vis_feats_5d` to downweight
     stationary background/parked vehicles before computing slot centroids, spreads,
     and depth, preventing parked objects in shared TACO slots from anchoring moving ones.
+
+    Includes Masked Trajectory Modeling (Temporal Boundary Masking on Head & Tail)
+    to prevent sequence overfitting:
+      - Tail Masking (Early Anticipation): hides the last K frames to force predicting actions early.
+      - Head Masking (Past Infilling): hides the initial K frames to force reasoning from late observations.
     """
 
     FRAME_FEAT_DIM = 21
@@ -307,10 +313,20 @@ class SlotTrajectoryEncoder(nn.Module):
         offset_vis_dim: int = 32,
         depth_offset_scale: float = 1.0,
         use_motion_weighting: bool = True,
+        dropout: float = 0.25,
+        mask_tail_prob: float = 0.30,
+        mask_head_prob: float = 0.20,
+        max_mask_ratio: float = 0.35,
+        coord_jitter: float = 0.015,
     ):
         super().__init__()
         self.depth_offset_scale = float(depth_offset_scale)
         self.use_motion_weighting = bool(use_motion_weighting)
+        self.dropout_p = float(dropout)
+        self.mask_tail_prob = float(mask_tail_prob)
+        self.mask_head_prob = float(mask_head_prob)
+        self.max_mask_ratio = float(max_mask_ratio)
+        self.coord_jitter = float(coord_jitter)
 
         # Learnable soft motion gate (floor ~0.25 at init so static scenes never collapse)
         self.motion_floor_logit = nn.Parameter(torch.tensor(-1.1))
@@ -325,6 +341,7 @@ class SlotTrajectoryEncoder(nn.Module):
             nn.LayerNorm(offset_in_dim),
             nn.Linear(offset_in_dim, 64),
             nn.GELU(),
+            nn.Dropout(self.dropout_p) if self.dropout_p > 0 else nn.Identity(),
             nn.Linear(64, 1),
         )
         # Zero-init final offset layer so training starts from clean -log(scale) physics prior
@@ -335,12 +352,14 @@ class SlotTrajectoryEncoder(nn.Module):
             nn.LayerNorm(self.FRAME_FEAT_DIM),
             nn.Linear(self.FRAME_FEAT_DIM, hidden_dim),
             nn.GELU(),
+            nn.Dropout(self.dropout_p) if self.dropout_p > 0 else nn.Identity(),
             nn.Linear(hidden_dim, slot_dim),
         )
         self.video_proj = nn.Sequential(
             nn.LayerNorm(self.VIDEO_FEAT_DIM),
             nn.Linear(self.VIDEO_FEAT_DIM, hidden_dim),
             nn.GELU(),
+            nn.Dropout(self.dropout_p) if self.dropout_p > 0 else nn.Identity(),
             nn.Linear(hidden_dim, slot_dim),
         )
 
@@ -417,6 +436,32 @@ class SlotTrajectoryEncoder(nn.Module):
         cx, cy, std_x, std_y, scale, depth_base, peak, mass, dyn_ratio = self._compute_base_geometry(
             obj_attn, motion_weight=motion_weight, motion_score=motion_score
         )
+
+        # Temporal Boundary Masking (Masked Trajectory Modeling on Head & Tail)
+        valid_time_mask = torch.ones((b, t, 1), device=device, dtype=torch.float32)
+        if self.training and t > 4 and (self.mask_tail_prob > 0 or self.mask_head_prob > 0):
+            max_mask_k = max(1, int(round(t * self.max_mask_ratio)))
+            for bi in range(b):
+                rnd = random.random()
+                if rnd < self.mask_tail_prob:
+                    # Tail Masking: Giấu k frame cuối (Mô phỏng Early Action Anticipation)
+                    k = random.randint(1, max_mask_k)
+                    valid_time_mask[bi, t - k :, 0] = 0.0
+                elif rnd < (self.mask_tail_prob + self.mask_head_prob):
+                    # Head Masking: Giấu k frame đầu (Mô phỏng Past Infilling / Late Arrival)
+                    k = random.randint(1, max_mask_k)
+                    valid_time_mask[bi, :k, 0] = 0.0
+
+        # Áp dụng valid_time_mask vào peak, mass, dyn_ratio để triệt tiêu frame bị che
+        peak = peak * valid_time_mask
+        mass = mass * valid_time_mask
+        dyn_ratio = dyn_ratio * valid_time_mask
+
+        # Coordinate Gaussian Jittering khi training để tránh overfit tọa độ tuyệt đối
+        if self.training and self.coord_jitter > 0:
+            cx = cx + torch.randn_like(cx) * self.coord_jitter
+            cy = cy + torch.randn_like(cy) * self.coord_jitter
+            depth_base = depth_base + torch.randn_like(depth_base) * self.coord_jitter
 
         geom_ctx = torch.stack(
             [
@@ -508,12 +553,13 @@ class SlotTrajectoryEncoder(nn.Module):
 
         # Video-level 3D trajectory summary
         max_peak = peak.amax(dim=1)
-        mean_peak = peak.mean(dim=1)
+        valid_count = valid_time_mask.sum(dim=1).clamp(min=1.0)
+        mean_peak = peak.sum(dim=1) / valid_count
         max_mass = mass.amax(dim=1)
-        mean_mass = mass.mean(dim=1)
+        mean_mass = mass.sum(dim=1) / valid_count
 
-        w_t = peak.pow(2) + 1e-4
-        w_norm = w_t / w_t.sum(dim=1, keepdim=True)
+        w_t = (peak.pow(2) * valid_time_mask) + 1e-6
+        w_norm = w_t / w_t.sum(dim=1, keepdim=True).clamp(min=1e-6)
         mean_depth = (w_norm * depth).sum(dim=1) * max_peak
         mean_std_x = (w_norm * std_x).sum(dim=1) * max_peak
         mean_std_y = (w_norm * std_y).sum(dim=1) * max_peak
@@ -1078,6 +1124,7 @@ class ActionSlotModel(BaseModel):
             self.mamba = None
 
         self.use_slot_trajectory = bool(kwargs.get("use_slot_trajectory", True))
+        self.traj_branch_drop = float(kwargs.get("traj_branch_drop", 0.10))
         if self.use_slot_trajectory:
             self.traj_encoder = SlotTrajectoryEncoder(
                 slot_dim=self.slot_dim,
@@ -1085,6 +1132,11 @@ class ActionSlotModel(BaseModel):
                 offset_vis_dim=int(kwargs.get("depth_offset_vis_dim", 32)),
                 depth_offset_scale=float(kwargs.get("depth_offset_scale", 1.0)),
                 use_motion_weighting=bool(kwargs.get("use_motion_weighted_traj", True)),
+                dropout=float(kwargs.get("traj_dropout", 0.25)),
+                mask_tail_prob=float(kwargs.get("traj_mask_tail_prob", 0.30)),
+                mask_head_prob=float(kwargs.get("traj_mask_head_prob", 0.20)),
+                max_mask_ratio=float(kwargs.get("traj_max_mask_ratio", 0.35)),
+                coord_jitter=float(kwargs.get("traj_coord_jitter", 0.015)),
             )
         else:
             self.traj_encoder = None
@@ -1343,6 +1395,9 @@ class ActionSlotModel(BaseModel):
                     motion_slots = 0.5 * (mamba_out[:, -1, :, :] + mamba_out.mean(dim=1))
 
             if video_motion_emb is not None:
+                if self.training and self.traj_branch_drop > 0:
+                    keep_mask = (torch.rand((b, 1, 1), device=video_motion_emb.device) >= self.traj_branch_drop).to(dtype=video_motion_emb.dtype)
+                    video_motion_emb = video_motion_emb * keep_mask
                 motion_slots = video_motion_emb if motion_slots is None else (motion_slots + video_motion_emb)
             if tube_motion_emb is not None:
                 motion_slots = tube_motion_emb if motion_slots is None else (motion_slots + tube_motion_emb)
