@@ -3,6 +3,8 @@ import os
 import pickle
 import random
 from typing import Any, Dict, List, Optional
+
+import numpy as np
 import torch
 from PIL import Image
 from BaseModel.core import DATASETS
@@ -27,19 +29,22 @@ VISDRONE_CLASSES = [
 class CustomLMDBDataset(BaseDataset):
     """Dataset LMDB cho VisDrone chuẩn hóa nhãn về đếm số lượng 10 class: shape (10,).
 
-    Khi gom batch qua SmartCollate, label sẽ có shape (B, 10).
+    Hỗ trợ nạp trực tiếp ground-truth multi-scale background mask từ Sidecar LMDB (`bg_lmdb_path`)
+    để loại bỏ hoàn toàn chi phí tính toán rasterize bounding box trên CPU trong lúc train.
     """
 
     def __init__(
         self,
         data_root: str,
         pipeline=None,
-        split: str = "train",        # 'train' hoặc 'val'
-        split_ratio: float = 0.8,      # 80% train, 20% val
-        seed: int = 42,              # Seed đảm bảo train và val không bị lẫn
+        split: str = "train",            # 'train' hoặc 'val'
+        split_ratio: float = 0.8,        # 80% train, 20% val
+        seed: int = 42,                  # Seed đảm bảo train và val không bị lẫn
         test_mode: bool = False,
         num_classes: int = 10,
-        return_dict: bool = False,   # Nếu True thì trả về dict {'counts', 'boxes', 'labels'}
+        return_dict: bool = True,        # Mặc định True để trả về dict {'counts', 'bg_mask', ...}
+        bg_lmdb_path: Optional[str] = None,  # Đường dẫn Sidecar LMDB (bg_seg.lmdb)
+        include_boxes: bool = False,     # Luôn kèm boxes/labels kể cả khi đã có bg_mask
         **kwargs,
     ):
         self.split = split.lower()
@@ -47,8 +52,14 @@ class CustomLMDBDataset(BaseDataset):
         self.seed = seed
         self.num_classes = num_classes
         self.return_dict = return_dict
+        self.bg_lmdb_path = bg_lmdb_path
+        self.include_boxes = include_boxes
         self.env = None
         self.txn = None
+        self.bg_env = None
+        self.bg_txn = None
+        self._bg_num_tokens = 18900
+        self._bg_format = "packbits_uint8"
         super().__init__(data_root=data_root, pipeline=pipeline, test_mode=test_mode)
 
     def load_annotations(self) -> List[Dict[str, Any]]:
@@ -81,12 +92,21 @@ class CustomLMDBDataset(BaseDataset):
     def _init_db(self):
         if self.env is None:
             self.env, self.txn = open_lmdb(self.data_root, readonly=True)
+        if self.bg_lmdb_path and os.path.exists(self.bg_lmdb_path) and self.bg_env is None:
+            self.bg_env, self.bg_txn = open_lmdb(self.bg_lmdb_path, readonly=True)
+            num_tok_bytes = self.bg_txn.get(b"__num_tokens__")
+            if num_tok_bytes is not None:
+                self._bg_num_tokens = int(num_tok_bytes.decode("ascii"))
+            fmt_bytes = self.bg_txn.get(b"__format__")
+            if fmt_bytes is not None:
+                self._bg_format = fmt_bytes.decode("ascii")
 
     def get_data_info(self, idx: int) -> Dict[str, Any]:
         self._init_db()
         real_idx = self.data_infos[idx]["lmdb_idx"]
+        key = f"{real_idx:08d}".encode("ascii")
 
-        byteflow = self.txn.get(f"{real_idx:08d}".encode("ascii"))
+        byteflow = self.txn.get(key)
         data = pickle.loads(byteflow)
         buffer = io.BytesIO(data["image"])
         image = Image.open(buffer).convert("RGB")
@@ -102,19 +122,36 @@ class CustomLMDBDataset(BaseDataset):
                 counts[c] = (lbl_tensor == c).sum().float()
 
         if self.return_dict:
-            target = {
-                "counts": counts,
-                "boxes": (
+            target: Dict[str, Any] = {"counts": counts}
+
+            # Đọc nhanh pre-generated bg_mask từ sidecar LMDB nếu có
+            bg_mask: Optional[torch.Tensor] = None
+            if self.bg_txn is not None:
+                bg_bytes = self.bg_txn.get(key)
+                if bg_bytes is not None:
+                    if self._bg_format == "packbits_uint8":
+                        unpacked = np.unpackbits(
+                            np.frombuffer(bg_bytes, dtype=np.uint8)
+                        )[: self._bg_num_tokens]
+                        bg_mask = torch.from_numpy(unpacked.copy())  # uint8 (18900,)
+                    else:
+                        bg_mask = torch.from_numpy(
+                            np.frombuffer(bg_bytes, dtype=np.uint8).copy()
+                        )
+                    target["bg_mask"] = bg_mask
+
+            # Chỉ tạo và truyền boxes/labels khi chưa có bg_mask hoặc được yêu cầu tường minh
+            if bg_mask is None or self.include_boxes:
+                target["boxes"] = (
                     torch.tensor(raw_boxes, dtype=torch.float32)
                     if len(raw_boxes) > 0
                     else torch.empty((0, 4), dtype=torch.float32)
-                ),
-                "labels": (
+                )
+                target["labels"] = (
                     torch.tensor(raw_labels, dtype=torch.int64)
                     if len(raw_labels) > 0
                     else torch.empty((0,), dtype=torch.int64)
-                ),
-            }
+                )
         else:
             target = counts
 
@@ -123,4 +160,5 @@ class CustomLMDBDataset(BaseDataset):
     def __getstate__(self):
         state = self.__dict__.copy()
         state["env"], state["txn"] = None, None
+        state["bg_env"], state["bg_txn"] = None, None
         return state

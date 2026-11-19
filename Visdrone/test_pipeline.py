@@ -73,20 +73,28 @@ def test_visdrone_detector():
         suppress_weight=0.05,
     ).to(device)
 
-    # 4.1 Forward Train with Loss
+    # 4.1 Forward Train with Loss (Kiểm tra cả 2 dạng: Tensor counts thuần và Dict chứa Bounding Boxes)
     dummy_x = torch.rand((2, 3, 960, 960), device=device)
-    dummy_targets = torch.tensor([
-        [2.0, 1.0, 0.0, 5.0, 0.0, 1.0, 0.0, 0.0, 0.0, 3.0],
-        [0.0, 0.0, 1.0, 2.0, 1.0, 0.0, 0.0, 1.0, 0.0, 0.0],
-    ], device=device)
+    dummy_targets_dict = [
+        {
+            "counts": torch.tensor([2.0, 1.0, 0.0, 5.0, 0.0, 1.0, 0.0, 0.0, 0.0, 3.0], device=device),
+            "boxes": torch.tensor([[0.5, 0.5, 0.1, 0.2], [0.2, 0.3, 0.05, 0.08]], device=device),
+            "labels": torch.tensor([0, 1], device=device),
+        },
+        {
+            "counts": torch.tensor([0.0, 0.0, 1.0, 2.0, 1.0, 0.0, 0.0, 1.0, 0.0, 0.0], device=device),
+            "boxes": torch.tensor([[0.8, 0.7, 0.15, 0.25]], device=device),
+            "labels": torch.tensor([2], device=device),
+        },
+    ]
 
     model.train()
-    loss_dict = model(dummy_x, targets=dummy_targets)
+    loss_dict = model(dummy_x, targets=dummy_targets_dict)
     assert "loss" in loss_dict, "Loss dictionary must contain 'loss'"
     assert "loss_count" in loss_dict, "Loss dictionary must contain 'loss_count'"
     assert "loss_bg_attn" in loss_dict, "Loss dictionary must contain 'loss_bg_attn'"
     assert "loss_fg_attn" in loss_dict, "Loss dictionary must contain 'loss_fg_attn'"
-    print(f"Loss dict: {{k: round(v.item(), 4) for k, v in loss_dict.items()}}")
+    print("Loss dict (with Bounding Box bg_seg):", {k: round(v.item(), 4) for k, v in loss_dict.items()})
 
     # 4.2 Backward Pass & Gradients
     total_loss = loss_dict["loss"]
@@ -101,7 +109,7 @@ def test_visdrone_detector():
     # 4.3 Forward Validation
     model.eval()
     with torch.no_grad():
-        val_out = model(dummy_x, targets=dummy_targets)
+        val_out = model(dummy_x, targets=dummy_targets_dict)
         assert "preds" in val_out, "Validation output must contain 'preds'"
         assert val_out["preds"].shape == (2, 10), f"Expected preds shape (2, 10), got {val_out['preds'].shape}"
         print(f"Forward Val PASSED! Preds shape: {val_out['preds'].shape}")
@@ -137,6 +145,67 @@ def test_metric():
     print("ClassCountingMetric PASSED!")
 
 
+def test_bg_seg_lmdb_parity():
+    print("--- 6. Testing Sidecar bg_seg.lmdb Parity & Multi-worker DataLoader ---")
+    src_lmdb = "D:/apps/Datasets/VisDrone/train_data.lmdb"
+    bg_lmdb = "D:/apps/Datasets/VisDrone/bg_seg.lmdb"
+    if not (os.path.exists(src_lmdb) and os.path.exists(bg_lmdb)):
+        print("[!] Skipping LMDB parity test (LMDB files not found on disk).")
+        return
+
+    from torch.utils.data import DataLoader
+    from Visdrone.dataset import CustomLMDBDataset
+
+    pipeline = [{"type": "Resize", "size": [960, 960]}, {"type": "ToTensor"}]
+    ds_parity = CustomLMDBDataset(
+        data_root=src_lmdb,
+        bg_lmdb_path=bg_lmdb,
+        pipeline=pipeline,
+        split="train",
+        return_dict=True,
+        include_boxes=True,
+    )
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model = VisDroneDetector(num_classes=10, dim=32, pretrained=False).to(device)
+    resolutions = ((120, 120), (60, 60), (30, 30))
+
+    # Kiểm tra trùng khớp tuyệt đối bit-for-bit giữa bg_seg.lmdb và tính trực tiếp từ boxes trên 10 mẫu
+    for idx in range(10):
+        sample = ds_parity.get_data_info(idx)
+        tgt = sample["target"]
+        assert "bg_mask" in tgt and "boxes" in tgt
+        m_precomputed = model._create_bg_masks_from_boxes([{"bg_mask": tgt["bg_mask"]}], resolutions, 1, device)
+        m_onthefly = model._create_bg_masks_from_boxes([{"boxes": tgt["boxes"]}], resolutions, 1, device)
+        assert torch.equal(m_precomputed, m_onthefly), f"Mismatch at sample {idx}!"
+
+    print("Bit-for-bit parity between bg_seg.lmdb and on-the-fly boxes PASSED (10/10 samples)!")
+
+    # Kiểm tra DataLoader đa luồng (num_workers=2) và forward/backward với bg_seg.lmdb
+    ds_fast = CustomLMDBDataset(
+        data_root=src_lmdb,
+        bg_lmdb_path=bg_lmdb,
+        pipeline=pipeline,
+        split="train",
+        return_dict=True,
+    )
+    loader = DataLoader(ds_fast, batch_size=2, num_workers=2, collate_fn=ds_fast.collate_fn)
+    metric = ClassCountingMetric(num_classes=10)
+    for batch in loader:
+        images = batch["image"].to(device)
+        targets = batch["target"]
+        assert "bg_mask" in targets[0] and "boxes" not in targets[0], "Fast mode should transfer bg_mask only"
+        model.train()
+        loss_dict = model.forward_train(images, targets)
+        loss_dict["loss"].backward()
+        model.eval()
+        with torch.no_grad():
+            val_out = model.forward_val(images, targets)
+            metric.update(val_out["preds"], targets)
+        print("Multi-worker DataLoader + bg_seg.lmdb train/val step PASSED! Loss:", round(loss_dict["loss"].item(), 4))
+        break
+
+
 def main():
     print("=" * 70)
     print("      RUNNING VISDRONE PIPELINE VERIFICATION SUITE")
@@ -146,6 +215,7 @@ def main():
     test_slot_attention()
     test_visdrone_detector()
     test_metric()
+    test_bg_seg_lmdb_parity()
     print("\n" + "=" * 70)
     print("ALL TESTS PASSED SUCCESSFULLY! The pipeline is fully functional and ready.")
     print("=" * 70)

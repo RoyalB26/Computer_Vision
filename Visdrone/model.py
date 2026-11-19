@@ -87,6 +87,98 @@ def filter_color_bg(
     flat_mask = (relu_v == 0).float()
     return flat_mask
 
+class PANetNeck(nn.Module):
+    """Path Aggregation Network (PANet) Neck cho 3 tầng P3 (//8), P4 (//16), P5 (//32).
+
+    Kết hợp 2 luồng thông tin:
+      1. Top-Down (FPN): truyền ngữ nghĩa cấp cao từ P5 -> P4 -> P3 (giúp P3 nhận diện vật thể nhỏ tốt hơn).
+      2. Bottom-Up (PAN): truyền chi tiết vị trí/biên cạnh từ P3 -> P4 -> P5 (giúp P4, P5 định vị chính xác hơn).
+    """
+
+    def __init__(self, in_channels: Tuple[int, int, int] = (24, 48, 576), out_dim: int = 32):
+        super().__init__()
+        c3_in, c4_in, c5_in = in_channels
+
+        # 1. Lateral 1x1 projections đưa C3, C4, C5 về cùng số kênh out_dim
+        self.lat_p3 = nn.Sequential(
+            nn.Conv2d(c3_in, out_dim, kernel_size=1, bias=False),
+            nn.BatchNorm2d(out_dim),
+            nn.ReLU(inplace=True),
+        )
+        self.lat_p4 = nn.Sequential(
+            nn.Conv2d(c4_in, out_dim, kernel_size=1, bias=False),
+            nn.BatchNorm2d(out_dim),
+            nn.ReLU(inplace=True),
+        )
+        self.lat_p5 = nn.Sequential(
+            nn.Conv2d(c5_in, out_dim, kernel_size=1, bias=False),
+            nn.BatchNorm2d(out_dim),
+            nn.ReLU(inplace=True),
+        )
+
+        # 2. Top-Down smoothing convs (FPN)
+        self.td_conv_p4 = nn.Sequential(
+            nn.Conv2d(out_dim, out_dim, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(out_dim),
+            nn.ReLU(inplace=True),
+        )
+        self.td_conv_p3 = nn.Sequential(
+            nn.Conv2d(out_dim, out_dim, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(out_dim),
+            nn.ReLU(inplace=True),
+        )
+
+        # 3. Bottom-Up downsampling & fusion convs (PAN)
+        self.down_p3_to_p4 = nn.Sequential(
+            nn.Conv2d(out_dim, out_dim, kernel_size=3, stride=2, padding=1, bias=False),
+            nn.BatchNorm2d(out_dim),
+            nn.ReLU(inplace=True),
+        )
+        self.bu_conv_p4 = nn.Sequential(
+            nn.Conv2d(out_dim, out_dim, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(out_dim),
+            nn.ReLU(inplace=True),
+        )
+
+        self.down_p4_to_p5 = nn.Sequential(
+            nn.Conv2d(out_dim, out_dim, kernel_size=3, stride=2, padding=1, bias=False),
+            nn.BatchNorm2d(out_dim),
+            nn.ReLU(inplace=True),
+        )
+        self.bu_conv_p5 = nn.Sequential(
+            nn.Conv2d(out_dim, out_dim, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(out_dim),
+            nn.ReLU(inplace=True),
+        )
+
+    def forward(
+        self, c3: torch.Tensor, c4: torch.Tensor, c5: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        # Lateral projections
+        p3_lat = self.lat_p3(c3)
+        p4_lat = self.lat_p4(c4)
+        p5_lat = self.lat_p5(c5)
+
+        # Top-Down Pathway (P5 -> P4 -> P3)
+        td_p5 = p5_lat
+        td_p4 = self.td_conv_p4(p4_lat + F.interpolate(td_p5, size=p4_lat.shape[-2:], mode="nearest"))
+        td_p3 = self.td_conv_p3(p3_lat + F.interpolate(td_p4, size=p3_lat.shape[-2:], mode="nearest"))
+
+        # Bottom-Up Pathway (P3 -> P4 -> P5)
+        out_p3 = td_p3
+        p3_down = self.down_p3_to_p4(out_p3)
+        if p3_down.shape[-2:] != td_p4.shape[-2:]:
+            p3_down = F.interpolate(p3_down, size=td_p4.shape[-2:], mode="bilinear", align_corners=False)
+        out_p4 = self.bu_conv_p4(td_p4 + p3_down)
+
+        p4_down = self.down_p4_to_p5(out_p4)
+        if p4_down.shape[-2:] != td_p5.shape[-2:]:
+            p4_down = F.interpolate(p4_down, size=td_p5.shape[-2:], mode="bilinear", align_corners=False)
+        out_p5 = self.bu_conv_p5(td_p5 + p4_down)
+
+        return out_p3, out_p4, out_p5
+
+
 class SlotAttention(nn.Module):
     """Slot Attention module nhận chuỗi tokens đa quy mô N = N_p3 + N_p4 + N_p5.
     num_slots: num_class + 1 (10 class slots + 1 background slot).
@@ -169,10 +261,8 @@ class VisDroneDetector(BaseModel):
             "features.12": "p5",  # stride 32 (576 channels)
         }
         self.backbone = create_feature_extractor(m, return_nodes=return_nodes)
-        # 2. Chiếu 3 mức đặc trưng về cùng số chiều dim
-        self.proj_p3 = nn.Conv2d(24, dim, kernel_size=1)
-        self.proj_p4 = nn.Conv2d(48, dim, kernel_size=1)
-        self.proj_p5 = nn.Conv2d(576, dim, kernel_size=1)
+        # 2. PANet Neck tổng hợp đặc trưng 2 chiều (Top-Down + Bottom-Up) cho P3, P4, P5
+        self.neck = PANetNeck(in_channels=(24, 48, 576), out_dim=dim)
         # 3. 2D Positional Encoding (Sine-Cosine)
         assert dim % 2 == 0, f"dim must be even for 2D Positional Encoding, got {dim}"
         self.pos_emb = PositionEmbeddingSine(num_pos_feats=dim // 2)
@@ -180,10 +270,10 @@ class VisDroneDetector(BaseModel):
         self.level_embed = nn.Parameter(torch.randn(3, dim) * 0.02)
         # 4. Slot Attention Module
         self.slot_attention = SlotAttention(dim=dim, num_class=num_classes)
-        # 5. fc_actor: nhận [slot_vector (dim), attn_mass (1)] -> dự đoán số lượng (không âm)
+        # 5. fc_actor: nhận [slot_vector (dim), mass_p3, mass_p4, mass_p5] -> dự đoán số lượng (không âm)
         self.fc_actor = nn.ModuleList([
             nn.Sequential(
-                nn.Linear(dim + 1, dim),
+                nn.Linear(dim + 3, dim),
                 nn.ReLU(inplace=False),
                 nn.Linear(dim, 1),
                 nn.ReLU(inplace=False),  # Số lượng đối tượng không âm
@@ -191,11 +281,9 @@ class VisDroneDetector(BaseModel):
             for _ in range(num_classes)
         ])
     def extract_features(self, x: torch.Tensor) -> Tuple[torch.Tensor, Tuple[Tuple[int, int], Tuple[int, int], Tuple[int, int]]]:
-        """Trích xuất P3, P4, P5, cộng 2D Positional Encoding và Level Embeddings."""
+        """Trích xuất P3, P4, P5 qua PANet Neck, cộng 2D Positional Encoding và Level Embeddings."""
         feats = self.backbone(x)
-        feat_p3 = self.proj_p3(feats["p3"])  # (B, dim, 120, 120)
-        feat_p4 = self.proj_p4(feats["p4"])  # (B, dim, 60, 60)
-        feat_p5 = self.proj_p5(feats["p5"])  # (B, dim, 30, 30)
+        feat_p3, feat_p4, feat_p5 = self.neck(feats["p3"], feats["p4"], feats["p5"])
         # Cộng 2D Positional Encoding (x, y) để mạng biết vị trí địa lý của từng token
         feat_p3 = feat_p3 + self.pos_emb(feat_p3)
         feat_p4 = feat_p4 + self.pos_emb(feat_p4)
@@ -220,8 +308,14 @@ class VisDroneDetector(BaseModel):
         attn_ori: torch.Tensor,
         resolutions: Tuple[Tuple[int, int], Tuple[int, int], Tuple[int, int]],
         target_size: Tuple[int, int] = (960, 960),
+        fuse_mode: str = "max",
     ) -> torch.Tensor:
-        """Tái cấu trúc attention matrix (B, 11, 18900) thành bản đồ không gian 2D (B, 11, H, W)."""
+        """Tái cấu trúc attention matrix (B, 11, 18900) thành bản đồ không gian 2D (B, 11, H, W).
+
+        fuse_mode:
+          - 'max' (mặc định): lấy cực đại theo 3 tầng P3/P4/P5 giúp vật nhỏ (P3) và vật lớn (P5) không bị làm mờ lẫn nhau.
+          - 'mean': trung bình cộng 3 tầng sau khi upsample.
+        """
         B, num_slots, _ = attn_ori.shape
         (H3, W3), (H4, W4), (H5, W5) = resolutions
         n3 = H3 * W3  # 14400
@@ -232,17 +326,33 @@ class VisDroneDetector(BaseModel):
         p3_up = F.interpolate(attn_p3, size=target_size, mode="bilinear", align_corners=False)
         p4_up = F.interpolate(attn_p4, size=target_size, mode="bilinear", align_corners=False)
         p5_up = F.interpolate(attn_p5, size=target_size, mode="bilinear", align_corners=False)
-        attn_full = (p3_up + p4_up + p5_up) / 3.0
-        return attn_full
-    def _predict_counts(self, slots: torch.Tensor, attn_ori: torch.Tensor) -> torch.Tensor:
-        """Dự đoán số lượng 10 class thông qua fc_actor bằng cách ghép [slots, attn_mass].
-        attn_mass: tổng diện tích attention trước khi chia chuẩn hóa (phản ánh trực tiếp số lượng đối tượng).
+        if fuse_mode == "mean":
+            return (p3_up + p4_up + p5_up) / 3.0
+        return torch.maximum(torch.maximum(p3_up, p4_up), p5_up)
+
+    def _predict_counts(
+        self,
+        slots: torch.Tensor,
+        attn_ori: torch.Tensor,
+        resolutions: Tuple[Tuple[int, int], Tuple[int, int], Tuple[int, int]],
+    ) -> torch.Tensor:
+        """Dự đoán số lượng 10 class bằng cách ghép [slots, mass_p3, mass_p4, mass_p5].
+        Tách riêng tỉ lệ diện tích attention của từng tầng (mean theo số token của tầng đó)
+        để P5 (vật lớn) không bị P3 (nhiều token gấp 16x) áp đảo.
         """
-        # attn_mass shape: (B, 10, 1) - chia 100 để đưa về biên độ số học phù hợp cho MLP
-        attn_mass = attn_ori[:, :self.num_classes, :].sum(dim=-1, keepdim=True) / 100.0
+        (H3, W3), (H4, W4), _ = resolutions
+        n3 = H3 * W3
+        n4 = H4 * W4
+        cls_attn = attn_ori[:, :self.num_classes, :]  # (B, 10, N)
+        # Tỉ lệ phủ không gian theo từng tầng (nhân 10.0 để đưa về biên độ phù hợp cho MLP)
+        mass_p3 = cls_attn[:, :, :n3].mean(dim=-1, keepdim=True) * 10.0
+        mass_p4 = cls_attn[:, :, n3:n3 + n4].mean(dim=-1, keepdim=True) * 10.0
+        mass_p5 = cls_attn[:, :, n3 + n4:].mean(dim=-1, keepdim=True) * 10.0
+        attn_mass_3 = torch.cat([mass_p3, mass_p4, mass_p5], dim=-1)  # (B, 10, 3)
+
         pred_list = []
         for i in range(self.num_classes):
-            feat_i = torch.cat([slots[:, i, :], attn_mass[:, i, :]], dim=-1)  # (B, dim + 1)
+            feat_i = torch.cat([slots[:, i, :], attn_mass_3[:, i, :]], dim=-1)  # (B, dim + 3)
             pred_list.append(self.fc_actor[i](feat_i).squeeze(-1))
         pred_counts = torch.stack(pred_list, dim=-1)  # (B, 10)
         return pred_counts
@@ -285,6 +395,103 @@ class VisDroneDetector(BaseModel):
 
         return torch.zeros((batch_size, self.num_classes), device=device, dtype=torch.float32)
 
+    def _create_bg_masks_from_boxes(
+        self,
+        targets: Optional[Union[torch.Tensor, List[Any], Dict[str, Any]]],
+        resolutions: Tuple[Tuple[int, int], Tuple[int, int], Tuple[int, int]],
+        batch_size: int,
+        device: torch.device,
+        fallback_inputs: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """Lấy hoặc tạo multi-scale background segmentation mask chuẩn xác từ Bounding Box.
+        - Giá trị 1.0: Vùng Nền (Background) bên ngoài mọi bounding box.
+        - Giá trị 0.0: Vùng Vật thể (Foreground) bên trong các bounding box.
+
+        Ưu tiên theo thứ tự tốc độ:
+          1. Nạp trực tiếp `bg_mask` đã pre-generate từ sidecar LMDB (`bg_seg.lmdb`) -> O(1), không tốn CPU.
+          2. Rasterize trực tiếp từ `boxes` trong `targets` (nếu chưa có `bg_mask` hoặc khác độ phân giải).
+          3. Fallback về `filter_color_bg` nếu không có cả `bg_mask` và `boxes`.
+        """
+        total_tokens = sum(h * w for h, w in resolutions)
+
+        # --- Nhánh 1 (Nhanh nhất): Đọc pre-generated bg_mask từ sidecar LMDB ---
+        if isinstance(targets, (list, tuple)) and len(targets) >= batch_size:
+            if all(isinstance(item, dict) and "bg_mask" in item and item["bg_mask"] is not None for item in targets[:batch_size]):
+                first_m = targets[0]["bg_mask"]
+                if hasattr(first_m, "numel") and first_m.numel() == total_tokens:
+                    stacked = torch.stack(
+                        [item["bg_mask"].reshape(-1) for item in targets[:batch_size]], dim=0
+                    )
+                    return stacked.to(device=device, dtype=torch.float32)
+        elif isinstance(targets, dict) and "bg_mask" in targets and targets["bg_mask"] is not None:
+            bm = targets["bg_mask"]
+            if isinstance(bm, torch.Tensor):
+                if bm.dim() == 1 and bm.numel() == total_tokens and batch_size == 1:
+                    return bm.unsqueeze(0).to(device=device, dtype=torch.float32)
+                elif bm.dim() == 2 and bm.shape == (batch_size, total_tokens):
+                    return bm.to(device=device, dtype=torch.float32)
+            elif isinstance(bm, (list, tuple)) and len(bm) >= batch_size:
+                if bm[0].numel() == total_tokens:
+                    return torch.stack([m.reshape(-1) for m in bm[:batch_size]], dim=0).to(
+                        device=device, dtype=torch.float32
+                    )
+
+        # --- Nhánh 2: Tạo on-the-fly từ bounding boxes ---
+        has_boxes = False
+        boxes_list = []
+        if isinstance(targets, (list, tuple)):
+            for item in targets:
+                if isinstance(item, dict) and "boxes" in item:
+                    has_boxes = True
+                    boxes_list.append(item["boxes"])
+                else:
+                    boxes_list.append(None)
+        elif isinstance(targets, dict) and "boxes" in targets:
+            has_boxes = True
+            bxs = targets["boxes"]
+            if isinstance(bxs, (list, tuple)):
+                boxes_list = list(bxs)
+            elif isinstance(bxs, torch.Tensor) and bxs.dim() == 3:
+                boxes_list = [bxs[b] for b in range(bxs.shape[0])]
+            else:
+                boxes_list = [bxs]
+
+        if not has_boxes:
+            # --- Nhánh 3: Fallback nếu targets không cung cấp bg_mask hay bounding box ---
+            if fallback_inputs is not None:
+                (H3, W3), (H4, W4), (H5, W5) = resolutions
+                m3 = filter_color_bg(fallback_inputs, target_res=(H3, W3), exp_factor=self.exp_factor)
+                m4 = filter_color_bg(fallback_inputs, target_res=(H4, W4), exp_factor=self.exp_factor)
+                m5 = filter_color_bg(fallback_inputs, target_res=(H5, W5), exp_factor=self.exp_factor)
+                return torch.cat([m3.flatten(1), m4.flatten(1), m5.flatten(1)], dim=1).to(device)
+            else:
+                return torch.ones((batch_size, total_tokens), device=device, dtype=torch.float32)
+
+        multiscale_masks = []
+        for H, W in resolutions:
+            mask = torch.ones((batch_size, H, W), device=device, dtype=torch.float32)
+            for b in range(min(batch_size, len(boxes_list))):
+                bxs = boxes_list[b]
+                if bxs is None or len(bxs) == 0:
+                    continue
+                if isinstance(bxs, np.ndarray):
+                    bxs = torch.from_numpy(bxs)
+                bxs = bxs.to(device=device, dtype=torch.float32)
+
+                # VisDrone bounding box format: [cx, cy, w, h] chuẩn hóa trong [0, 1]
+                cx, cy, w, h = bxs[:, 0], bxs[:, 1], bxs[:, 2], bxs[:, 3]
+                x1 = ((cx - w / 2.0) * W).long().clamp(0, W - 1)
+                y1 = ((cy - h / 2.0) * H).long().clamp(0, H - 1)
+                x2 = torch.maximum(x1 + 1, ((cx + w / 2.0) * W).ceil().long().clamp(0, W))
+                y2 = torch.maximum(y1 + 1, ((cy + h / 2.0) * H).ceil().long().clamp(0, H))
+
+                for i in range(len(bxs)):
+                    mask[b, y1[i]:y2[i], x1[i]:x2[i]] = 0.0
+
+            multiscale_masks.append(mask.flatten(1))
+
+        return torch.cat(multiscale_masks, dim=1)  # (B, 18900)
+
     def _compute_losses(
         self,
         inputs: torch.Tensor,
@@ -292,34 +499,60 @@ class VisDroneDetector(BaseModel):
         attn_ori: torch.Tensor,
         resolutions: Tuple[Tuple[int, int], Tuple[int, int], Tuple[int, int]],
         gt_counts: torch.Tensor,
+        targets: Optional[Union[torch.Tensor, List[Any], Dict[str, Any]]] = None,
     ) -> Dict[str, torch.Tensor]:
-        """Tính toán tổng hợp: Count Loss + Multi-scale Attention Mask Loss."""
+        """Tính toán tổng hợp: Count Loss + Multi-scale Attention Mask Loss (từ Bounding Box)."""
         B, num_slots, total_tokens = attn_ori.shape
         (H3, W3), (H4, W4), (H5, W5) = resolutions
+        n3 = H3 * W3
+        n4 = H4 * W4
+
+        def _balanced_multiscale_bce(pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+            """Tính BCE riêng cho P3, P4, P5 rồi lấy trung bình 3 tầng"""
+            p = pred.clamp(1e-6, 1.0 - 1e-6)
+            l_p3 = F.binary_cross_entropy(p[..., :n3], target[..., :n3])
+            l_p4 = F.binary_cross_entropy(p[..., n3:n3 + n4], target[..., n3:n3 + n4])
+            l_p5 = F.binary_cross_entropy(p[..., n3 + n4:], target[..., n3 + n4:])
+            return (l_p3 + l_p4 + l_p5) / 3.0
+
         # 1. Count regression loss (Smooth L1)
         loss_count = F.smooth_l1_loss(pred_counts, gt_counts, beta=1.0)
-        # 2. Tạo flat background mask tương ứng cho từng quy mô
-        mask_p3 = filter_color_bg(inputs, target_res=(H3, W3), exp_factor=self.exp_factor)
-        mask_p4 = filter_color_bg(inputs, target_res=(H4, W4), exp_factor=self.exp_factor)
-        mask_p5 = filter_color_bg(inputs, target_res=(H5, W5), exp_factor=self.exp_factor)
-        # Ghép nối mask thành vector 18,900 khớp với tokens
-        mask_multiscale = torch.cat(
-            [mask_p3.flatten(1), mask_p4.flatten(1), mask_p5.flatten(1)], dim=1
-        ).to(device=inputs.device, dtype=torch.float32)  # (B, 18900)
-        # 3. Background Slot Loss: Slot cuối (index -1) tập trung vào mask = 1
-        bg_attn = attn_ori[:, -1, :]  # (B, 18900)
-        loss_bg_attn = F.binary_cross_entropy(bg_attn.clamp(1e-6, 1.0 - 1e-6), mask_multiscale)
-        # 4. Foreground Slots Loss: 10 slot foreground tập trung vào mask = 0 (1.0 - mask)
-        fg_mask = 1.0 - mask_multiscale
-        fg_attn_sum = attn_ori[:, :self.num_classes, :].sum(dim=1)  # (B, 18900)
-        loss_fg_attn = F.binary_cross_entropy(fg_attn_sum.clamp(1e-6, 1.0 - 1e-6), fg_mask)
-        # 5. Inactive Slot Suppression
-        inactive_classes = (gt_counts == 0)  # (B, 10)
-        class_attn = attn_ori[:, :self.num_classes, :]  # (B, 10, 18900)
-        if inactive_classes.any():
-            inactive_selected = class_attn[inactive_classes].clamp(1e-6, 1.0 - 1e-6)
-            zeros = torch.zeros_like(inactive_selected)
-            loss_suppress = F.binary_cross_entropy(inactive_selected, zeros)
+
+        # 2. Lấy hoặc tạo background mask chuẩn xác từ Bounding Box (ưu tiên đọc từ sidecar bg_seg.lmdb)
+        if self.bg_attn_weight > 0 or self.fg_attn_weight > 0:
+            mask_multiscale = self._create_bg_masks_from_boxes(
+                targets=targets,
+                resolutions=resolutions,
+                batch_size=B,
+                device=inputs.device,
+                fallback_inputs=inputs,
+            )
+        else:
+            mask_multiscale = None
+
+        # 3. Background Slot Loss: Slot cuối (index -1) tập trung vào mask = 1 (vùng nền ngoài box)
+        if self.bg_attn_weight > 0:
+            bg_attn = attn_ori[:, -1, :]  # (B, 18900)
+            loss_bg_attn = _balanced_multiscale_bce(bg_attn, mask_multiscale)
+        else:
+            loss_bg_attn = torch.tensor(0.0, device=inputs.device)
+        # 4. Foreground Slots Loss: 10 slot foreground tập trung vào mask = 0 (1.0 - mask, vùng trong box)
+        if self.fg_attn_weight > 0:
+            fg_mask = 1.0 - mask_multiscale
+            fg_attn_sum = attn_ori[:, :self.num_classes, :].sum(dim=1)  # (B, 18900)
+            loss_fg_attn = _balanced_multiscale_bce(fg_attn_sum, fg_mask)
+        else:
+            loss_fg_attn = torch.tensor(0.0, device=inputs.device)
+        # 5. Inactive Slot Suppression (cân bằng đều giữa P3, P4, P5)
+        if self.suppress_weight > 0:
+            inactive_classes = (gt_counts == 0)  # (B, 10)
+            class_attn = attn_ori[:, :self.num_classes, :]  # (B, 10, 18900)
+            if inactive_classes.any():
+                inactive_selected = class_attn[inactive_classes]
+                zeros = torch.zeros_like(inactive_selected)
+                loss_suppress = _balanced_multiscale_bce(inactive_selected, zeros)
+            else:
+                loss_suppress = torch.tensor(0.0, device=inputs.device)
         else:
             loss_suppress = torch.tensor(0.0, device=inputs.device)
         # Tổng hợp loss
@@ -342,10 +575,10 @@ class VisDroneDetector(BaseModel):
         targets: Optional[Union[torch.Tensor, List[Any], Dict[str, Any]]] = None,
         **kwargs,
     ) -> Dict[str, torch.Tensor]:
-        """Huấn luyện mô hình với Backbone MobileNetV3, Positional Encoding và Attention Mass."""
+        """Huấn luyện mô hình với Backbone MobileNetV3, PANet Neck, Positional Encoding, Multi-scale Attention Mass và BG Mask."""
         B = inputs.shape[0]
         slots, attn_ori, resolutions = self.extract_slots(inputs)
-        pred_counts = self._predict_counts(slots, attn_ori)
+        pred_counts = self._predict_counts(slots, attn_ori, resolutions)
         gt_counts = self._normalize_targets(targets, device=inputs.device, batch_size=B)
         return self._compute_losses(
             inputs=inputs,
@@ -353,6 +586,7 @@ class VisDroneDetector(BaseModel):
             attn_ori=attn_ori,
             resolutions=resolutions,
             gt_counts=gt_counts,
+            targets=targets,
         )
     def forward_val(
         self,
@@ -363,7 +597,7 @@ class VisDroneDetector(BaseModel):
         """Validation: tính loss và xuất preds (B, 10) để trainer cập nhật metrics."""
         B = inputs.shape[0]
         slots, attn_ori, resolutions = self.extract_slots(inputs)
-        pred_counts = self._predict_counts(slots, attn_ori)
+        pred_counts = self._predict_counts(slots, attn_ori, resolutions)
         gt_counts = self._normalize_targets(targets, device=inputs.device, batch_size=B)
         loss_dict = self._compute_losses(
             inputs=inputs,
@@ -371,6 +605,7 @@ class VisDroneDetector(BaseModel):
             attn_ori=attn_ori,
             resolutions=resolutions,
             gt_counts=gt_counts,
+            targets=targets,
         )
         output: Dict[str, Any] = {}
         output.update(loss_dict)
@@ -383,8 +618,8 @@ class VisDroneDetector(BaseModel):
         **kwargs,
     ) -> torch.Tensor:
         """Inference: dự đoán số lượng 10 class từ batch ảnh đầu vào."""
-        slots, attn_ori, _ = self.extract_slots(inputs)
-        return self._predict_counts(slots, attn_ori)
+        slots, attn_ori, resolutions = self.extract_slots(inputs)
+        return self._predict_counts(slots, attn_ori, resolutions)
     def forward(
         self,
         inputs: torch.Tensor,

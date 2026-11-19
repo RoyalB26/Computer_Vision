@@ -15,12 +15,12 @@ custom_imports:
 model:
   type: "VisDroneDetector"
   num_classes: 10
-  dim: 32
+  dim: 256
   pretrained: true
   exp_factor: 5.0
   count_loss_weight: 1.0
-  bg_attn_weight: 0.5
-  fg_attn_weight: 0.5
+  bg_attn_weight: 1.0
+  fg_attn_weight: 1.0
   suppress_weight: 0.05
 
 # 2. Dataset Configuration (960x960 input resolution)
@@ -29,6 +29,7 @@ data:
     dataset:
       type: "CustomLMDBDataset"
       data_root: "D:/apps/Datasets/VisDrone/train_data.lmdb"
+      bg_lmdb_path: "D:/apps/Datasets/VisDrone/bg_seg.lmdb"
       split: "train"
       split_ratio: 0.8
       seed: 42
@@ -44,6 +45,7 @@ data:
     dataset:
       type: "CustomLMDBDataset"
       data_root: "D:/apps/Datasets/VisDrone/train_data.lmdb"
+      bg_lmdb_path: "D:/apps/Datasets/VisDrone/bg_seg.lmdb"
       split: "val"
       split_ratio: 0.8
       seed: 42
@@ -83,9 +85,7 @@ hooks:
     resume: true
     submodules:
       - "backbone"
-      - "proj_p3"
-      - "proj_p4"
-      - "proj_p5"
+      - "neck"
       - "slot_attention"
       - "fc_actor"
 
@@ -99,7 +99,7 @@ hooks:
 # 7. Training Engine Configuration
 train_cfg:
   max_epochs: 100
-  val_interval: 1
-  log_interval: 50
-  grad_clip: 1.0
+  val_interval: 5
+  log_interval: 5000
+  grad_clip: 5.0
   use_amp: false

@@ -317,7 +317,17 @@ class ClassCountingMetric(BaseMetric):
         else:
             p = np.asarray(preds, dtype=np.float32)
 
-        if isinstance(targets, torch.Tensor):
+        # Trích xuất targets khi nhận dict hoặc list of dicts từ dataset
+        if isinstance(targets, (list, tuple)):
+            if len(targets) > 0 and isinstance(targets[0], dict) and "counts" in targets[0]:
+                t = torch.stack([item["counts"] for item in targets]).detach().cpu().float().numpy()
+            elif len(targets) > 0 and isinstance(targets[0], torch.Tensor):
+                t = torch.stack(targets).detach().cpu().float().numpy()
+            else:
+                t = np.asarray(targets, dtype=np.float32)
+        elif isinstance(targets, dict) and "counts" in targets:
+            t = targets["counts"].detach().cpu().float().numpy()
+        elif isinstance(targets, torch.Tensor):
             t = targets.detach().cpu().float().numpy()
         else:
             t = np.asarray(targets, dtype=np.float32)

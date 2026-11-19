@@ -298,6 +298,7 @@ def run_inference(
     if not torch.cuda.is_available() and device == "cuda":
         print("[!] CUDA không khả dụng, tự động chuyển về cpu.")
         device = "cpu"
+    print(f"[*] Thiết bị suy luận: {device.upper()}")
 
     model = load_model(config_path=config_path, weights_path=weights_path, device=device)
 
@@ -321,7 +322,7 @@ def run_inference(
     # 2. Suy luận qua Slot Attention
     with torch.no_grad():
         slots, attn_ori, resolutions = model.extract_slots(tensor_bchw)
-        pred_counts = model._predict_counts(slots, attn_ori)[0]  # (10,)
+        pred_counts = model._predict_counts(slots, attn_ori, resolutions)[0]  # (10,)
         counts_raw = pred_counts.cpu().numpy()
 
         # Tái cấu trúc spatial attention maps đa quy mô gộp từ //8, //16, //32 về target_size
@@ -358,8 +359,11 @@ def main():
     parser.add_argument("--out", type=str, default="Visdrone/attn_map_result.png", help="Đường dẫn lưu ảnh 3x4 attention map")
     parser.add_argument("--out-all", type=str, default="Visdrone/all_attn.png", help="Đường dẫn lưu ảnh gộp tất cả slot đa màu")
     parser.add_argument("--device", type=str, default="cuda", help="Thiết bị: 'cuda' hoặc 'cpu'")
+    parser.add_argument("--cpu", action="store_true", help="Chạy suy luận hoàn toàn trên CPU (tương đương --device cpu)")
     parser.add_argument("--no-overlay", action="store_true", help="Không phủ attention map lên ảnh gốc")
     args = parser.parse_args()
+
+    device = "cpu" if args.cpu else args.device
 
     # Tìm ảnh mặc định nếu người dùng không truyền --image
     image_path = args.image
@@ -386,7 +390,7 @@ def main():
         weights_path=args.weights,
         out_path=args.out,
         out_all_path=args.out_all,
-        device=args.device,
+        device=device,
         overlay=not args.no_overlay,
     )
 
