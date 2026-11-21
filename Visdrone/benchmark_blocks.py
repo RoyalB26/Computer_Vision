@@ -788,20 +788,77 @@ def rasterize_boxes(boxes: np.ndarray, resolutions: Tuple[Tuple[int, int], ...])
     return np.concatenate(parts, axis=0)
 
 
-class InMemoryVisDroneMicroDataset(Dataset):
-    """Nạp sẵn tập con VisDrone thật (resize img_size x img_size) vào RAM để benchmark siêu nhanh."""
-    def __init__(self, samples: List[Dict]):
-        self.samples = samples
+class LMDBVisDroneMicroDataset(Dataset):
+    """Đọc ảnh VisDrone trực tiếp từ LMDB theo nhu cầu (Lazy Loading),
+    giúp chạy được ảnh kích thước lớn (VD: 960x960) trên toàn bộ dataset mà không tốn RAM.
+    """
+    def __init__(
+        self,
+        lmdb_path: str,
+        indices: List[int],
+        all_counts: np.ndarray,
+        img_size: int = 384,
+        for_eval: bool = False,
+    ):
+        self.lmdb_path = lmdb_path
+        self.indices = indices
+        self.all_counts = all_counts
+        self.img_size = img_size
+        self.for_eval = for_eval
+        self.resolutions = (
+            (img_size // 8, img_size // 8),
+            (img_size // 16, img_size // 16),
+            (img_size // 32, img_size // 32),
+        )
+        self.env = None
+        self.txn = None
+
+    def _init_db(self):
+        if self.env is None:
+            self.env, self.txn = open_lmdb(self.lmdb_path, readonly=True)
+
+    def __getstate__(self):
+        state = self.__dict__.copy()
+        state["env"] = None
+        state["txn"] = None
+        return state
 
     def __len__(self) -> int:
-        return len(self.samples)
+        return len(self.indices)
 
     def __getitem__(self, idx: int) -> Dict:
-        s = self.samples[idx]
+        self._init_db()
+        real_idx = self.indices[idx]
+        byteflow = self.txn.get(f"{real_idx:08d}".encode("ascii"))
+        data = pickle.loads(byteflow)
+        raw_boxes = data.get("boxes", [])
+        raw_labels = data.get("labels", [])
+
+        img = Image.open(io.BytesIO(data["image"])).convert("RGB").resize((self.img_size, self.img_size), Image.BILINEAR)
+        img_np = np.array(img, dtype=np.uint8)
+        img_t = torch.from_numpy(img_np).permute(2, 0, 1).float() / 255.0
+
+        counts = torch.from_numpy(self.all_counts[real_idx].astype(np.float32))
+        bg_mask = torch.from_numpy(rasterize_boxes(raw_boxes, self.resolutions))
+
+        if not self.for_eval:
+            return {
+                "image": img_t,
+                "counts": counts,
+                "bg_mask": bg_mask,
+            }
+
+        boxes_norm = [
+            (int(l), float(b[0]), float(b[1]), float(b[2]), float(b[3]))
+            for b, l in zip(raw_boxes, raw_labels)
+            if 0 <= int(l) < 10
+        ]
         return {
-            "image": s["image"],
-            "counts": s["counts"],
-            "bg_mask": s["bg_mask"],
+            "image": img_t,
+            "img_np": img_np,
+            "counts": counts,
+            "bg_mask": bg_mask,
+            "boxes_norm": boxes_norm,
         }
 
 
@@ -975,43 +1032,10 @@ def load_micro_splits(
     print(f"  Total Variation Distance so với Global: Train TVD = {tv_train:.2f}% | Val TVD = {tv_val:.2f}%")
     print("=" * 105)
 
-    resolutions = ((img_size // 8, img_size // 8), (img_size // 16, img_size // 16), (img_size // 32, img_size // 32))
-
-    def _load_indices(idx_list: List[int]) -> List[Dict]:
-        loaded: List[Dict] = []
-        for real_idx in idx_list:
-            byteflow = txn.get(f"{real_idx:08d}".encode("ascii"))
-            if byteflow is None:
-                continue
-            data = pickle.loads(byteflow)
-            raw_boxes = data.get("boxes", [])
-            raw_labels = data.get("labels", [])
-
-            img = Image.open(io.BytesIO(data["image"])).convert("RGB").resize((img_size, img_size), Image.BILINEAR)
-            img_np = np.array(img, dtype=np.uint8)
-            img_t = torch.from_numpy(img_np).permute(2, 0, 1).float() / 255.0
-
-            counts = torch.from_numpy(all_counts[real_idx].astype(np.float32))
-            bg_mask = torch.from_numpy(rasterize_boxes(raw_boxes, resolutions))
-            boxes_norm = [
-                (int(l), float(b[0]), float(b[1]), float(b[2]), float(b[3]))
-                for b, l in zip(raw_boxes, raw_labels)
-                if 0 <= int(l) < 10
-            ]
-            loaded.append({
-                "image": img_t,
-                "img_np": img_np,
-                "counts": counts,
-                "bg_mask": bg_mask,
-                "boxes_norm": boxes_norm,
-            })
-        return loaded
-
-    print(f"[*] Đang nạp {len(train_indices) + len(val_indices)} ảnh đã chọn ({img_size}x{img_size}) vào RAM...")
-    train_samples = _load_indices(train_indices)
-    val_samples = _load_indices(val_indices)
-    print(f"[+] Đã nạp xong {len(train_samples)} ảnh train và {len(val_samples)} ảnh val cân bằng theo phân phối toàn cục.")
-    return train_samples, val_samples
+    train_ds = LMDBVisDroneMicroDataset(lmdb_path=lmdb_path, indices=train_indices, all_counts=all_counts, img_size=img_size, for_eval=False)
+    val_ds = LMDBVisDroneMicroDataset(lmdb_path=lmdb_path, indices=val_indices, all_counts=all_counts, img_size=img_size, for_eval=True)
+    print(f"[+] Đã khởi tạo Lazy LMDB Dataset ({len(train_ds)} train, {len(val_ds)} val) ở kích thước {img_size}x{img_size} (không tốn RAM lưu ảnh).")
+    return train_ds, val_ds
 
 
 # =============================================================================
@@ -1751,6 +1775,7 @@ def main():
     parser.add_argument("--size", type=int, default=384, help="Kích thước ảnh (khuyên dùng 384, chia hết 32 & 6)")
     parser.add_argument("--epochs", type=int, default=15, help="Số epoch train mỗi kiến trúc")
     parser.add_argument("--batch-size", type=int, default=8)
+    parser.add_argument("--num-workers", type=int, default=4, help="Số worker đọc LMDB song song")
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--device", type=str, default="cuda")
@@ -1767,14 +1792,21 @@ def main():
     else:
         block_list = args.blocks
 
-    train_samples, val_samples = load_micro_splits(
+    train_ds, val_ds = load_micro_splits(
         lmdb_path=args.lmdb,
         n_train=args.n_train,
         n_val=args.n_val,
         img_size=args.size,
         seed=args.seed,
     )
-    train_loader = DataLoader(InMemoryVisDroneMicroDataset(train_samples), batch_size=args.batch_size, shuffle=True)
+    train_loader = DataLoader(
+        train_ds,
+        batch_size=args.batch_size,
+        shuffle=True,
+        num_workers=args.num_workers,
+        pin_memory=(device.type == "cuda"),
+        persistent_workers=(args.num_workers > 0),
+    )
 
     for run_idx in range(1, args.runs + 1):
         if args.runs > 1:
@@ -1785,7 +1817,7 @@ def main():
             run_seed = args.seed
 
         print("\n" + "=" * 150)
-        print(f"  BẮT ĐẦU BENCHMARK {len(block_list)} KIẾN TRÚC [RUN {run_idx}/{args.runs}] ({args.epochs} epochs | Seed: {run_seed} | {args.size}x{args.size} | {len(train_samples)} train / {len(val_samples)} val)")
+        print(f"  BẮT ĐẦU BENCHMARK {len(block_list)} KIẾN TRÚC [RUN {run_idx}/{args.runs}] ({args.epochs} epochs | Seed: {run_seed} | {args.size}x{args.size} | {len(train_ds)} train / {len(val_ds)} val)")
         print(f"  Thư mục lưu kết quả: {run_out_dir}")
         print("=" * 150)
         print(
@@ -1801,7 +1833,7 @@ def main():
             metrics, vpack = train_and_eval_block(
                 block_type=bname,
                 train_loader=train_loader,
-                val_samples=val_samples,
+                val_samples=val_ds,
                 device=device,
                 epochs=args.epochs,
                 lr=args.lr,
