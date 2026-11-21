@@ -19,3 +19,5 @@ toy_action/data
 work_dirs/
 action_depth/
 *.mdb
+
+Visdrone/analysis
