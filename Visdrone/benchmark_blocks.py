@@ -645,7 +645,7 @@ BLOCK_REGISTRY = {
     "repvgg": RepVGGBlock,
     "convnext": ConvNeXtBlock,
     "window_attn": WindowSelfAttentionBlock,
-    "vmamba": VMambaBlock,
+    # "vmamba": VMambaBlock,
     "mobilevit": MobileViTBlock,
     "fastvit": FastViTBlock,
     "area_attn": AreaAttentionBlock,
@@ -768,6 +768,48 @@ class MiniSlotCounter(nn.Module):
 # 3. MICRO-DATASET TRONG RAM TỪ VISDRONE LMDB THẬT
 # =============================================================================
 
+def rasterize_boxes_with_classes(
+    boxes: np.ndarray,
+    labels: np.ndarray,
+    resolutions: Tuple[Tuple[int, int], ...],
+    num_classes: int = 10,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Tạo vector multi-scale background mask (1.0 = BG, 0.0 = Box)
+    và per-class binary masks (10, total_tokens) (1.0 = Box của class c, 0.0 = khác).
+    """
+    has_b = boxes is not None and len(boxes) > 0 and labels is not None and len(labels) > 0
+    if has_b:
+        bxs = np.asarray(boxes, dtype=np.float32)
+        lbls = np.asarray(labels, dtype=np.int64)
+        valid = (lbls >= 0) & (lbls < num_classes)
+        bxs = bxs[valid]
+        lbls = lbls[valid]
+        has_b = len(bxs) > 0
+        if has_b:
+            cx, cy, w, h = bxs[:, 0], bxs[:, 1], bxs[:, 2], bxs[:, 3]
+
+    bg_parts = []
+    cls_parts = []
+    for H, W in resolutions:
+        bg_m = np.ones((H, W), dtype=np.float32)
+        cls_m = np.zeros((num_classes, H, W), dtype=np.float32)
+        if has_b:
+            x1 = np.clip(np.trunc((cx - w / 2.0) * W).astype(np.int64), 0, W - 1)
+            y1 = np.clip(np.trunc((cy - h / 2.0) * H).astype(np.int64), 0, H - 1)
+            x2 = np.maximum(x1 + 1, np.clip(np.ceil((cx + w / 2.0) * W).astype(np.int64), 0, W))
+            y2 = np.maximum(y1 + 1, np.clip(np.ceil((cy + h / 2.0) * H).astype(np.int64), 0, H))
+            for i in range(len(x1)):
+                c = int(lbls[i])
+                bg_m[y1[i] : y2[i], x1[i] : x2[i]] = 0.0
+                cls_m[c, y1[i] : y2[i], x1[i] : x2[i]] = 1.0
+        bg_parts.append(bg_m.reshape(-1))
+        cls_parts.append(cls_m.reshape(num_classes, -1))
+
+    bg_mask = np.concatenate(bg_parts, axis=0)
+    cls_mask = np.concatenate(cls_parts, axis=1)
+    return bg_mask, cls_mask
+
+
 def rasterize_boxes(boxes: np.ndarray, resolutions: Tuple[Tuple[int, int], ...]) -> np.ndarray:
     """Tạo vector multi-scale background mask (1.0 = BG, 0.0 = Box)."""
     has_b = boxes is not None and len(boxes) > 0
@@ -839,13 +881,16 @@ class LMDBVisDroneMicroDataset(Dataset):
         img_t = torch.from_numpy(img_np).permute(2, 0, 1).float() / 255.0
 
         counts = torch.from_numpy(self.all_counts[real_idx].astype(np.float32))
-        bg_mask = torch.from_numpy(rasterize_boxes(raw_boxes, self.resolutions))
+        bg_mask_np, cls_mask_np = rasterize_boxes_with_classes(raw_boxes, raw_labels, self.resolutions, num_classes=10)
+        bg_mask = torch.from_numpy(bg_mask_np)
+        cls_mask = torch.from_numpy(cls_mask_np)
 
         if not self.for_eval:
             return {
                 "image": img_t,
                 "counts": counts,
                 "bg_mask": bg_mask,
+                "cls_mask": cls_mask,
             }
 
         boxes_norm = [
@@ -858,6 +903,7 @@ class LMDBVisDroneMicroDataset(Dataset):
             "img_np": img_np,
             "counts": counts,
             "bg_mask": bg_mask,
+            "cls_mask": cls_mask,
             "boxes_norm": boxes_norm,
         }
 
@@ -1373,6 +1419,9 @@ def train_and_eval_block(
     epochs: int = 15,
     lr: float = 1e-3,
     seed: int = 42,
+    w_cls_attn: float = 0.5,
+    w_ortho: float = 0.1,
+    loss_log_interval: int = 100,
 ) -> Tuple[Dict[str, float], Dict[str, np.ndarray]]:
     """Huấn luyện và đánh giá 1 kiến trúc block với seed cố định."""
     torch.manual_seed(seed)
@@ -1388,15 +1437,21 @@ def train_and_eval_block(
 
     t0 = time.perf_counter()
     model.train()
-    for _ in range(epochs):
-        for batch in train_loader:
+    loss_history: List[Dict[str, float]] = []
+    global_step = 0
+    total_steps = epochs * len(train_loader)
+
+    for epoch in range(1, epochs + 1):
+        for batch_idx, batch in enumerate(train_loader):
+            global_step += 1
             imgs = batch["image"].to(device, non_blocking=True)
             gt_counts = batch["counts"].to(device, non_blocking=True)
             bg_mask = batch["bg_mask"].to(device, non_blocking=True)
+            cls_mask = batch["cls_mask"].to(device, non_blocking=True)  # (B, 10, total_tokens)
             fg_mask = 1.0 - bg_mask
 
             optimizer.zero_grad()
-            preds, attn_ori, _, _, _ = model.forward_all(imgs)
+            preds, attn_ori, _, _, slots = model.forward_all(imgs)
 
             loss_count = F.smooth_l1_loss(preds, gt_counts, beta=1.0)
             bg_attn = attn_ori[:, -1, :].clamp(1e-6, 1.0 - 1e-6)
@@ -1411,10 +1466,77 @@ def train_and_eval_block(
             else:
                 loss_sup = torch.tensor(0.0, device=device)
 
-            loss = loss_count + 1.0 * loss_bg + 1.0 * loss_fg + 0.05 * loss_sup
+            # -------------------------------------------------------------
+            # 1. Per-Class Attention Loss (Dice Loss + Positive Focused CE)
+            # -------------------------------------------------------------
+            active_mask = (gt_counts > 0)  # (B, 10)
+            if active_mask.any() and w_cls_attn > 0:
+                p_cls = attn_ori[:, :10, :].clamp(1e-6, 1.0 - 1e-6)  # (B, 10, N)
+                y_cls = cls_mask  # (B, 10, N)
+                # Dice loss trên các class active có mặt trong từng ảnh
+                inter = (p_cls * y_cls).sum(dim=-1)  # (B, 10)
+                card = p_cls.sum(dim=-1) + y_cls.sum(dim=-1)  # (B, 10)
+                dice = 1.0 - (2.0 * inter + 1.0) / (card + 1.0)
+                loss_dice = dice[active_mask].mean()
+
+                # Focused Cross-Entropy trên đúng các pixel FG của class đó
+                pos_pixels = (y_cls > 0.5) & active_mask.unsqueeze(-1)
+                if pos_pixels.any():
+                    loss_pos = -torch.log(p_cls[pos_pixels]).mean()
+                else:
+                    loss_pos = torch.tensor(0.0, device=device)
+
+                loss_cls_attn = loss_dice + 0.5 * loss_pos
+            else:
+                loss_cls_attn = torch.tensor(0.0, device=device)
+
+            # -------------------------------------------------------------
+            # 2. Slot Orthogonality / Diversity Loss
+            # -------------------------------------------------------------
+            if w_ortho > 0:
+                # 2a. Orthogonality trên final class slots: slots[:, :10, :] (B, 10, D)
+                norm_slots = F.normalize(slots[:, :10, :], p=2, dim=-1)
+                sim_matrix = torch.bmm(norm_slots, norm_slots.transpose(1, 2))  # (B, 10, 10)
+                eye_10 = torch.eye(10, device=device).unsqueeze(0)
+                off_diag = sim_matrix * (1.0 - eye_10)
+                loss_slot_ortho = (off_diag ** 2).sum(dim=(-1, -2)).mean() / 90.0
+
+                # 2b. Orthogonality trên learnable query embeddings ban đầu (1, 10, D)
+                norm_queries = F.normalize(model.slot_attention.obj_queries[:, :10, :], p=2, dim=-1)
+                sim_q = torch.bmm(norm_queries, norm_queries.transpose(1, 2))[0] * (1.0 - torch.eye(10, device=device))
+                loss_q_ortho = (sim_q ** 2).sum() / 90.0
+
+                loss_ortho = loss_slot_ortho + 0.5 * loss_q_ortho
+            else:
+                loss_ortho = torch.tensor(0.0, device=device)
+
+            loss = (
+                loss_count
+                + 1.0 * loss_bg
+                + 1.0 * loss_fg
+                + 0.05 * loss_sup
+                + w_cls_attn * loss_cls_attn
+                + w_ortho * loss_ortho
+            )
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), 5.0)
             optimizer.step()
+
+            # Ghi nhận loss mỗi loss_log_interval step, hoặc ở step đầu / step cuối
+            if global_step % loss_log_interval == 0 or global_step == 1 or global_step == total_steps:
+                cur_epoch = round((epoch - 1) + (batch_idx + 1) / len(train_loader), 2)
+                loss_history.append({
+                    "step": global_step,
+                    "epoch": cur_epoch,
+                    "total_loss": float(loss.item()),
+                    "loss_count": float(loss_count.item()),
+                    "loss_bg": float(loss_bg.item()),
+                    "loss_fg": float(loss_fg.item()),
+                    "loss_bg_fg": float((loss_bg + loss_fg).item()),
+                    "loss_sup": float(loss_sup.item()),
+                    "loss_cls_attn": float(loss_cls_attn.item()),
+                    "loss_ortho": float(loss_ortho.item()),
+                })
         scheduler.step()
 
     train_sec = time.perf_counter() - t0
@@ -1422,6 +1544,7 @@ def train_and_eval_block(
     metrics["block"] = block_type
     metrics["params_m"] = params_m
     metrics["train_sec"] = train_sec
+    vis_pack["loss_history"] = loss_history
     return metrics, vis_pack
 
 
@@ -1505,6 +1628,104 @@ def _save_pairwise_csv_and_heatmap(
     plt.suptitle(f"Pairwise Inter-Class Cosine Separation — {title_prefix} (All 45 Class Pairs)", fontsize=14, fontweight="bold")
     plt.savefig(hm_path, dpi=160, bbox_inches="tight")
     plt.close()
+
+
+def _save_loss_history_and_charts(
+    names: List[str],
+    vis_packs: Dict[str, Dict[str, np.ndarray]],
+    out_dir: str,
+) -> Tuple[str, str]:
+    """Lưu CSV lịch sử loss theo từng step và vẽ biểu đồ đường (loss curves) so sánh tất cả các model."""
+    loss_csv_path = os.path.join(out_dir, "benchmark_training_loss_history.csv")
+    loss_chart_path = os.path.join(out_dir, "benchmark_training_loss_curves.png")
+
+    # 1. Ghi file CSV lịch sử loss
+    fields = [
+        "block", "step", "epoch", "total_loss", "loss_count",
+        "loss_bg_fg", "loss_cls_attn", "loss_ortho", "loss_bg", "loss_fg", "loss_sup"
+    ]
+    with open(loss_csv_path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=fields)
+        writer.writeheader()
+        for bname in names:
+            lh = vis_packs[bname].get("loss_history", [])
+            for pt in lh:
+                row = {"block": bname, **pt}
+                writer.writerow(row)
+
+    # 2. Vẽ biểu đồ đường 2x3 (6 panels) so sánh quá trình hội tụ
+    palette = [
+        "#1f77b4", "#ff7f0e", "#2ca02c", "#d62728", "#9467bd",
+        "#8c564b", "#e377c2", "#7f7f7f", "#bcbd22", "#17becf",
+        "#20b2aa", "#dc143c", "#ff1493", "#00bfff", "#ffa500",
+        "#32cd32", "#8a2be2",
+    ]
+
+    fig, axes = plt.subplots(2, 3, figsize=(22, 11))
+    panels = [
+        ("total_loss", "Total Training Loss (Tổng hợp)", "Loss"),
+        ("loss_count", "Count Prediction Loss (Smooth L1)", "Count Loss"),
+        ("loss_cls_attn", "Per-Class Attention Loss (Dice + Pos CE)", "Cls Attn Loss"),
+        ("loss_ortho", "Slot Orthogonality / Diversity Loss", "Ortho Loss"),
+        ("loss_bg_fg", "Foreground & Background BCE Loss (FG + BG)", "Mask BCE Loss"),
+    ]
+
+    for (k_loss, title, ylabel), ax in zip(panels, axes.flatten()[:5]):
+        for idx_b, bname in enumerate(names):
+            lh = vis_packs[bname].get("loss_history", [])
+            if not lh:
+                continue
+            steps = [pt["step"] for pt in lh]
+            vals = [pt[k_loss] for pt in lh]
+            clr = palette[idx_b % len(palette)]
+            ax.plot(steps, vals, marker="o", markersize=3, linewidth=1.8, label=bname, color=clr, alpha=0.9)
+        ax.set_title(title, fontsize=11, fontweight="bold")
+        ax.set_xlabel("Training Step", fontsize=9.5, fontweight="bold")
+        ax.set_ylabel(ylabel, fontsize=9.5, fontweight="bold")
+        ax.grid(True, linestyle="--", alpha=0.4)
+
+    # Panel 6: Xếp hạng Final Total Loss ở step cuối cùng
+    ax_bar = axes[1, 2]
+    final_losses = []
+    for bname in names:
+        lh = vis_packs[bname].get("loss_history", [])
+        last_val = lh[-1]["total_loss"] if lh else 0.0
+        final_losses.append((bname, last_val))
+    final_losses.sort(key=lambda x: x[1])
+
+    b_names = [x[0] for x in final_losses]
+    b_vals = [x[1] for x in final_losses]
+    y_pos = np.arange(len(b_names))
+    bars = ax_bar.barh(y_pos, b_vals, color="#2980b9", alpha=0.85)
+    ax_bar.set_yticks(y_pos)
+    ax_bar.set_yticklabels(b_names, fontsize=9, fontweight="bold")
+    ax_bar.invert_yaxis()
+    ax_bar.set_title("Xếp hạng Final Total Loss (Thấp hơn = Tốt hơn)", fontsize=11, fontweight="bold")
+    ax_bar.set_xlabel("Total Loss at Final Step", fontsize=9.5, fontweight="bold")
+    ax_bar.grid(axis="x", linestyle="--", alpha=0.4)
+    max_val = max(b_vals) if b_vals else 1.0
+    for bar, val in zip(bars, b_vals):
+        ax_bar.text(val + 0.01 * max_val, bar.get_y() + bar.get_height() / 2, f"{val:.3f}", va="center", fontsize=8, fontweight="bold")
+
+    # Legend dùng chung cho toàn bộ biểu đồ
+    handles, labels = axes[0, 0].get_legend_handles_labels()
+    if handles:
+        fig.legend(
+            handles,
+            labels,
+            loc="upper center",
+            bbox_to_anchor=(0.5, 1.015),
+            ncol=min(len(names), 9),
+            fontsize=9,
+            frameon=True,
+            title="Kiến trúc Backbone (Đường Loss theo Step)",
+            title_fontsize=10,
+        )
+
+    plt.tight_layout(rect=[0, 0, 1, 0.96])
+    plt.savefig(loss_chart_path, dpi=160, bbox_inches="tight")
+    plt.close()
+    return loss_csv_path, loss_chart_path
 
 
 def save_visual_comparison(
@@ -1748,6 +1969,9 @@ def save_visual_comparison(
         names, vis_packs, "pairwise_cos_sep_slots", pair_slots_csv_path, pair_slots_hm_path, "Final Slots (P3+P4+P5)"
     )
 
+    # 6. Lưu CSV lịch sử Loss mỗi step & Biểu đồ đường loss so sánh tất cả các model
+    loss_csv_path, loss_chart_path = _save_loss_history_and_charts(names, vis_packs, out_dir)
+
     print("\n[+] Đã lưu kết quả benchmark tại:")
     print(f"    1. Bảng CSV tổng hợp (P3,P4,P5,Slots) : {os.path.abspath(csv_path)}")
     print(f"    2. Bảng CSV chuyên biệt Final Slots    : {os.path.abspath(slots_csv_path)}")
@@ -1758,6 +1982,8 @@ def save_visual_comparison(
     print(f"    7. CSV Cosine Sep 45 cặp (P4)          : {os.path.abspath(pair_p4_csv_path)} (+ heatmap: {os.path.abspath(pair_p4_hm_path)})")
     print(f"    8. CSV Cosine Sep 45 cặp (P5)          : {os.path.abspath(pair_p5_csv_path)} (+ heatmap: {os.path.abspath(pair_p5_hm_path)})")
     print(f"    9. CSV Cosine Sep 45 cặp (Final Slots) : {os.path.abspath(pair_slots_csv_path)} (+ heatmap: {os.path.abspath(pair_slots_hm_path)})")
+    print(f"   10. CSV Lịch sử Loss (mỗi 100 step)    : {os.path.abspath(loss_csv_path)}")
+    print(f"   11. Biểu đồ đường Loss tất cả model    : {os.path.abspath(loss_chart_path)}")
 
 
 def main():
@@ -1775,8 +2001,11 @@ def main():
     parser.add_argument("--size", type=int, default=384, help="Kích thước ảnh (khuyên dùng 384, chia hết 32 & 6)")
     parser.add_argument("--epochs", type=int, default=15, help="Số epoch train mỗi kiến trúc")
     parser.add_argument("--batch-size", type=int, default=8)
-    parser.add_argument("--num-workers", type=int, default=4, help="Số worker đọc LMDB song song")
+    parser.add_argument("--num-workers", type=int, default=2, help="Số worker đọc LMDB song song (khuyên dùng 2 trên Windows)")
     parser.add_argument("--lr", type=float, default=1e-3)
+    parser.add_argument("--w-cls-attn", type=float, default=0.5, help="Trọng số Per-Class Attention Loss (Dice + Pos CE)")
+    parser.add_argument("--w-ortho", type=float, default=0.1, help="Trọng số Slot Orthogonality / Diversity Loss")
+    parser.add_argument("--loss-log-step", type=int, default=100, help="Khoảng cách số step ghi log loss (mặc định: 100 step)")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--device", type=str, default="cuda")
     parser.add_argument("--cpu", action="store_true", help="Chạy trên CPU")
@@ -1838,6 +2067,9 @@ def main():
                 epochs=args.epochs,
                 lr=args.lr,
                 seed=run_seed,
+                w_cls_attn=args.w_cls_attn,
+                w_ortho=args.w_ortho,
+                loss_log_interval=args.loss_log_step,
             )
             results.append(metrics)
             vis_packs[bname] = vpack
