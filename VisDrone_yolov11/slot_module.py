@@ -54,7 +54,7 @@ class LightweightSlotAttention(nn.Module):
     while keeping full slot-level FFN and class-supervised attention dynamics.
     """
 
-    def __init__(self, dim: int = 32, num_classes: int = 10, eps: float = 1e-8):
+    def __init__(self, dim: int = 32, num_classes: int = 10, eps: float = 1e-8, slot_dropout: float = 0.1):
         super().__init__()
         self.dim = dim
         self.num_classes = num_classes
@@ -72,6 +72,7 @@ class LightweightSlotAttention(nn.Module):
         self.to_v = nn.Linear(dim, dim)
 
         self.fc1 = nn.Linear(dim, dim * 2)
+        self.dropout = nn.Dropout(slot_dropout)
         self.fc2 = nn.Linear(dim * 2, dim)
 
     def forward(
@@ -107,7 +108,7 @@ class LightweightSlotAttention(nn.Module):
         attn_norm = attn_eps / attn_eps.sum(dim=-1, keepdim=True).clamp(min=self.eps)
 
         slots = torch.einsum("bnd,bsn->bsd", v.float(), attn_norm).to(dtype=v.dtype)
-        slots = slots + self.fc2(F.silu(self.fc1(self.norm_pre_ff(slots))))
+        slots = slots + self.fc2(self.dropout(F.silu(self.fc1(self.norm_pre_ff(slots)))))
         return slots, attn_ori, dots
 
 
@@ -130,6 +131,7 @@ class PostNeckSlotFiLMRefiner(nn.Module):
         use_bg_slot_write: bool = False,
         use_logit_prior: bool = True,
         use_checkpoint: bool = False,
+        slot_dropout: float = 0.1,
     ):
         super().__init__()
         assert slot_dim % 2 == 0, f"slot_dim must be even for 2D Sine PosEmb, got {slot_dim}"
@@ -156,7 +158,12 @@ class PostNeckSlotFiLMRefiner(nn.Module):
         self.pos_emb = PositionEmbeddingSine(num_pos_feats=slot_dim // 2)
         self.level_embed = nn.Parameter(torch.randn(len(in_channels), slot_dim) * 0.02)
 
-        self.slot_attention = LightweightSlotAttention(dim=slot_dim, num_classes=num_classes)
+        self.slot_attention = LightweightSlotAttention(
+            dim=slot_dim,
+            num_classes=num_classes,
+            slot_dropout=slot_dropout,
+        )
+        self.slot_drop = nn.Dropout2d(slot_dropout)
 
         # Zero-initialized FiLM or Residual projections back to each scale's channel dim
         if fusion_mode == "film":
@@ -233,6 +240,7 @@ class PostNeckSlotFiLMRefiner(nn.Module):
             for i, (f, (h, w), n_i) in enumerate(zip(feats_f, resolutions, counts)):
                 slot_map_i = slot_broadcast[:, :, offset : offset + n_i].view(bs, self.slot_dim, h, w)
                 offset += n_i
+                slot_map_i = self.slot_drop(slot_map_i)
 
                 if self.fusion_mode == "film":
                     delta_gamma, delta_beta = self.modulators[i](slot_map_i).chunk(2, dim=1)
@@ -442,13 +450,18 @@ class SlotAuxiliaryLoss(nn.Module):
                 dice = 1.0 - (2.0 * inter + 1.0) / (card + 1.0)
                 loss_dice = dice[active].mean()
 
-                pos_pixels = (cls_mask > 0.5) & active.unsqueeze(-1)
-                if pos_pixels.any():
+                # Class-balanced Positive CE: average per active class first so rare classes
+                # (bicycle, tricycle, awning-tricycle) are not drowned out by car/pedestrian pixels
+                pos_m = (cls_mask > 0.5).float()  # (B, K, N)
+                pos_cnt = pos_m.sum(dim=-1)       # (B, K)
+                valid_pos_cls = active & (pos_cnt > 0)
+                if valid_pos_cls.any():
                     if dots_f is not None:
-                        log_p_cls = F.log_softmax(dots_f, dim=1)[:, : self.num_classes, :]
-                        loss_pos = -log_p_cls[pos_pixels].mean()
+                        neg_log_p = -F.log_softmax(dots_f, dim=1)[:, : self.num_classes, :]
                     else:
-                        loss_pos = -torch.log(p_cls[pos_pixels]).mean()
+                        neg_log_p = -torch.log(p_cls)
+                    per_cls_pos_ce = (neg_log_p * pos_m).sum(dim=-1) / pos_cnt.clamp(min=1.0)
+                    loss_pos = per_cls_pos_ce[valid_pos_cls].mean()
                 else:
                     loss_pos = torch.tensor(0.0, device=device)
 

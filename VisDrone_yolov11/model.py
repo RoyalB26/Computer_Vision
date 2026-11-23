@@ -398,8 +398,9 @@ class VisDroneYOLO11Slot(VisDroneYOLO11):
         fusion_mode: str = "film",
         use_bg_slot_write: bool = False,
         use_logit_prior: bool = False,
-        assigner_prior_weight: float = 0.25,
+        assigner_prior_weight: float = 0.0,
         use_slot_checkpoint: bool = False,
+        slot_dropout: float = 0.1,
         slot_loss_weight: float = 0.3,
         bg_attn_weight: float = 0.5,
         fg_attn_weight: float = 0.5,
@@ -430,6 +431,7 @@ class VisDroneYOLO11Slot(VisDroneYOLO11):
             use_bg_slot_write=use_bg_slot_write,
             use_logit_prior=use_logit_prior,
             use_checkpoint=use_slot_checkpoint,
+            slot_dropout=slot_dropout,
         )
         self.slot_criterion = SlotAuxiliaryLoss(
             num_classes=num_classes,

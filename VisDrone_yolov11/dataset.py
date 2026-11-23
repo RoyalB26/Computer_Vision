@@ -7,6 +7,7 @@ from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 import numpy as np
 from PIL import Image
 import torch
+import torch.nn.functional as F
 
 from BaseModel.core import DATASETS
 from BaseModel.dataset import BaseDataset, open_lmdb
@@ -57,6 +58,7 @@ class VisDroneLMDBDataset(BaseDataset):
         include_boxes: bool = True,
         cache_images: Optional[str] = None,   # None | "ram" (shared uint8 tensor) | "jpeg" (compressed bytes)
         cache_size: Optional[Tuple[int, int]] = None,
+        augment: bool = False,                # Fast tensor augmentation (HFlip + ColorJitter + Scale/Crop)
         **kwargs,
     ):
         self.split = split.lower()
@@ -67,6 +69,7 @@ class VisDroneLMDBDataset(BaseDataset):
         self.include_boxes = include_boxes
         self.cache_images = cache_images.lower() if isinstance(cache_images, str) else None
         self.cache_size = tuple(cache_size) if cache_size is not None else self._infer_resize_from_pipeline(pipeline)
+        self.augment = bool(augment) and (self.split == "train") and (not test_mode)
         self.env = None
         self.txn = None
         self.bg_env = None
@@ -391,8 +394,91 @@ class VisDroneLMDBDataset(BaseDataset):
             return {"image": image, "target": target}
         return self._read_lmdb_sample(idx)
 
+    def _apply_tensor_augment(
+        self, img: torch.Tensor, target: Dict[str, Any]
+    ) -> Tuple[torch.Tensor, Dict[str, Any]]:
+        """Fast GPU/CPU-friendly tensor augmentation compatible with `cache_images='ram'`.
+
+        Applies:
+          1. RandomHorizontalFlip (p=0.5)
+          2. RandomScale + RandomCrop/Pad (p=0.5, scale in [0.8, 1.2])
+          3. Random ColorJitter: brightness, contrast, saturation (p=0.8)
+        """
+        _, h, w = img.shape
+        boxes = target.get("boxes", torch.empty((0, 4), dtype=torch.float32)).clone()
+        labels = target.get("labels", torch.empty((0,), dtype=torch.int64)).clone()
+
+        # 1. Random Horizontal Flip (p=0.5)
+        if random.random() < 0.5:
+            img = torch.flip(img, dims=[2])
+            if len(boxes) > 0:
+                boxes[:, 0] = (1.0 - boxes[:, 0]).clamp(0.0, 1.0)
+
+        # 2. Random Scale + Crop/Pad (p=0.5)
+        if random.random() < 0.5:
+            scale = random.uniform(0.8, 1.2)
+            nh, nw = max(32, int(round(h * scale))), max(32, int(round(w * scale)))
+            img_s = F.interpolate(img.unsqueeze(0), size=(nh, nw), mode="bilinear", align_corners=False).squeeze(0)
+
+            if scale >= 1.0:
+                # Random crop (h, w) from larger (nh, nw)
+                y0 = random.randint(0, nh - h)
+                x0 = random.randint(0, nw - w)
+                img = img_s[:, y0 : y0 + h, x0 : x0 + w]
+                if len(boxes) > 0:
+                    cx = (boxes[:, 0] * nw - x0) / w
+                    cy = (boxes[:, 1] * nh - y0) / h
+                    bw = boxes[:, 2] * (nw / w)
+                    bh = boxes[:, 3] * (nh / h)
+                    x1 = (cx - bw / 2.0).clamp(0.0, 1.0)
+                    y1 = (cy - bh / 2.0).clamp(0.0, 1.0)
+                    x2 = (cx + bw / 2.0).clamp(0.0, 1.0)
+                    y2 = (cy + bh / 2.0).clamp(0.0, 1.0)
+                    nbw, nbh = x2 - x1, y2 - y1
+                    keep = (nbw > (2.0 / w)) & (nbh > (2.0 / h))
+                    boxes = torch.stack([(x1 + x2) / 2.0, (y1 + y2) / 2.0, nbw, nbh], dim=-1)[keep]
+                    labels = labels[keep]
+            else:
+                # Random pad (nh, nw) into canvas (h, w) with neutral gray (0.447)
+                canvas = torch.full((3, h, w), 0.447, dtype=img.dtype)
+                y0 = random.randint(0, h - nh)
+                x0 = random.randint(0, w - nw)
+                canvas[:, y0 : y0 + nh, x0 : x0 + nw] = img_s
+                img = canvas
+                if len(boxes) > 0:
+                    cx = (boxes[:, 0] * nw + x0) / w
+                    cy = (boxes[:, 1] * nh + y0) / h
+                    bw = boxes[:, 2] * (nw / w)
+                    bh = boxes[:, 3] * (nh / h)
+                    boxes = torch.stack([cx, cy, bw, bh], dim=-1)
+
+        # 3. Random Photometric Jitter (p=0.8)
+        if random.random() < 0.8:
+            b_fac = random.uniform(0.8, 1.2)
+            c_fac = random.uniform(0.8, 1.2)
+            s_fac = random.uniform(0.8, 1.2)
+            img = img * b_fac
+            mean = img.mean(dim=(1, 2), keepdim=True)
+            img = (img - mean) * c_fac + mean
+            gray = 0.299 * img[0:1] + 0.587 * img[1:2] + 0.114 * img[2:3]
+            img = (gray + (img - gray) * s_fac).clamp_(0.0, 1.0)
+
+        counts = torch.zeros(self.num_classes, dtype=torch.float32)
+        if len(labels) > 0:
+            valid = labels[(labels >= 0) & (labels < self.num_classes)]
+            if len(valid) > 0:
+                counts = torch.bincount(valid, minlength=self.num_classes).float()
+
+        new_target: Dict[str, Any] = {
+            "_is_cxcywh": True,
+            "counts": counts,
+            "boxes": boxes,
+            "labels": labels,
+        }
+        return img, new_target
+
     def prepare_data(self, idx: int) -> Optional[Dict[str, Any]]:
-        """Fast path when resized uint8 images are cached in shared RAM."""
+        """Fast path when resized uint8 images are cached in shared RAM, with optional tensor augmentation."""
         if self._ram_images is not None and self._ram_targets is not None:
             img = self._ram_images[idx].to(dtype=torch.float32).div_(255.0)
             t_np = self._ram_targets[idx]
@@ -403,10 +489,18 @@ class VisDroneLMDBDataset(BaseDataset):
                 target["boxes"] = torch.from_numpy(t_np["boxes"])
             if "labels" in t_np:
                 target["labels"] = torch.from_numpy(t_np["labels"])
-            if "bg_mask" in t_np:
+            if "bg_mask" in t_np and not self.augment:
                 target["bg_mask"] = torch.from_numpy(t_np["bg_mask"])
+            if self.augment:
+                img, target = self._apply_tensor_augment(img, target)
             return {"image": img, "target": target}
-        return super().prepare_data(idx)
+
+        data = super().prepare_data(idx)
+        if data is not None and self.augment and isinstance(data.get("image"), torch.Tensor):
+            img, target = self._apply_tensor_augment(data["image"], data["target"])
+            data["image"] = img
+            data["target"] = target
+        return data
 
     def __getstate__(self):
         """Enable safe pickle serialization across multiprocessing DataLoader workers."""

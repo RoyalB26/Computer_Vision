@@ -42,7 +42,7 @@ model:
   suppress_weight: 0.05
   cls_attn_weight: 0.5
   ortho_weight: 0.1
-
+  slot_dropout: 0.1
 # 2. Dataset Configuration (Stratified Split synced with Visdrone/dataset.py)
 data:
   train:
