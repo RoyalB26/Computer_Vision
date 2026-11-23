@@ -98,15 +98,17 @@ class LightweightSlotAttention(nn.Module):
             slots = self.obj_queries.expand(inputs.shape[0], -1, -1)
 
         q = self.to_q(self.norm_slots(slots))
-        dots = torch.einsum("bsd,bnd->bsn", q, k) * self.scale
+        # Compute attention logits & softmax in float32 to prevent AMP fp16 overflow/NaN
+        dots = torch.einsum("bsd,bnd->bsn", q.float(), k.float()) * self.scale
+        dots = dots.clamp(-30.0, 30.0)
 
         attn_ori = dots.softmax(dim=1)
         attn_eps = attn_ori + self.eps
         attn_norm = attn_eps / attn_eps.sum(dim=-1, keepdim=True).clamp(min=self.eps)
 
-        slots = torch.einsum("bnd,bsn->bsd", v, attn_norm)
+        slots = torch.einsum("bnd,bsn->bsd", v.float(), attn_norm).to(dtype=v.dtype)
         slots = slots + self.fc2(F.silu(self.fc1(self.norm_pre_ff(slots))))
-        return slots, attn_ori, dots
+        return slots, attn_ori.to(dtype=v.dtype), dots.to(dtype=v.dtype)
 
 
 class PostNeckSlotFiLMRefiner(nn.Module):
@@ -361,10 +363,11 @@ class SlotAuxiliaryLoss(nn.Module):
             n4 = resolutions[1][0] * resolutions[1][1]
 
             def _balanced_multiscale_bce(pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
-                p = pred.clamp(1e-6, 1.0 - 1e-6)
-                l_p3 = F.binary_cross_entropy(p[..., :n3], target[..., :n3])
-                l_p4 = F.binary_cross_entropy(p[..., n3 : n3 + n4], target[..., n3 : n3 + n4])
-                l_p5 = F.binary_cross_entropy(p[..., n3 + n4 :], target[..., n3 + n4 :])
+                p = torch.nan_to_num(pred, nan=0.5, posinf=1.0, neginf=0.0).clamp(1e-6, 1.0 - 1e-6)
+                t = torch.nan_to_num(target, nan=0.0, posinf=1.0, neginf=0.0).clamp(0.0, 1.0)
+                l_p3 = F.binary_cross_entropy(p[..., :n3], t[..., :n3])
+                l_p4 = F.binary_cross_entropy(p[..., n3 : n3 + n4], t[..., n3 : n3 + n4])
+                l_p5 = F.binary_cross_entropy(p[..., n3 + n4 :], t[..., n3 + n4 :])
                 return (l_p3 + l_p4 + l_p5) / 3.0
 
             bg_mask, cls_mask, gt_counts = self._rasterize_masks_from_xyxy(
