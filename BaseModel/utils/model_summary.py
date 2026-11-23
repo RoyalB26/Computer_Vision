@@ -102,6 +102,13 @@ def _synthesize_dummy_input(model: nn.Module, cfg: Any, device: torch.device) ->
                             elif isinstance(img_s, int):
                                 height = width = img_s
                             has_explicit_hw = True
+                        elif p.get("type") == "Resize" and "size" in p:
+                            sz = p["size"]
+                            if isinstance(sz, (list, tuple)) and len(sz) >= 2:
+                                height, width = int(sz[0]), int(sz[1])
+                            elif isinstance(sz, int):
+                                height = width = int(sz)
+                            has_explicit_hw = True
                         elif "Action_Slot_Transform" in p.get("type", ""):
                             height, width = 256, 768
                             is_video = True
@@ -122,9 +129,16 @@ def _synthesize_dummy_input(model: nn.Module, cfg: Any, device: torch.device) ->
                 is_video = True
                 use_uint8 = True
 
-    # Check model class name hints
+    # Check model class name hints (avoid treating 2D image Slot models like VisDroneYOLO11Slot as 5D video)
     cls_name = model.__class__.__name__.lower()
-    if "slot" in cls_name or "video" in cls_name or "x3d" in cls_name or "i3d" in cls_name or "slowfast" in cls_name:
+    is_2d_image_hint = ("yolo" in cls_name) or ("visdrone" in cls_name)
+    if (
+        (not is_2d_image_hint and "slot" in cls_name)
+        or "video" in cls_name
+        or "x3d" in cls_name
+        or "i3d" in cls_name
+        or "slowfast" in cls_name
+    ):
         is_video = True
 
     if is_video:

@@ -17,7 +17,7 @@ root_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 if root_dir not in sys.path:
     sys.path.insert(0, root_dir)
 
-from VisDrone_yolov11.model import VisDroneYOLO11
+from VisDrone_yolov11.model import VisDroneYOLO11, VisDroneYOLO11Slot
 from VisDrone_yolov11.dataset import VISDRONE_CLASSES
 
 
@@ -63,11 +63,15 @@ def draw_detections(
         cls_id = int(labels[i])
 
         x1, y1, x2, y2 = box
-        # Clamp to image boundaries
-        x1 = max(0, min(orig_w - 1, x1))
-        y1 = max(0, min(orig_h - 1, y1))
-        x2 = max(0, min(orig_w - 1, x2))
-        y2 = max(0, min(orig_h - 1, y2))
+        # Ensure x1 <= x2, y1 <= y2 and clamp to image boundaries
+        x1, x2 = min(x1, x2), max(x1, x2)
+        y1, y2 = min(y1, y2), max(y1, y2)
+        x1 = max(0.0, min(float(orig_w - 1), x1))
+        y1 = max(0.0, min(float(orig_h - 1), y1))
+        x2 = max(0.0, min(float(orig_w - 1), x2))
+        y2 = max(0.0, min(float(orig_h - 1), y2))
+        if x2 <= x1 or y2 <= y1:
+            continue
 
         color = COLOR_PALETTE[cls_id % len(COLOR_PALETTE)]
         cls_name = class_names[cls_id] if cls_id < len(class_names) else f"class_{cls_id}"
@@ -131,17 +135,27 @@ def main():
     os.makedirs(args.out_dir, exist_ok=True)
 
     print(f"Initializing VisDrone YOLOv11 on device: {args.device}...")
-    model = VisDroneYOLO11(num_classes=10)
-    if os.path.exists(args.weights):
-        if args.weights.endswith(".pt"):
-            model.load_pretrained(args.weights)
-        elif args.weights.endswith(".pth"):
-            ckpt = torch.load(args.weights, map_location="cpu")
-            sd = ckpt.get("state_dict", ckpt)
-            model.load_state_dict(sd, strict=False)
-            print(f"Loaded weights from {args.weights}")
+    if os.path.exists(args.weights) and args.weights.endswith(".pth"):
+        ckpt = torch.load(args.weights, map_location="cpu", weights_only=False)
+        if isinstance(ckpt, dict):
+            sd = ckpt.get("model_state_dict") or ckpt.get("state_dict") or ckpt.get("model") or ckpt
+        else:
+            sd = ckpt
+        if hasattr(sd, "state_dict"):
+            sd = sd.state_dict()
+        has_slots = any(k.startswith("slot_refiner.") for k in sd.keys())
+        model = VisDroneYOLO11Slot(num_classes=10) if has_slots else VisDroneYOLO11(num_classes=10)
+        missing, unexpected = model.load_state_dict(sd, strict=False)
+        print(
+            f"Loaded {'VisDroneYOLO11Slot' if has_slots else 'VisDroneYOLO11'} weights from {args.weights} "
+            f"(missing: {len(missing)}, unexpected: {len(unexpected)})"
+        )
     else:
-        print(f"Notice: weights path {args.weights} not found. Running with initial weights.")
+        model = VisDroneYOLO11(num_classes=10)
+        if os.path.exists(args.weights) and args.weights.endswith(".pt"):
+            model.load_pretrained(args.weights)
+        elif not os.path.exists(args.weights):
+            print(f"Notice: weights path {args.weights} not found. Running with initial weights.")
 
     model.to(args.device)
     model.eval()

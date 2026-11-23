@@ -32,7 +32,7 @@ model:
   slot_dim: 32
   fusion_mode: "film"          # "film" (Method C) or "residual"
   use_bg_slot_write: false     # false = 10 fg slots only (natural bg gating), true = all 11 slots
-  use_logit_prior: true        # direct zero-init semantic logit residual added to Detect.cv3
+  use_logit_prior: false        # direct zero-init semantic logit residual added to Detect.cv3
   use_slot_checkpoint: false   # set true to further cut activation VRAM on small GPUs
   slot_loss_weight: 0.3        # auxiliary slot supervision multiplier
   bg_attn_weight: 0.5
