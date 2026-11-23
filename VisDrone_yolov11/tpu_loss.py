@@ -204,8 +204,9 @@ class TPUYOLOv11DetectionLoss(nn.Module):
             mask_gt=mask_gt,
         )
 
-        # Tensor normalizer (NO .item()!)
-        num_pos = fg_mask.sum().clamp(min=1.0)
+        # Ultralytics YOLOv11 TAL-weighted normalization (NO .item()!)
+        weight = target_scores.sum(dim=-1) * fg_mask  # (B, N)
+        target_scores_sum = target_scores.sum().clamp(min=1.0)
 
         # 2. Classification loss (Focal or standard YOLOv11 BCE when gamma=0, alpha<0)
         ce_loss = F.binary_cross_entropy_with_logits(pred_scores, target_scores, reduction="none")
@@ -216,13 +217,13 @@ class TPUYOLOv11DetectionLoss(nn.Module):
         if self.focal_alpha >= 0.0:
             alpha_t = self.focal_alpha * target_scores + (1.0 - self.focal_alpha) * (1.0 - target_scores)
             ce_loss = alpha_t * ce_loss
-        loss_focal = (ce_loss.sum() / num_pos) * self.cls_weight
+        loss_focal = (ce_loss.sum() / target_scores_sum) * self.cls_weight
 
-        # 3. DIoU loss over ALL anchors, masked by fg_mask (100% static shape!)
+        # 3. TAL-weighted DIoU loss over ALL anchors (100% static shape!)
         diou = box_diou(decoded_bboxes, target_bboxes, xywh=False)  # (B, N)
-        loss_diou = (((1.0 - diou) * fg_mask).sum() / num_pos) * self.box_weight
+        loss_diou = (((1.0 - diou) * weight).sum() / target_scores_sum) * self.box_weight
 
-        # 4. DFL loss over ALL anchors, masked by fg_mask (100% static shape!)
+        # 4. TAL-weighted DFL loss over ALL anchors (mean over 4 edges, 100% static shape!)
         ap_exp = anchor_points.unsqueeze(0).expand(bs, -1, -1)       # (B, N, 2)
         st_exp = stride_tensor.unsqueeze(0).expand(bs, -1, -1)       # (B, N, 1)
         lt = ap_exp - target_bboxes[:, :, :2]
@@ -238,8 +239,8 @@ class TPUYOLOv11DetectionLoss(nn.Module):
         dfl_raw = (
             F.cross_entropy(pred_dist_flat, tl.reshape(-1), reduction="none") * wl.reshape(-1)
             + F.cross_entropy(pred_dist_flat, tr.reshape(-1), reduction="none") * wr.reshape(-1)
-        ).view(bs, num_anchors, 4)
-        loss_dfl = ((dfl_raw * fg_mask.unsqueeze(-1)).sum() / num_pos) * self.dfl_weight
+        ).view(bs, num_anchors, 4).mean(dim=-1)  # (B, N)
+        loss_dfl = ((dfl_raw * weight).sum() / target_scores_sum) * self.dfl_weight
 
         total_loss = loss_focal + loss_diou + loss_dfl
         return {

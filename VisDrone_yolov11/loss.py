@@ -216,14 +216,17 @@ class DistributionFocalLoss(BaseLoss):
         pred_dist: torch.Tensor,
         target_dist: torch.Tensor,
         normalizer: Optional[float] = None,
+        weight: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        """Compute DFL.
+        """Compute DFL (Ultralytics-aligned mean over 4 edges with optional per-anchor TAL weight).
 
         Args:
             pred_dist: [N, 4, reg_max] predicted logits distribution.
             target_dist: [N, 4] continuous ground truth distance in stride units.
-            normalizer: Normalization scalar.
+            normalizer: Normalization scalar (e.g. target_scores_sum).
+            weight: Optional [N] per-anchor TAL quality weight.
         """
+        num_pos = target_dist.shape[0]
         target_dist = target_dist.clamp(0, self.reg_max - 1.01)
         tl = target_dist.long()           # left bin integer index
         tr = tl + 1                      # right bin integer index
@@ -239,7 +242,10 @@ class DistributionFocalLoss(BaseLoss):
         loss = (
             F.cross_entropy(pred_dist, tl, reduction="none") * wl
             + F.cross_entropy(pred_dist, tr, reduction="none") * wr
-        )
+        ).view(num_pos, 4).mean(dim=-1)  # [N], mean across 4 edges (Ultralytics standard)
+
+        if weight is not None:
+            loss = loss * weight
 
         if normalizer is not None and normalizer > 0:
             return (loss.sum() / normalizer) * self.loss_weight
@@ -448,7 +454,7 @@ class YOLOv11DetectionLoss(nn.Module):
         self.cls_weight = cls_weight
         self.dfl_weight = dfl_weight
 
-        self.diou_loss = DIoULoss(loss_weight=1.0, reduction="sum")
+        self.diou_loss = DIoULoss(loss_weight=1.0, reduction="none")
         self.focal_loss = SigmoidFocalLoss(loss_weight=1.0, alpha=focal_alpha, gamma=focal_gamma, reduction="sum")
         self.dfl_loss = DistributionFocalLoss(loss_weight=1.0, reg_max=reg_max)
         self.assigner = TaskAlignedAssigner(topk=10, num_classes=num_classes)
@@ -498,39 +504,42 @@ class YOLOv11DetectionLoss(nn.Module):
                 mask_gt=mask_gt,
             )
 
-            num_pos = max(float(fg_mask.sum().item()), 1.0)
+            # Ultralytics YOLOv11 normalization: weight box/DFL by per-anchor TAL quality `target_scores`
+            target_scores_sum = max(float(target_scores.sum().item()), 1.0)
 
-            # 1. Classification: Sigmoid Focal Loss across ALL anchors
+            # 1. Classification: Sigmoid Focal / BCE Loss across ALL anchors
             loss_focal = self.focal_loss(
                 pred_scores,
                 target_scores,
-                normalizer=num_pos,
+                normalizer=target_scores_sum,
             ) * self.cls_weight
 
-            # 2. Localization: DIoU Loss and DFL on FOREGROUND anchors
+            # 2. Localization: TAL-weighted DIoU Loss and DFL on FOREGROUND anchors
             if fg_mask.any():
                 pos_pred_bboxes = decoded_bboxes[fg_mask]
                 pos_target_bboxes = target_bboxes[fg_mask]
+                weight = target_scores.sum(dim=-1)[fg_mask]  # [num_pos]
 
-                # DIoU loss
-                loss_diou = self.diou_loss(
+                # Weighted DIoU loss (focuses gradient on high-quality center anchors)
+                diou_per_anchor = self.diou_loss(
                     pos_pred_bboxes,
                     pos_target_bboxes,
                     xywh=False,
-                ) / num_pos * self.box_weight
+                )
+                loss_diou = ((diou_per_anchor * weight).sum() / target_scores_sum) * self.box_weight
 
-                # DFL loss
+                # Weighted DFL loss (mean over 4 edges, weighted by TAL quality)
                 pos_anchor_points = anchor_points.unsqueeze(0).expand(bs, -1, -1)[fg_mask]
                 pos_stride = stride_tensor.unsqueeze(0).expand(bs, -1, -1)[fg_mask]
 
-                # Convert target xyxy to distance (ltrb) in stride units
                 target_ltrb = self._bbox2dist(pos_anchor_points, pos_target_bboxes) / pos_stride
                 pos_pred_dist = pred_dist[fg_mask].view(-1, 4, self.reg_max)
 
                 loss_dfl = self.dfl_loss(
                     pos_pred_dist,
                     target_ltrb,
-                    normalizer=num_pos,
+                    normalizer=target_scores_sum,
+                    weight=weight,
                 ) * self.dfl_weight
             else:
                 loss_diou = torch.tensor(0.0, device=device)

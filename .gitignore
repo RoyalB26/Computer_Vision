@@ -20,4 +20,6 @@ work_dirs/
 action_depth/
 *.mdb
 
+outputs/
+VisDrone_yolov11/output*/
 Visdrone/analysis

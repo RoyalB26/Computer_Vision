@@ -87,17 +87,20 @@ class VisDroneYOLO11(BaseModel):
         self._init_cls_bias(focal_gamma=focal_gamma)
 
     def _init_cls_bias(self, prior_prob: float = 0.01, focal_gamma: float = 2.0) -> None:
-        """Initialize Detect.cv3 final conv bias for stable BCE / Focal Loss."""
-        strides = self.net.head.stride.tolist()
-        for idx, branch in enumerate(self.net.head.cv3):
+        """Initialize Detect.cv3 final conv bias uniformly across P3, P4, P5.
+
+        Uses the same bias across all 3 scales so P3 (stride 8) is never suppressed 16x below P5
+        and receives positive anchors from Step 1 of Epoch 1 (eliminating P3 hibernation).
+        """
+        if focal_gamma <= 0.0:
+            # Uniform BCE prior (~0.0025 -> bias = -6.0): small initial loss_focal + instant P3 activation
+            bias_val = -6.0
+        else:
+            bias_val = -math.log((1.0 - prior_prob) / prior_prob)
+
+        for branch in self.net.head.cv3:
             last_conv = branch[-1]
             if isinstance(last_conv, nn.Conv2d) and last_conv.bias is not None:
-                if focal_gamma <= 0.0:
-                    s = strides[idx] if idx < len(strides) else 16.0
-                    # Ultralytics YOLOv8/11 formula: log(5 / nc / (640 / stride)^2)
-                    bias_val = math.log(5.0 / (self.num_classes * ((640.0 / s) ** 2)))
-                else:
-                    bias_val = -math.log((1.0 - prior_prob) / prior_prob)
                 nn.init.constant_(last_conv.bias, bias_val)
 
     def load_pretrained(self, weights_path: Union[str, Path]) -> Tuple[List[str], List[str]]:
