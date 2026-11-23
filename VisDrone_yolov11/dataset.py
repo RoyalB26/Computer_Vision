@@ -104,9 +104,15 @@ class VisDroneLMDBDataset(BaseDataset):
             for idx in range(n):
                 info = self._read_lmdb_sample(idx)
                 img_resized = info["image"].resize((w, h), Image.BILINEAR)
-                arr = np.asarray(img_resized, dtype=np.uint8)  # (H, W, 3)
+                arr = np.array(img_resized, dtype=np.uint8, copy=True)  # (H, W, 3) writable
                 buf[idx] = torch.from_numpy(arr).permute(2, 0, 1)
-                targets_cache.append(info["target"])
+                # Store targets as NumPy arrays (0 FDs) to avoid Python 3.13 forkserver `too many fds`
+                t = info["target"]
+                t_np: Dict[str, Any] = {"_is_cxcywh": t.get("_is_cxcywh", True)}
+                for k in ("counts", "boxes", "labels", "bg_mask"):
+                    if k in t:
+                        t_np[k] = t[k].numpy() if isinstance(t[k], torch.Tensor) else np.asarray(t[k])
+                targets_cache.append(t_np)
             self._ram_images = buf
             self._ram_targets = targets_cache
             print(f"[VisDroneLMDBDataset:{self.split}] RAM cache ready ({gb:.2f} GB shared memory).")
@@ -387,7 +393,17 @@ class VisDroneLMDBDataset(BaseDataset):
         """Fast path when resized uint8 images are cached in shared RAM."""
         if self._ram_images is not None and self._ram_targets is not None:
             img = self._ram_images[idx].to(dtype=torch.float32).div_(255.0)
-            return {"image": img, "target": self._ram_targets[idx]}
+            t_np = self._ram_targets[idx]
+            target: Dict[str, Any] = {"_is_cxcywh": t_np.get("_is_cxcywh", True)}
+            if "counts" in t_np:
+                target["counts"] = torch.from_numpy(t_np["counts"])
+            if "boxes" in t_np:
+                target["boxes"] = torch.from_numpy(t_np["boxes"])
+            if "labels" in t_np:
+                target["labels"] = torch.from_numpy(t_np["labels"])
+            if "bg_mask" in t_np:
+                target["bg_mask"] = torch.from_numpy(t_np["bg_mask"])
+            return {"image": img, "target": target}
         return super().prepare_data(idx)
 
     def __getstate__(self):
