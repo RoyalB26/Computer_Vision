@@ -193,52 +193,58 @@ class PostNeckSlotFiLMRefiner(nn.Module):
             slot_info: dict with 'slots', 'attn_ori', 'dots', 'resolutions', 'logit_prior'.
         """
         bs = feats[0].shape[0]
-        tokens_list = []
-        resolutions: List[Tuple[int, int]] = []
-        counts: List[int] = []
+        orig_dtype = feats[0].dtype
+        device = feats[0].device
 
-        for i, f in enumerate(feats):
-            h, w = f.shape[2], f.shape[3]
-            resolutions.append((h, w))
-            counts.append(h * w)
+        # Run entire Slot+FiLM refiner in float32 (only 2.85% of FLOPs) to prevent fp16 NaN/Inf overflow
+        with torch.amp.autocast(device_type=device.type, enabled=False):
+            feats_f = [f.float() for f in feats]
+            tokens_list = []
+            resolutions: List[Tuple[int, int]] = []
+            counts: List[int] = []
 
-            proj = self.proj_in[i](f)
-            proj = proj + self.pos_emb(proj)
-            tok = proj.flatten(2).transpose(1, 2) + self.level_embed[i]  # (B, H*W, D)
-            tokens_list.append(tok)
+            for i, f in enumerate(feats_f):
+                h, w = f.shape[2], f.shape[3]
+                resolutions.append((h, w))
+                counts.append(h * w)
 
-        tokens = torch.cat(tokens_list, dim=1)  # (B, N, D)
+                proj = self.proj_in[i](f)
+                proj = proj + self.pos_emb(proj)
+                tok = proj.flatten(2).transpose(1, 2) + self.level_embed[i]  # (B, H*W, D)
+                tokens_list.append(tok)
 
-        if self.use_checkpoint and self.training:
-            slots, attn_ori, dots = checkpoint(self.slot_attention, tokens, use_reentrant=False)
-        else:
-            slots, attn_ori, dots = self.slot_attention(tokens)
+            tokens = torch.cat(tokens_list, dim=1)  # (B, N, D)
 
-        # Write-back (Broadcast) using attn_ori (posterior over slots)
-        s_write = self.slot_attention.num_slots if self.use_bg_slot_write else self.num_classes
-        slot_broadcast = torch.einsum(
-            "bsd,bsn->bdn",
-            slots[:, :s_write, :].float(),
-            attn_ori[:, :s_write, :].float(),
-        ).to(dtype=feats[0].dtype)  # (B, D, N)
-
-        cls_feats: List[torch.Tensor] = []
-        offset = 0
-        for i, (f, (h, w), n_i) in enumerate(zip(feats, resolutions, counts)):
-            slot_map_i = slot_broadcast[:, :, offset : offset + n_i].view(bs, self.slot_dim, h, w)
-            offset += n_i
-
-            if self.fusion_mode == "film":
-                delta_gamma, delta_beta = self.modulators[i](slot_map_i).chunk(2, dim=1)
-                # Bound multiplicative FiLM scale to (0, 2) to prevent fp16/gradient explosion
-                f_cls = f * (1.0 + torch.tanh(delta_gamma)) + delta_beta
+            if self.use_checkpoint and self.training:
+                slots, attn_ori, dots = checkpoint(self.slot_attention, tokens, use_reentrant=False)
             else:
-                f_cls = f + self.modulators[i](slot_map_i)
-            cls_feats.append(f_cls)
+                slots, attn_ori, dots = self.slot_attention(tokens)
 
-        logit_prior = None
-        if self.logit_prior_scale is not None:
-            logit_prior = self.logit_prior_scale * dots[:, : self.num_classes, :]  # (B, K, N)
+            # Write-back (Broadcast) using attn_ori (posterior over slots)
+            s_write = self.slot_attention.num_slots if self.use_bg_slot_write else self.num_classes
+            slot_broadcast = torch.einsum(
+                "bsd,bsn->bdn",
+                slots[:, :s_write, :],
+                attn_ori[:, :s_write, :],
+            )  # (B, D, N)
+
+            cls_feats: List[torch.Tensor] = []
+            offset = 0
+            for i, (f, (h, w), n_i) in enumerate(zip(feats_f, resolutions, counts)):
+                slot_map_i = slot_broadcast[:, :, offset : offset + n_i].view(bs, self.slot_dim, h, w)
+                offset += n_i
+
+                if self.fusion_mode == "film":
+                    delta_gamma, delta_beta = self.modulators[i](slot_map_i).chunk(2, dim=1)
+                    # Bound multiplicative FiLM scale to (0, 2) to prevent gradient explosion
+                    f_cls = f * (1.0 + torch.tanh(delta_gamma)) + delta_beta
+                else:
+                    f_cls = f + self.modulators[i](slot_map_i)
+                cls_feats.append(f_cls.to(dtype=orig_dtype))
+
+            logit_prior = None
+            if self.logit_prior_scale is not None:
+                logit_prior = self.logit_prior_scale * dots[:, : self.num_classes, :]  # (B, K, N)
 
         slot_info = {
             "slots": slots,

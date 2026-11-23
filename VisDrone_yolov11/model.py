@@ -80,16 +80,24 @@ class VisDroneYOLO11(BaseModel):
         if pretrained:
             self.load_pretrained(pretrained)
 
-        # Initialize classification head bias with Focal Loss prior (p=0.01 -> b ≈ -4.595)
-        # Prevents initial loss_focal explosion (~16,000+) when cv3 final conv is randomly initialized
-        self._init_cls_bias(prior_prob=0.01)
+        # Initialize classification head bias properly:
+        # - For standard YOLOv11 BCE (focal_gamma == 0): Ultralytics per-stride prior (~ -7.5 to -9.5)
+        #   so Epoch 1 loss_focal starts around ~5-20 instead of 40,000+!
+        # - For RetinaNet Focal Loss (focal_gamma > 0): prior_prob = 0.01 (~ -4.595)
+        self._init_cls_bias(focal_gamma=focal_gamma)
 
-    def _init_cls_bias(self, prior_prob: float = 0.01) -> None:
-        """Initialize Detect.cv3 final conv bias for stable Sigmoid Focal Loss."""
-        bias_val = -math.log((1.0 - prior_prob) / prior_prob)
-        for branch in self.net.head.cv3:
+    def _init_cls_bias(self, prior_prob: float = 0.01, focal_gamma: float = 2.0) -> None:
+        """Initialize Detect.cv3 final conv bias for stable BCE / Focal Loss."""
+        strides = self.net.head.stride.tolist()
+        for idx, branch in enumerate(self.net.head.cv3):
             last_conv = branch[-1]
             if isinstance(last_conv, nn.Conv2d) and last_conv.bias is not None:
+                if focal_gamma <= 0.0:
+                    s = strides[idx] if idx < len(strides) else 16.0
+                    # Ultralytics YOLOv8/11 formula: log(5 / nc / (640 / stride)^2)
+                    bias_val = math.log(5.0 / (self.num_classes * ((640.0 / s) ** 2)))
+                else:
+                    bias_val = -math.log((1.0 - prior_prob) / prior_prob)
                 nn.init.constant_(last_conv.bias, bias_val)
 
     def load_pretrained(self, weights_path: Union[str, Path]) -> Tuple[List[str], List[str]]:
