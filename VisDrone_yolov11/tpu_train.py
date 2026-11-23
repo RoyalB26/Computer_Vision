@@ -28,12 +28,20 @@ from .metrics import VisDroneMAP
 from .tpu_loss import TPUSlotAuxiliaryLoss, TPUYOLOv11DetectionLoss
 
 
-def _has_torch_xla() -> bool:
+def _detect_tpu_backend() -> str:
+    """Detect available TPU backend: 'torch_tpu' (Colab PrivateUse1), 'torch_xla', or 'fallback'."""
+    try:
+        import torch_tpu  # noqa: F401
+        if hasattr(torch, "tpu") and torch.tpu.is_available():
+            return "torch_tpu"
+    except Exception:
+        pass
     try:
         import torch_xla  # noqa: F401
-        return True
-    except ImportError:
-        return False
+        return "torch_xla"
+    except Exception:
+        pass
+    return "fallback"
 
 
 class TPUVisDroneCollate:
@@ -240,7 +248,10 @@ def _extract_img_size(ds_cfg: Dict[str, Any]) -> Tuple[int, int]:
     return (960, 960)
 
 
-def _train_worker(rank: int, cfg: Dict[str, Any], max_gt: int, use_xla: bool) -> None:
+def _train_worker(rank: int, cfg: Dict[str, Any], max_gt: int, backend: str) -> None:
+    use_xla = backend == "torch_xla"
+    use_torch_tpu = backend == "torch_tpu"
+
     if use_xla:
         import torch_xla.core.xla_model as xm
         import torch_xla.distributed.parallel_loader as pl
@@ -249,6 +260,11 @@ def _train_worker(rank: int, cfg: Dict[str, Any], max_gt: int, use_xla: bool) ->
         world_size = xm.xrt_world_size()
         is_master = xm.is_master_ordinal()
         log_fn = xm.master_print
+    elif use_torch_tpu:
+        device = torch.device("tpu")
+        world_size = 1
+        is_master = True
+        log_fn = print
     else:
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         world_size = 1
@@ -258,7 +274,7 @@ def _train_worker(rank: int, cfg: Dict[str, Any], max_gt: int, use_xla: bool) ->
     work_dir = Path(cfg.get("work_dir", "./work_dirs/visdrone_yolov11_tpu"))
     if is_master:
         work_dir.mkdir(parents=True, exist_ok=True)
-    log_fn(f"[TPU Trainer] Device: {device} | World size: {world_size} | max_gt: {max_gt}")
+    log_fn(f"[TPU Trainer] Backend: {backend} | Device: {device} | World size: {world_size} | max_gt: {max_gt}")
 
     # 1. Build model & wrap with static-shape TPU losses
     base_model = MODELS.build(cfg["model"])
@@ -279,6 +295,14 @@ def _train_worker(rank: int, cfg: Dict[str, Any], max_gt: int, use_xla: bool) ->
         build_slot_masks=wrapper.has_slots,
     )
 
+    # On `torch_tpu` (PrivateUse1 PjRt), DataLoader multiprocessing workers trigger
+    # `torch.manual_seed` -> `torch_tpu.manual_seed_all` -> "libtpu.so already in use".
+    # Force num_workers=0 to avoid PjRt lock conflicts.
+    train_workers = 0 if use_torch_tpu else train_data_cfg.get("num_workers", 4)
+    val_workers = 0 if use_torch_tpu else val_data_cfg.get("num_workers", 2)
+    if use_torch_tpu and (train_data_cfg.get("num_workers", 0) > 0 or val_data_cfg.get("num_workers", 0) > 0):
+        log_fn("[TPU Trainer] `torch_tpu` detected: setting DataLoader num_workers=0 to prevent PjRt lock conflict.")
+
     train_sampler = (
         DistributedSampler(train_ds, num_replicas=world_size, rank=rank, shuffle=True, drop_last=True)
         if world_size > 1
@@ -289,7 +313,7 @@ def _train_worker(rank: int, cfg: Dict[str, Any], max_gt: int, use_xla: bool) ->
         batch_size=train_data_cfg.get("batch_size", 16),
         shuffle=(train_sampler is None),
         sampler=train_sampler,
-        num_workers=train_data_cfg.get("num_workers", 4),
+        num_workers=train_workers,
         collate_fn=collate_fn,
         drop_last=True,  # Critical for TPU static batch shape
         pin_memory=False,
@@ -298,7 +322,7 @@ def _train_worker(rank: int, cfg: Dict[str, Any], max_gt: int, use_xla: bool) ->
         val_ds,
         batch_size=val_data_cfg.get("batch_size", 16),
         shuffle=False,
-        num_workers=val_data_cfg.get("num_workers", 2),
+        num_workers=val_workers,
         collate_fn=lambda b: (torch.stack([x[0] for x in b], dim=0), [x[1] for x in b]),
         drop_last=False,
     )
@@ -314,7 +338,8 @@ def _train_worker(rank: int, cfg: Dict[str, Any], max_gt: int, use_xla: bool) ->
     max_epochs = int(train_cfg.get("max_epochs", 100))
     val_interval = int(train_cfg.get("val_interval", 10))
     grad_clip = float(train_cfg.get("grad_clip", 10.0))
-    use_bf16 = bool(train_cfg.get("use_amp", True)) and use_xla
+    use_bf16 = bool(train_cfg.get("use_amp", True)) and (use_xla or use_torch_tpu)
+    autocast_device = "xla" if use_xla else "tpu"
     log_interval = int(train_cfg.get("log_interval", 50))
 
     sched_cfg = cfg.get("lr_scheduler", {})
@@ -342,7 +367,7 @@ def _train_worker(rank: int, cfg: Dict[str, Any], max_gt: int, use_xla: bool) ->
 
             optimizer.zero_grad(set_to_none=True)
             if use_bf16:
-                with torch.amp.autocast("xla", dtype=torch.bfloat16):
+                with torch.amp.autocast(autocast_device, dtype=torch.bfloat16):
                     out = wrapper(batch)
                     loss = out["loss"]
             else:
@@ -394,22 +419,22 @@ def _train_worker(rank: int, cfg: Dict[str, Any], max_gt: int, use_xla: bool) ->
 
 
 def main(argv: Optional[List[str]] = None) -> None:
-    parser = argparse.ArgumentParser(description="TPU/XLA Trainer for VisDrone YOLOv11")
+    parser = argparse.ArgumentParser(description="TPU Trainer for VisDrone YOLOv11 (torch_tpu & torch_xla)")
     parser.add_argument("--config", type=str, required=True, help="Path to YAML config file")
-    parser.add_argument("--tpu", action="store_true", help="Enable TPU/XLA static-shape training mode")
-    parser.add_argument("--tpu-cores", type=int, default=8, help="Number of TPU cores (e.g. 8 for v3-8, 1 for single-core)")
+    parser.add_argument("--tpu", action="store_true", help="Enable TPU static-shape training mode")
+    parser.add_argument("--tpu-cores", type=int, default=8, help="Number of TPU cores (torch_xla multi-core)")
     parser.add_argument("--max-gt", type=int, default=300, help="Fixed static GT padding length per image")
     args, _ = parser.parse_known_args(argv)
 
     with open(args.config, "r", encoding="utf-8") as f:
         cfg = yaml.safe_load(f)
 
-    use_xla = _has_torch_xla()
-    if use_xla and args.tpu_cores > 1:
+    backend = _detect_tpu_backend()
+    if backend == "torch_xla" and args.tpu_cores > 1:
         import torch_xla.distributed.xla_multiprocessing as xmp
 
-        xmp.spawn(_train_worker, args=(cfg, args.max_gt, True), nprocs=args.tpu_cores, start_method="fork")
+        xmp.spawn(_train_worker, args=(cfg, args.max_gt, backend), nprocs=args.tpu_cores, start_method="fork")
     else:
-        if not use_xla:
-            print("[TPU Trainer] Warning: `torch_xla` not found. Running static-shape TPU pipeline on local CUDA/CPU.")
-        _train_worker(0, cfg, args.max_gt, use_xla)
+        if backend == "fallback":
+            print("[TPU Trainer] Warning: Neither `torch_tpu` nor `torch_xla` found. Running static-shape pipeline on local CUDA/CPU.")
+        _train_worker(0, cfg, args.max_gt, backend)
