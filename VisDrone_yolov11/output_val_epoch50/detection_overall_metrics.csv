@@ -1,2 +1,2 @@
 mAP50,mAP50_95,precision_c25,recall_c25,f1_c25,total_gt,active_classes,mAP50_95_small,mAP50_95_medium,mAP50_95_large,latency_ms,fps,total_eval_sec,params_total_m,params_backbone_m,params_neck_m,params_head_m,head_share_p3_pct,head_share_p4_pct,head_share_p5_pct
-0.25439,0.13492,0.57681,0.21051,0.30845,11581,10,0.07105,0.22607,0.0,44.06679,22.69283,145.69632,2.6439,1.36547,0.7937,0.43262,80.80603,15.89213,3.30184
+0.26689,0.14384,0.59159,0.21152,0.31163,5830,10,0.08534,0.25796,0.0,50.99078,19.61139,85.42307,2.6439,1.36547,0.7937,0.43262,80.57162,16.06252,3.36586

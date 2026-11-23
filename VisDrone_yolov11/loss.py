@@ -479,6 +479,7 @@ class YOLOv11DetectionLoss(nn.Module):
         with torch.amp.autocast(device_type=device.type, enabled=False):
             pred_dist = preds["boxes"].transpose(1, 2).float()  # [B, N, 4*reg_max]
             pred_scores = preds["scores"].transpose(1, 2).float()  # [B, N, nc]
+            assign_scores = preds.get("assign_scores", preds["scores"]).transpose(1, 2).float()  # [B, N, nc]
             decoded_bboxes = decoded_bboxes.float()
             anchor_points = anchor_points.float()
             stride_tensor = stride_tensor.float()
@@ -487,9 +488,9 @@ class YOLOv11DetectionLoss(nn.Module):
             # Format targets into padded tensors [B, max_gt, 4] and [B, max_gt, 1]
             gt_bboxes, gt_labels, mask_gt = self._prepare_targets(targets, img_size, device)
 
-            # Dynamic target assignment
+            # Dynamic target assignment (can use decoupled slot-guided assign_scores)
             target_bboxes, target_scores, fg_mask = self.assigner(
-                pred_scores=pred_scores.sigmoid(),
+                pred_scores=assign_scores.sigmoid(),
                 pred_bboxes=decoded_bboxes,
                 anchor_points=anchor_points,
                 gt_labels=gt_labels,

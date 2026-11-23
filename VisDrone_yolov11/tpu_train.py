@@ -208,6 +208,10 @@ class TPUYOLO11Wrapper(nn.Module):
             slot_info = None
 
         preds = {"boxes": boxes_raw, "scores": scores_raw}
+        if self.has_slots and getattr(self.model, "assigner_prior_weight", 0.0) > 0 and slot_info is not None and "dots" in slot_info:
+            preds["assign_scores"] = (
+                scores_raw + self.model.assigner_prior_weight * slot_info["dots"][:, : self.model.num_classes, :].detach()
+            )
         a_raw, s_raw = make_anchors(feats, self.model.net.head.stride, 0.5)
         anchors, strides = (a.transpose(0, 1).to(images.device) for a in (a_raw, s_raw))
 

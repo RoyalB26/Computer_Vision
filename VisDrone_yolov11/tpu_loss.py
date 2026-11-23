@@ -187,6 +187,7 @@ class TPUYOLOv11DetectionLoss(nn.Module):
     ) -> Dict[str, torch.Tensor]:
         pred_dist = preds["boxes"].transpose(1, 2).float()      # (B, N, 4*reg_max)
         pred_scores = preds["scores"].transpose(1, 2).float()   # (B, N, C)
+        assign_scores = preds.get("assign_scores", preds["scores"]).transpose(1, 2).float()
         decoded_bboxes = decoded_bboxes.float()                 # (B, N, 4)
         anchor_points = anchor_points.float()                   # (N, 2)
         stride_tensor = stride_tensor.float()                   # (N, 1)
@@ -195,7 +196,7 @@ class TPUYOLOv11DetectionLoss(nn.Module):
 
         # 1. Static vectorized assignment
         target_bboxes, target_scores, fg_mask = self.assigner(
-            pred_scores=pred_scores.sigmoid(),
+            pred_scores=assign_scores.sigmoid(),
             pred_bboxes=decoded_bboxes,
             anchor_points=anchor_points,
             gt_labels=gt_labels,

@@ -386,7 +386,8 @@ class VisDroneYOLO11Slot(VisDroneYOLO11):
         slot_dim: int = 32,
         fusion_mode: str = "film",
         use_bg_slot_write: bool = False,
-        use_logit_prior: bool = True,
+        use_logit_prior: bool = False,
+        assigner_prior_weight: float = 0.25,
         use_slot_checkpoint: bool = False,
         slot_loss_weight: float = 0.3,
         bg_attn_weight: float = 0.5,
@@ -408,6 +409,7 @@ class VisDroneYOLO11Slot(VisDroneYOLO11):
             max_det=max_det,
         )
         self.slot_loss_weight = float(slot_loss_weight)
+        self.assigner_prior_weight = float(assigner_prior_weight)
 
         self.slot_refiner = PostNeckSlotFiLMRefiner(
             in_channels=(64, 128, 256),
@@ -463,6 +465,12 @@ class VisDroneYOLO11Slot(VisDroneYOLO11):
         """Training forward pass computing YOLOv11 detection loss + Slot auxiliary loss."""
         feats, boxes_raw, scores_raw, slot_info = self._forward_head_with_slots(inputs)
         preds = {"boxes": boxes_raw, "scores": scores_raw, "feats": feats}
+        if self.assigner_prior_weight > 0 and "dots" in slot_info:
+            # Decoupled Slot-Guided Assignment: guides TAL for fast box learning
+            # while keeping `scores` (loss_focal / cv3) clean from logit co-adaptation.
+            preds["assign_scores"] = (
+                scores_raw + self.assigner_prior_weight * slot_info["dots"][:, : self.num_classes, :].detach()
+            )
 
         # Decode bounding boxes for Task-Aligned Assignment
         a_raw, s_raw = make_anchors(feats, self.net.head.stride, 0.5)

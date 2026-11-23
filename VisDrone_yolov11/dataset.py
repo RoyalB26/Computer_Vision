@@ -191,6 +191,7 @@ class VisDroneLMDBDataset(BaseDataset):
         cur_val_boxes = np.zeros(num_classes, dtype=np.float64)
         cur_val_pres = np.zeros(num_classes, dtype=np.float64)
         cur_val_count = 0
+        assigned_count = 0
 
         inv_box_target = 1.0 / np.maximum(target_val_boxes, 1.0)
         inv_pres_target = 1.0 / np.maximum(target_val_pres, 1.0)
@@ -205,7 +206,8 @@ class VisDroneLMDBDataset(BaseDataset):
 
             for idx in cand_indices:
                 assigned[idx] = True
-                rem_total = total - int(assigned.sum())
+                assigned_count += 1
+                rem_total = total - assigned_count
                 rem_val_needed = n_val - cur_val_count
 
                 if rem_val_needed <= 0:

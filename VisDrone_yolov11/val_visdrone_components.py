@@ -33,6 +33,7 @@ import torchvision.transforms.functional as TF
 
 from VisDrone_yolov11.dataset import VISDRONE_CLASSES, VisDroneLMDBDataset
 from VisDrone_yolov11.model import VisDroneYOLO11, VisDroneYOLO11Slot
+from yolo.head import dist2bbox, make_anchors
 from yolo.val_coco_components import (
     COMPONENT_ORDER as BASE_COMPONENT_ORDER,
     YOLOv11ComponentProbe,
@@ -172,6 +173,7 @@ def _generate_visdrone_dashboard(
     comp_rows: List[Dict[str, object]],
     overall_det: Dict[str, float],
     slot_summary: Optional[Dict[str, float]],
+    box_diag: Optional[Dict[str, float]] = None,
 ) -> None:
     comp_headers = "".join(f"<th>{html.escape(k)}</th>" for k in comp_rows[0].keys())
     comp_body = "".join(
@@ -186,6 +188,14 @@ def _generate_visdrone_dashboard(
             for k, v in slot_summary.items()
         )
         slot_card = f"<h2>Slot+FiLM Diagnostics</h2><div class='kpi-grid'>{slot_items}</div>"
+
+    box_card = ""
+    if box_diag:
+        box_items = "".join(
+            f"<div class='kpi'><div class='lbl'>{html.escape(k)}</div><div class='val'>{v:.4f}</div></div>"
+            for k, v in box_diag.items()
+        )
+        box_card = f"<h2>Box Learning Mechanism Diagnostics (Boundary, TAL, DFL & Gradient Conflict)</h2><div class='kpi-grid'>{box_items}</div>"
 
     chart_files = [
         ("Component-by-Component Progression", "chart_01_component_progression.png"),
@@ -231,6 +241,7 @@ def _generate_visdrone_dashboard(
     <div class="kpi"><div class="lbl">Total Params</div><div class="val">{overall_det['params_total_m']:.2f}M</div></div>
   </div>
   {slot_card}
+  {box_card}
   <div class="card">
     <h2>Component-by-Component Breakdown</h2>
     <table><thead><tr>{comp_headers}</tr></thead><tbody>{comp_body}</tbody></table>
@@ -240,6 +251,224 @@ def _generate_visdrone_dashboard(
 </html>"""
     with open(os.path.join(out_dir, "dashboard.html"), "w", encoding="utf-8") as f:
         f.write(html_str)
+
+
+def _measure_box_spatial_metrics(
+    feat: torch.Tensor,
+    gt_lb_norm: np.ndarray,
+    imgsz: int,
+) -> Dict[str, float]:
+    """Measure Boundary Contrast & Intra-Box Spatial Decorrelation on a feature map (1, C, H, W)."""
+    f = feat[0].float()  # (C, H, W)
+    c, h, w = f.shape
+    device = f.device
+    if len(gt_lb_norm) == 0 or h < 3 or w < 3:
+        return {}
+
+    fg_m, _, _, _, _ = build_masks_at_res_gpu(gt_lb_norm, h, w, imgsz, device)
+    fg_2d = fg_m.view(1, 1, h, w).float()
+    if fg_2d.sum() < 4:
+        return {}
+
+    # 1. Spatial gradient magnitude ||grad_{x,y} F||
+    gx = torch.zeros_like(f)
+    gy = torch.zeros_like(f)
+    gx[:, :, :-1] = f[:, :, 1:] - f[:, :, :-1]
+    gy[:, :-1, :] = f[:, 1:, :] - f[:, :-1, :]
+    grad_mag = torch.sqrt(gx.pow(2).sum(dim=0) + gy.pow(2).sum(dim=0) + 1e-8)  # (H, W)
+
+    # Border mask = dilate(fg) - erode(fg)
+    dilated = F.max_pool2d(fg_2d, kernel_size=3, stride=1, padding=1)
+    eroded = 1.0 - F.max_pool2d(1.0 - fg_2d, kernel_size=3, stride=1, padding=1)
+    border_m = ((dilated - eroded) > 0.5).squeeze(0).squeeze(0)
+    interior_m = (eroded > 0.5).squeeze(0).squeeze(0)
+    if not interior_m.any():
+        interior_m = (fg_2d > 0.5).squeeze(0).squeeze(0)
+
+    out: Dict[str, float] = {}
+    if border_m.any() and interior_m.any():
+        out["boundary_contrast"] = float((grad_mag[border_m].mean() / (grad_mag[interior_m].mean() + 1e-8)).item())
+
+    # 2. Intra-Box Spatial Decorrelation: 1 - cos_sim between adjacent cells inside FG
+    fn = F.normalize(f, dim=0)
+    fg_bool = fg_m.view(h, w) > 0.5
+    pair_x = fg_bool[:, :-1] & fg_bool[:, 1:]
+    pair_y = fg_bool[:-1, :] & fg_bool[1:, :]
+    decorrs = []
+    if pair_x.any():
+        cos_x = (fn[:, :, :-1] * fn[:, :, 1:]).sum(dim=0)[pair_x]
+        decorrs.append(float((1.0 - cos_x).mean().item()))
+    if pair_y.any():
+        cos_y = (fn[:, :-1, :] * fn[:, 1:, :]).sum(dim=0)[pair_y]
+        decorrs.append(float((1.0 - cos_y).mean().item()))
+    if decorrs:
+        out["intra_box_decorr"] = float(np.mean(decorrs))
+
+    return out
+
+
+def _measure_tal_and_dfl_metrics(
+    model: torch.nn.Module,
+    feats: List[torch.Tensor],
+    boxes_raw: torch.Tensor,
+    scores_raw: torch.Tensor,
+    gt_xyxy: np.ndarray,
+    imgsz: int,
+    device: torch.device,
+) -> Dict[str, float]:
+    """Measure GT Assignment Coverage, Avg Pos/GT, DFL Clipping Rate, and DFL Entropy."""
+    if len(gt_xyxy) == 0:
+        return {}
+
+    reg_max = model.net.head.reg_max
+    a_raw, s_raw = make_anchors(feats, model.net.head.stride, 0.5)
+    anchors, strides = (a.transpose(0, 1).to(device) for a in (a_raw, s_raw))
+    anchor_points = (anchors * strides).transpose(0, 1).float()  # (N, 2)
+    stride_tensor = strides.transpose(0, 1).float()              # (N, 1)
+
+    pred_dist = model.net.head.dfl(boxes_raw)
+    decoded_xyxy = (dist2bbox(pred_dist, anchors.unsqueeze(0), xywh=False, dim=1) * strides).transpose(1, 2).float()
+
+    gt_boxes = torch.from_numpy(gt_xyxy[:, 1:5]).to(device=device, dtype=torch.float32)  # (M, 4)
+    gt_labels = torch.from_numpy(gt_xyxy[:, 0]).to(device=device, dtype=torch.long)      # (M,)
+    M = len(gt_boxes)
+
+    # Check geometric `is_in_box` coverage (how many GTs have >=1 anchor center inside)
+    lt = anchor_points.unsqueeze(0) - gt_boxes[:, :2].unsqueeze(1)  # (M, N, 2)
+    rb = gt_boxes[:, 2:].unsqueeze(1) - anchor_points.unsqueeze(0)  # (M, N, 2)
+    is_in_box = torch.cat([lt, rb], dim=-1).amin(dim=-1) > 0.0      # (M, N)
+    covered = is_in_box.any(dim=1)                                   # (M,)
+
+    areas = (gt_boxes[:, 2] - gt_boxes[:, 0]).clamp(min=0) * (gt_boxes[:, 3] - gt_boxes[:, 1]).clamp(min=0)
+    small_m = areas < (32.0 ** 2)
+
+    # Run actual TAL assigner
+    target_bboxes, _, fg_mask = model.criterion.assigner(
+        pred_scores=scores_raw.transpose(1, 2).float().sigmoid(),
+        pred_bboxes=decoded_xyxy,
+        anchor_points=anchor_points,
+        gt_labels=gt_labels.view(1, M, 1),
+        gt_bboxes=gt_boxes.view(1, M, 4),
+        mask_gt=torch.ones((1, M, 1), dtype=torch.bool, device=device),
+    )
+
+    out: Dict[str, float] = {
+        "gt_coverage_all_pct": float(covered.float().mean().item() * 100.0),
+        "avg_pos_per_gt": float(fg_mask.sum().item()) / max(M, 1),
+    }
+    if small_m.any():
+        out["gt_coverage_small_pct"] = float(covered[small_m].float().mean().item() * 100.0)
+
+    if fg_mask.any():
+        pos_ap = anchor_points.unsqueeze(0)[fg_mask]
+        pos_st = stride_tensor.unsqueeze(0)[fg_mask]
+        pos_tgt = target_bboxes[fg_mask]
+        ltrb = torch.cat([pos_ap - pos_tgt[:, :2], pos_tgt[:, 2:] - pos_ap], dim=-1).clamp(min=0.0) / pos_st
+        out["dfl_clipping_rate_pct"] = float((ltrb > (reg_max - 1.0)).float().mean().item() * 100.0)
+
+        # DFL softmax distribution entropy & peak confidence on positive anchors
+        pos_logits = boxes_raw.transpose(1, 2).float()[fg_mask].view(-1, 4, reg_max)
+        probs = pos_logits.softmax(dim=-1).clamp(min=1e-7)
+        entropy = -(probs * probs.log()).sum(dim=-1) / float(np.log(reg_max))  # normalized in [0, 1]
+        out["dfl_entropy_pos"] = float(entropy.mean().item())
+        out["dfl_top1_prob"] = float(probs.amax(dim=-1).mean().item())
+
+    return out
+
+
+def _measure_neck_gradient_conflict(
+    model: torch.nn.Module,
+    has_slots: bool,
+    img_t: torch.Tensor,
+    target_dict: Dict[str, torch.Tensor],
+    imgsz: int,
+    device: torch.device,
+) -> Dict[str, float]:
+    """Measure cos_sim(grad_box, grad_cls+slot) and ||grad_box||/||grad_cls+slot|| at neck P3/P4/P5."""
+    was_training = model.training
+    model.eval()
+    out: Dict[str, float] = {}
+
+    with torch.enable_grad():
+        with torch.no_grad():
+            feat4, feat6, feat10 = model.net.backbone(img_t)
+            p3, p4, p5 = model.net.neck(feat4, feat6, feat10)
+
+        p3 = p3.detach().requires_grad_(True)
+        p4 = p4.detach().requires_grad_(True)
+        p5 = p5.detach().requires_grad_(True)
+        feats = [p3, p4, p5]
+
+        if has_slots and hasattr(model, "slot_refiner"):
+            cls_feats, slot_info = model.slot_refiner(feats)
+        else:
+            cls_feats, slot_info = feats, None
+
+        bs = p3.shape[0]
+        boxes_raw = torch.cat(
+            [model.net.head.cv2[i](feats[i]).view(bs, 4 * model.net.head.reg_max, -1) for i in range(model.net.head.nl)],
+            dim=-1,
+        )
+        scores_raw = torch.cat(
+            [model.net.head.cv3[i](cls_feats[i]).view(bs, model.num_classes, -1) for i in range(model.net.head.nl)],
+            dim=-1,
+        )
+        if slot_info is not None and slot_info.get("logit_prior") is not None:
+            scores_raw = scores_raw + slot_info["logit_prior"]
+
+        a_raw, s_raw = make_anchors(feats, model.net.head.stride, 0.5)
+        anchors, strides = (a.transpose(0, 1).to(device) for a in (a_raw, s_raw))
+        pred_dist = model.net.head.dfl(boxes_raw)
+        decoded_xyxy = (dist2bbox(pred_dist, anchors.unsqueeze(0), xywh=False, dim=1) * strides).transpose(1, 2)
+        ap_px = (anchors * strides).transpose(0, 1)
+        st_t = strides.transpose(0, 1)
+
+        targets_list = [{
+            "boxes": target_dict["boxes"].to(device),
+            "labels": target_dict["labels"].to(device),
+            "_is_cxcywh": True,
+        }]
+        det_losses = model.criterion(
+            preds={"boxes": boxes_raw, "scores": scores_raw, "feats": feats},
+            targets=targets_list,
+            decoded_bboxes=decoded_xyxy,
+            anchor_points=ap_px,
+            stride_tensor=st_t,
+            img_size=(imgsz, imgsz),
+        )
+        loss_box = det_losses["loss_diou"] + det_losses["loss_dfl"]
+        loss_cls = det_losses["loss_focal"]
+
+        if has_slots and slot_info is not None and model.slot_loss_weight > 0:
+            gt_b, gt_l, m_gt = model.criterion._prepare_targets(targets_list, (imgsz, imgsz), device)
+            sl = model.slot_criterion(
+                slots=slot_info["slots"],
+                attn_ori=slot_info["attn_ori"],
+                obj_queries=model.slot_refiner.slot_attention.obj_queries,
+                resolutions=slot_info["resolutions"],
+                gt_bboxes=gt_b,
+                gt_labels=gt_l,
+                mask_gt=m_gt,
+                img_size=(imgsz, imgsz),
+            )
+            loss_cls = loss_cls + model.slot_loss_weight * sl["loss_slot"]
+
+        if loss_box.requires_grad and loss_cls.requires_grad:
+            g_box = torch.autograd.grad(loss_box, feats, retain_graph=True, allow_unused=True)
+            g_cls = torch.autograd.grad(loss_cls, feats, retain_graph=False, allow_unused=True)
+            for name, gb, gc in zip(["p3", "p4", "p5"], g_box, g_cls):
+                if gb is not None and gc is not None:
+                    gb_f = gb.reshape(-1).float()
+                    gc_f = gc.reshape(-1).float()
+                    nb = float(gb_f.norm().item())
+                    nc = float(gc_f.norm().item())
+                    if nb > 1e-8 and nc > 1e-8:
+                        out[f"grad_cos_box_vs_cls_{name}"] = float(F.cosine_similarity(gb_f.unsqueeze(0), gc_f.unsqueeze(0)).item())
+                        out[f"grad_ratio_box_over_cls_{name}"] = nb / (nc + 1e-8)
+
+    if was_training:
+        model.train()
+    return out
 
 
 @torch.no_grad()
@@ -320,6 +549,15 @@ def run_visdrone_component_validation(
     comp_acc: Dict[str, Dict[str, List[float]]] = {c: {k: [] for k in metric_keys} for c in component_order}
     head_scale_share: Dict[str, List[float]] = {"p3": [], "p4": [], "p5": []}
     slot_stats: Dict[str, List[float]] = {"slot_fg_mass_pct": [], "slot_share_p3": [], "slot_share_p4": [], "slot_share_p5": [], "slot_cos_sep": []}
+    box_diag_acc: Dict[str, List[float]] = {
+        "boundary_contrast_p3": [], "boundary_contrast_p4": [], "boundary_contrast_p5": [],
+        "intra_box_decorr_p3": [], "intra_box_decorr_p4": [], "intra_box_decorr_p5": [],
+        "gt_coverage_all_pct": [], "gt_coverage_small_pct": [], "avg_pos_per_gt": [],
+        "dfl_clipping_rate_pct": [], "dfl_entropy_pos": [], "dfl_top1_prob": [],
+        "grad_cos_box_vs_cls_p3": [], "grad_cos_box_vs_cls_p4": [], "grad_cos_box_vs_cls_p5": [],
+        "grad_ratio_box_over_cls_p3": [], "grad_ratio_box_over_cls_p4": [], "grad_ratio_box_over_cls_p5": [],
+    }
+    grad_conflict_samples = 0
 
     p3_dim = 64
     p3_proto_sum = np.zeros((10, p3_dim), dtype=np.float64)
@@ -415,6 +653,48 @@ def run_visdrone_component_validation(
         head_scale_share["p4"].append(cv3_masses[1] / tot_mass * 100.0)
         head_scale_share["p5"].append(cv3_masses[2] / tot_mass * 100.0)
 
+        # Box learning mechanism diagnostics: Boundary Contrast & Intra-Box Decorrelation
+        for pname, cname in [
+            ("p3", "neck.c3k2_16 (P3 //8)"),
+            ("p4", "neck.c3k2_19 (P4 //16)"),
+            ("p5", "neck.c3k2_22 (P5 //32)"),
+        ]:
+            sp_m = _measure_box_spatial_metrics(probe.features[cname], gt_lb_norm, imgsz)
+            if "boundary_contrast" in sp_m:
+                box_diag_acc[f"boundary_contrast_{pname}"].append(sp_m["boundary_contrast"])
+            if "intra_box_decorr" in sp_m:
+                box_diag_acc[f"intra_box_decorr_{pname}"].append(sp_m["intra_box_decorr"])
+
+        # TAL coverage & DFL entropy/clipping
+        if len(gt_xyxy) > 0:
+            neck_feats = [
+                probe.features["neck.c3k2_16 (P3 //8)"],
+                probe.features["neck.c3k2_19 (P4 //16)"],
+                probe.features["neck.c3k2_22 (P5 //32)"],
+            ]
+            boxes_raw_cat = torch.cat([
+                probe.features["head.cv2_p3 (Box //8)"].flatten(2),
+                probe.features["head.cv2_p4 (Box //16)"].flatten(2),
+                probe.features["head.cv2_p5 (Box //32)"].flatten(2),
+            ], dim=-1)
+            scores_raw_cat = torch.cat([
+                probe.features["head.cv3_p3 (Cls //8)"].flatten(2),
+                probe.features["head.cv3_p4 (Cls //16)"].flatten(2),
+                probe.features["head.cv3_p5 (Cls //32)"].flatten(2),
+            ], dim=-1)
+            if has_slots and "slot_info" in slot_cache and slot_cache["slot_info"].get("logit_prior") is not None:
+                scores_raw_cat = scores_raw_cat + slot_cache["slot_info"]["logit_prior"]
+            tal_dfl_m = _measure_tal_and_dfl_metrics(model, neck_feats, boxes_raw_cat, scores_raw_cat, gt_xyxy, imgsz, device)
+            for k, v in tal_dfl_m.items():
+                box_diag_acc[k].append(v)
+
+            # Gradient conflict cos_sim(grad_box, grad_cls+slot) on first 20 val images with GTs
+            if grad_conflict_samples < 20:
+                gc_m = _measure_neck_gradient_conflict(model, has_slots, img_t, target, imgsz, device)
+                for k, v in gc_m.items():
+                    box_diag_acc[k].append(v)
+                grad_conflict_samples += 1
+
         p0 = pred_list[0]
         if len(p0["boxes"]) > 0:
             det = np.column_stack([
@@ -505,6 +785,17 @@ def run_visdrone_component_validation(
             "slot_share_p5_pct": round(float(np.mean(slot_stats["slot_share_p5"])), 2),
         }
 
+    box_diag = {
+        k: round(float(np.mean(v)), 4)
+        for k, v in box_diag_acc.items()
+        if len(v) > 0
+    }
+    if box_diag:
+        with open(os.path.join(out_dir, "box_learning_diagnostics.csv"), "w", newline="", encoding="utf-8") as f:
+            w = csv.DictWriter(f, fieldnames=list(box_diag.keys()))
+            w.writeheader()
+            w.writerow(box_diag)
+
     # Save CSVs & Plots
     with open(os.path.join(out_dir, "component_breakdown.csv"), "w", newline="", encoding="utf-8") as f:
         w = csv.DictWriter(f, fieldnames=list(comp_rows[0].keys()))
@@ -530,7 +821,7 @@ def run_visdrone_component_validation(
     if vis_sample is not None:
         _plot_visdrone_visual_inspection(vis_sample, os.path.join(out_dir, "chart_04_feature_visual_inspection.png"))
     _plot_visdrone_pairwise_heatmap(valid_cls_ids, pw_mat, os.path.join(out_dir, "chart_05_pairwise_class_separation.png"))
-    _generate_visdrone_dashboard(out_dir, comp_rows, overall_det, slot_summary)
+    _generate_visdrone_dashboard(out_dir, comp_rows, overall_det, slot_summary, box_diag=box_diag)
 
     print("\n" + "=" * 80)
     print("VISDRONE COMPONENT VALIDATION SUMMARY:")
@@ -539,6 +830,14 @@ def run_visdrone_component_validation(
     print(f"  P / R / F1    : {overall_det['precision_c25']:.4f} / {overall_det['recall_c25']:.4f} / {overall_det['f1_c25']:.4f} (conf>=0.25)")
     if slot_summary:
         print(f"  Slot Cos Sep  : {slot_summary['slot_cos_sep']:.4f} | Share P3/P4/P5: {slot_summary['slot_share_p3_pct']:.1f}% / {slot_summary['slot_share_p4_pct']:.1f}% / {slot_summary['slot_share_p5_pct']:.1f}%")
+    if box_diag:
+        print("  --- Box Learning Mechanism Diagnostics ---")
+        print(f"  Boundary Contrast (P3/P4/P5)   : {box_diag.get('boundary_contrast_p3', 0):.3f} / {box_diag.get('boundary_contrast_p4', 0):.3f} / {box_diag.get('boundary_contrast_p5', 0):.3f}")
+        print(f"  Intra-Box Decorr  (P3/P4/P5)   : {box_diag.get('intra_box_decorr_p3', 0):.3f} / {box_diag.get('intra_box_decorr_p4', 0):.3f} / {box_diag.get('intra_box_decorr_p5', 0):.3f}")
+        print(f"  TAL GT Coverage (All / Small)  : {box_diag.get('gt_coverage_all_pct', 0):.1f}% / {box_diag.get('gt_coverage_small_pct', 0):.1f}% | Avg Pos/GT: {box_diag.get('avg_pos_per_gt', 0):.2f}")
+        print(f"  DFL Entropy / Top1 / Clipping  : {box_diag.get('dfl_entropy_pos', 0):.3f} / {box_diag.get('dfl_top1_prob', 0):.3f} / {box_diag.get('dfl_clipping_rate_pct', 0):.2f}%")
+        print(f"  Grad Cos(Box, Cls+Slot) P3/4/5 : {box_diag.get('grad_cos_box_vs_cls_p3', 0):+.3f} / {box_diag.get('grad_cos_box_vs_cls_p4', 0):+.3f} / {box_diag.get('grad_cos_box_vs_cls_p5', 0):+.3f}")
+        print(f"  Grad Ratio ||Box||/||Cls||     : {box_diag.get('grad_ratio_box_over_cls_p3', 0):.2f} / {box_diag.get('grad_ratio_box_over_cls_p4', 0):.2f} / {box_diag.get('grad_ratio_box_over_cls_p5', 0):.2f}")
     print(f"  Latency / FPS : {overall_det['latency_ms']:.2f} ms/img ({overall_det['fps']:.1f} FPS)")
     print(f"  Output saved  : {os.path.abspath(out_dir)}")
     print("=" * 80)
