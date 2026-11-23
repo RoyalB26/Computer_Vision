@@ -64,7 +64,7 @@ data:
     shuffle: true
     num_workers: 4
     pin_memory: true
-
+    augment: true
   val:
     dataset:
       type: "VisDroneLMDBDataset"
