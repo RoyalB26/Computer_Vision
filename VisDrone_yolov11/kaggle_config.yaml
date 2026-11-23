@@ -1,0 +1,113 @@
+# ==============================================================================
+# VisDrone YOLOv11 + Post-Neck Decoupled Slot Attention & FiLM (Method B+C, 960x960)
+# ==============================================================================
+
+work_dir: "./work_dirs/visdrone_yolov11_slot_960"
+device: "cuda"
+seed: 42
+tqdm: true
+
+custom_imports:
+  - "VisDrone_yolov11.model"
+  - "VisDrone_yolov11.dataset"
+  - "VisDrone_yolov11.loss"
+  - "VisDrone_yolov11.metrics"
+
+# 1. Model Configuration: YOLOv11 + Post-Neck Decoupled Slot + FiLM (B+C)
+model:
+  type: "VisDroneYOLO11Slot"
+  num_classes: 10
+  pretrained: "yolo11n.pt"
+  # Core YOLOv11 detection loss weights
+  box_weight: 7.5
+  cls_weight: 1.0
+  dfl_weight: 1.5
+  focal_alpha: -1.0
+  focal_gamma: 0.0
+  # Inference thresholds
+  conf_threshold: 0.05
+  nms_threshold: 0.5
+  max_det: 300
+  # Slot + FiLM (Method B+C) hyperparameters
+  slot_dim: 32
+  fusion_mode: "film"          # "film" (Method C) or "residual"
+  use_bg_slot_write: false     # false = 10 fg slots only (natural bg gating), true = all 11 slots
+  use_logit_prior: true        # direct zero-init semantic logit residual added to Detect.cv3
+  use_slot_checkpoint: false   # set true to further cut activation VRAM on small GPUs
+  slot_loss_weight: 0.3        # auxiliary slot supervision multiplier
+  bg_attn_weight: 0.5
+  fg_attn_weight: 0.5
+  suppress_weight: 0.05
+  cls_attn_weight: 0.5
+  ortho_weight: 0.1
+
+# 2. Dataset Configuration (Stratified Split synced with Visdrone/dataset.py)
+data:
+  train:
+    dataset:
+      type: "VisDroneLMDBDataset"
+      data_root: "D:/apps/Datasets/VisDrone/VisDrone_data.lmdb"
+      split: "train"
+      split_ratio: 0.8
+      seed: 42
+      num_classes: 10
+      include_boxes: true
+      pipeline:
+        - type: "Resize"
+          size: [960, 960]
+        - type: "ToTensor"
+    batch_size: 8
+    shuffle: true
+    num_workers: 4
+
+  val:
+    dataset:
+      type: "VisDroneLMDBDataset"
+      data_root: "D:/apps/Datasets/VisDrone/VisDrone_data.lmdb"
+      split: "val"
+      split_ratio: 0.8
+      seed: 42
+      num_classes: 10
+      include_boxes: true
+      pipeline:
+        - type: "Resize"
+          size: [960, 960]
+        - type: "ToTensor"
+    batch_size: 8
+    shuffle: false
+    num_workers: 2
+
+# 3. Optimizer Configuration
+optimizer:
+  type: "AdamW"
+  lr: 0.001
+  weight_decay: 0.0005
+
+# 4. Learning Rate Scheduler
+lr_scheduler:
+  type: "CosineAnnealingLR"
+  T_max: 100
+  eta_min: 0.00001
+
+# 5. Metrics Configuration: mAP Evaluation
+metrics:
+  mAP:
+    type: "VisDroneMAP"
+    num_classes: 10
+
+# 6. Training Hyperparameters
+train_cfg:
+  max_epochs: 100
+  val_interval: 1
+  grad_clip: 10.0
+  use_amp: true
+  accumulate: 2                # effective batch size = 8 * 2 = 16
+
+# 7. Lifecycle Hooks
+hooks:
+  - type: "LoggerHook"
+    interval: 50
+  - type: "CheckpointHook"
+    interval: 1
+    save_best: "mAP_50"
+    mode: "max"

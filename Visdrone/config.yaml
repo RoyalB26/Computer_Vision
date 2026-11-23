@@ -15,14 +15,14 @@ custom_imports:
 model:
   type: "VisDroneDetector"
   num_classes: 10
-  dim: 256
+  dim: 128
   pretrained: true
   exp_factor: 5.0
   count_loss_weight: 1.0
   bg_attn_weight: 1.0
   fg_attn_weight: 1.0
   suppress_weight: 0.05
-
+  cls_attn_weight: 0.5
 # 2. Dataset Configuration (960x960 input resolution)
 data:
   train:
@@ -33,6 +33,7 @@ data:
       split: "train"
       split_ratio: 0.8
       seed: 42
+      include_boxes: true
       pipeline:
         - type: "Resize"
           size: [960, 960]
@@ -49,6 +50,7 @@ data:
       split: "val"
       split_ratio: 0.8
       seed: 42
+      include_boxes: true
       pipeline:
         - type: "Resize"
           size: [960, 960]

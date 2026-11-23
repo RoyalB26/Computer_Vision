@@ -773,9 +773,12 @@ def rasterize_boxes_with_classes(
     labels: np.ndarray,
     resolutions: Tuple[Tuple[int, int], ...],
     num_classes: int = 10,
-) -> Tuple[np.ndarray, np.ndarray]:
-    """Tạo vector multi-scale background mask (1.0 = BG, 0.0 = Box)
-    và per-class binary masks (10, total_tokens) (1.0 = Box của class c, 0.0 = khác).
+    small_area_thresh: float = 0.0025,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Tạo vector multi-scale dạng bool siêu nhẹ (tiết kiệm 4x RAM):
+    - bg_mask    : (total_tokens,) bool — True = BG, False = Box
+    - cls_mask   : (num_classes, total_tokens) bool — True = Box của class c
+    - small_mask : (total_tokens,) bool — True = Box vật nhỏ (w*h < small_area_thresh)
     """
     has_b = boxes is not None and len(boxes) > 0 and labels is not None and len(labels) > 0
     if has_b:
@@ -787,12 +790,15 @@ def rasterize_boxes_with_classes(
         has_b = len(bxs) > 0
         if has_b:
             cx, cy, w, h = bxs[:, 0], bxs[:, 1], bxs[:, 2], bxs[:, 3]
+            is_small = (w * h) < small_area_thresh
 
     bg_parts = []
     cls_parts = []
+    small_parts = []
     for H, W in resolutions:
-        bg_m = np.ones((H, W), dtype=np.float32)
-        cls_m = np.zeros((num_classes, H, W), dtype=np.float32)
+        bg_m = np.ones((H, W), dtype=np.bool_)
+        cls_m = np.zeros((num_classes, H, W), dtype=np.bool_)
+        sm_m = np.zeros((H, W), dtype=np.bool_)
         if has_b:
             x1 = np.clip(np.trunc((cx - w / 2.0) * W).astype(np.int64), 0, W - 1)
             y1 = np.clip(np.trunc((cy - h / 2.0) * H).astype(np.int64), 0, H - 1)
@@ -800,14 +806,18 @@ def rasterize_boxes_with_classes(
             y2 = np.maximum(y1 + 1, np.clip(np.ceil((cy + h / 2.0) * H).astype(np.int64), 0, H))
             for i in range(len(x1)):
                 c = int(lbls[i])
-                bg_m[y1[i] : y2[i], x1[i] : x2[i]] = 0.0
-                cls_m[c, y1[i] : y2[i], x1[i] : x2[i]] = 1.0
+                bg_m[y1[i] : y2[i], x1[i] : x2[i]] = False
+                cls_m[c, y1[i] : y2[i], x1[i] : x2[i]] = True
+                if is_small[i]:
+                    sm_m[y1[i] : y2[i], x1[i] : x2[i]] = True
         bg_parts.append(bg_m.reshape(-1))
         cls_parts.append(cls_m.reshape(num_classes, -1))
+        small_parts.append(sm_m.reshape(-1))
 
     bg_mask = np.concatenate(bg_parts, axis=0)
     cls_mask = np.concatenate(cls_parts, axis=1)
-    return bg_mask, cls_mask
+    small_mask = np.concatenate(small_parts, axis=0)
+    return bg_mask, cls_mask, small_mask
 
 
 def rasterize_boxes(boxes: np.ndarray, resolutions: Tuple[Tuple[int, int], ...]) -> np.ndarray:
@@ -831,8 +841,9 @@ def rasterize_boxes(boxes: np.ndarray, resolutions: Tuple[Tuple[int, int], ...])
 
 
 class LMDBVisDroneMicroDataset(Dataset):
-    """Đọc ảnh VisDrone trực tiếp từ LMDB theo nhu cầu (Lazy Loading),
-    giúp chạy được ảnh kích thước lớn (VD: 960x960) trên toàn bộ dataset mà không tốn RAM.
+    """Đọc ảnh VisDrone từ LMDB với hỗ trợ RAM Cache dạng nén (uint8 + bool) để loại bỏ
+    nghẽn cổ chai giải nén JPEG / resize PIL / rasterize box lặp lại qua mỗi epoch.
+    Nếu vượt ngưỡng RAM cho phép, tự động chuyển về Lazy Loading từ LMDB.
     """
     def __init__(
         self,
@@ -841,6 +852,7 @@ class LMDBVisDroneMicroDataset(Dataset):
         all_counts: np.ndarray,
         img_size: int = 384,
         for_eval: bool = False,
+        cache_in_ram: bool = True,
     ):
         self.lmdb_path = lmdb_path
         self.indices = indices
@@ -854,10 +866,57 @@ class LMDBVisDroneMicroDataset(Dataset):
         )
         self.env = None
         self.txn = None
+        self.cached = False
+        self._cache: Optional[List[Dict]] = None
+
+        if cache_in_ram and len(indices) > 0:
+            self._preload_cache()
 
     def _init_db(self):
         if self.env is None:
             self.env, self.txn = open_lmdb(self.lmdb_path, readonly=True)
+
+    def _read_raw_item(self, idx: int) -> Dict:
+        self._init_db()
+        real_idx = self.indices[idx]
+        byteflow = self.txn.get(f"{real_idx:08d}".encode("ascii"))
+        data = pickle.loads(byteflow)
+        raw_boxes = data.get("boxes", [])
+        raw_labels = data.get("labels", [])
+
+        img = Image.open(io.BytesIO(data["image"])).convert("RGB").resize((self.img_size, self.img_size), Image.BILINEAR)
+        img_np = np.array(img, dtype=np.uint8)
+        counts_np = self.all_counts[real_idx].astype(np.float32)
+        bg_mask_b, cls_mask_b, small_mask_b = rasterize_boxes_with_classes(
+            raw_boxes, raw_labels, self.resolutions, num_classes=10
+        )
+
+        item = {
+            "img_np": img_np,          # (H, W, 3) uint8
+            "counts": counts_np,       # (10,) float32
+            "bg_mask": bg_mask_b,      # (N,) bool
+            "cls_mask": cls_mask_b,    # (10, N) bool
+        }
+        if self.for_eval:
+            item["small_mask"] = small_mask_b
+            item["boxes_norm"] = [
+                (int(l), float(b[0]), float(b[1]), float(b[2]), float(b[3]))
+                for b, l in zip(raw_boxes, raw_labels)
+                if 0 <= int(l) < 10
+            ]
+        return item
+
+    def _preload_cache(self) -> None:
+        t0 = time.perf_counter()
+        self._init_db()
+        self._cache = [self._read_raw_item(i) for i in range(len(self.indices))]
+        # Chỉ bỏ tham chiếu cục bộ (không gọi env.close() vì open_lmdb dùng singleton cache chung)
+        self.env = None
+        self.txn = None
+        self.cached = True
+        dt = time.perf_counter() - t0
+        split_name = "Val" if self.for_eval else "Train"
+        print(f"    -> Đã nạp & cache {len(self._cache)} ảnh {split_name} ({self.img_size}x{self.img_size} uint8 + bool masks) vào RAM trong {dt:.1f}s.")
 
     def __getstate__(self):
         state = self.__dict__.copy()
@@ -869,21 +928,12 @@ class LMDBVisDroneMicroDataset(Dataset):
         return len(self.indices)
 
     def __getitem__(self, idx: int) -> Dict:
-        self._init_db()
-        real_idx = self.indices[idx]
-        byteflow = self.txn.get(f"{real_idx:08d}".encode("ascii"))
-        data = pickle.loads(byteflow)
-        raw_boxes = data.get("boxes", [])
-        raw_labels = data.get("labels", [])
-
-        img = Image.open(io.BytesIO(data["image"])).convert("RGB").resize((self.img_size, self.img_size), Image.BILINEAR)
-        img_np = np.array(img, dtype=np.uint8)
-        img_t = torch.from_numpy(img_np).permute(2, 0, 1).float() / 255.0
-
-        counts = torch.from_numpy(self.all_counts[real_idx].astype(np.float32))
-        bg_mask_np, cls_mask_np = rasterize_boxes_with_classes(raw_boxes, raw_labels, self.resolutions, num_classes=10)
-        bg_mask = torch.from_numpy(bg_mask_np)
-        cls_mask = torch.from_numpy(cls_mask_np)
+        item = self._cache[idx] if (self.cached and self._cache is not None) else self._read_raw_item(idx)
+        img_np = item["img_np"]
+        img_t = torch.from_numpy(img_np).permute(2, 0, 1).float().div_(255.0)
+        counts = torch.from_numpy(item["counts"])
+        bg_mask = torch.from_numpy(item["bg_mask"]).float()
+        cls_mask = torch.from_numpy(item["cls_mask"]).float()
 
         if not self.for_eval:
             return {
@@ -893,18 +943,14 @@ class LMDBVisDroneMicroDataset(Dataset):
                 "cls_mask": cls_mask,
             }
 
-        boxes_norm = [
-            (int(l), float(b[0]), float(b[1]), float(b[2]), float(b[3]))
-            for b, l in zip(raw_boxes, raw_labels)
-            if 0 <= int(l) < 10
-        ]
         return {
             "image": img_t,
             "img_np": img_np,
             "counts": counts,
             "bg_mask": bg_mask,
             "cls_mask": cls_mask,
-            "boxes_norm": boxes_norm,
+            "small_mask": torch.from_numpy(item["small_mask"]),
+            "boxes_norm": item["boxes_norm"],
         }
 
 
@@ -976,7 +1022,8 @@ def load_micro_splits(
     n_val: int = 40,
     img_size: int = 384,
     seed: int = 42,
-) -> Tuple[List[Dict], List[Dict]]:
+    cache_ram_gb: float = 16.0,
+) -> Tuple[LMDBVisDroneMicroDataset, LMDBVisDroneMicroDataset]:
     """Tải tập con VisDrone thật vào RAM sao cho cả tập train và val đều cân bằng
     và bám sát phân phối của 10 class trong toàn bộ dataset gốc.
     """
@@ -1078,9 +1125,25 @@ def load_micro_splits(
     print(f"  Total Variation Distance so với Global: Train TVD = {tv_train:.2f}% | Val TVD = {tv_val:.2f}%")
     print("=" * 105)
 
-    train_ds = LMDBVisDroneMicroDataset(lmdb_path=lmdb_path, indices=train_indices, all_counts=all_counts, img_size=img_size, for_eval=False)
-    val_ds = LMDBVisDroneMicroDataset(lmdb_path=lmdb_path, indices=val_indices, all_counts=all_counts, img_size=img_size, for_eval=True)
-    print(f"[+] Đã khởi tạo Lazy LMDB Dataset ({len(train_ds)} train, {len(val_ds)} val) ở kích thước {img_size}x{img_size} (không tốn RAM lưu ảnh).")
+    # Ước lượng dung lượng RAM cần để cache ảnh uint8 + bool masks (tiết kiệm 4x so với float32)
+    total_tokens = (img_size // 8) ** 2 + (img_size // 16) ** 2 + (img_size // 32) ** 2
+    bytes_per_sample = (img_size * img_size * 3) + (12 * total_tokens)
+    est_gb = (len(train_indices) + len(val_indices)) * bytes_per_sample / (1024 ** 3)
+    use_ram_cache = (cache_ram_gb > 0) and (est_gb <= cache_ram_gb)
+
+    if use_ram_cache:
+        print(f"[*] Bật RAM Cache (ước lượng ~{est_gb:.2f} GB <= ngưỡng {cache_ram_gb:.1f} GB) — đang nạp & rasterize sẵn một lần duy nhất...")
+    else:
+        print(f"[*] Dùng Lazy LMDB Loading (ước lượng RAM cache ~{est_gb:.2f} GB > ngưỡng {cache_ram_gb:.1f} GB).")
+
+    train_ds = LMDBVisDroneMicroDataset(
+        lmdb_path=lmdb_path, indices=train_indices, all_counts=all_counts, img_size=img_size, for_eval=False, cache_in_ram=use_ram_cache
+    )
+    val_ds = LMDBVisDroneMicroDataset(
+        lmdb_path=lmdb_path, indices=val_indices, all_counts=all_counts, img_size=img_size, for_eval=True, cache_in_ram=use_ram_cache
+    )
+    mode_lbl = f"RAM-Cached (~{est_gb:.2f} GB)" if use_ram_cache else "Lazy LMDB"
+    print(f"[+] Đã khởi tạo {mode_lbl} Dataset ({len(train_ds)} train, {len(val_ds)} val) ở kích thước {img_size}x{img_size}.")
     return train_ds, val_ds
 
 
@@ -1142,6 +1205,30 @@ def _build_pairwise_matrix(proto_sum: np.ndarray, proto_cnt: np.ndarray, dim: in
     return pairwise_dist, mean_45
 
 
+def _compute_pca_rgb_gpu(fs: torch.Tensor) -> torch.Tensor:
+    """Tính nhanh PCA-3D RGB trực tiếp trên GPU thông qua ma trận hiệp phương sai (C x C)
+    thay vì SVD ma trận (H*W x C) trên CPU — nhanh hơn ~50-100x ở 960x960.
+    Input: fs (C, H, W) trên device -> Output: (H*W, 3) trong [0, 1] trên device.
+    """
+    C, H, W = fs.shape
+    X = fs.float().reshape(C, -1).transpose(0, 1)  # (N, C)
+    X = X - X.mean(dim=0, keepdim=True)
+    cov = X.transpose(0, 1) @ X  # (C, C) — chỉ 64x64!
+    _, eigvecs = torch.linalg.eigh(cov)
+    V = eigvecs[:, -3:].flip(dims=[1])  # Top 3 thành phần chính (C, 3)
+    proj = X @ V  # (N, 3)
+    q_probs = torch.tensor([0.02, 0.98], device=proj.device, dtype=proj.dtype)
+    q = torch.quantile(proj, q_probs, dim=0)  # (2, 3)
+    p_lo, p_hi = q[0], q[1]
+    span = p_hi - p_lo
+    out = torch.where(
+        span > 0,
+        ((proj - p_lo) / span.clamp(min=1e-8)).clamp(0.0, 1.0),
+        torch.full_like(proj, 0.5),
+    )
+    return out  # (N, 3)
+
+
 @torch.no_grad()
 def evaluate_architecture(
     model: MiniSlotCounter,
@@ -1149,7 +1236,9 @@ def evaluate_architecture(
     device: torch.device,
     small_area_thresh: float = 0.0025,
 ) -> Tuple[Dict[str, float], Dict[str, np.ndarray]]:
-    """Đo đầy đủ tất cả chỉ số trên từng tầng P3, P4, P5 VÀ trên Slots cuối cùng sau khi qua P3+P4+P5."""
+    """Đo đầy đủ tất cả chỉ số trên từng tầng P3, P4, P5 VÀ trên Slots cuối cùng sau khi qua P3+P4+P5.
+    Đã tối ưu hóa toàn bộ tính toán PCA-3D, Fisher, Cosine Sep trên GPU & tái sử dụng mask đã rasterize sẵn.
+    """
     model.eval()
 
     scale_names = ("p3", "p4", "p5")
@@ -1187,11 +1276,15 @@ def evaluate_architecture(
     vis_pack: Dict[str, np.ndarray] = {}
 
     for idx, s in enumerate(val_samples):
-        img_t = s["image"].unsqueeze(0).to(device)
+        img_t = s["image"].unsqueeze(0).to(device, non_blocking=True)
         counts_gt = s["counts"].numpy()
         boxes_norm = s["boxes_norm"]
-        small_boxes = [b for b in boxes_norm if (b[3] * b[4]) < small_area_thresh]
-        small_cls_set = {int(b[0]) for b in small_boxes}
+        small_cls_set = {int(b[0]) for b in boxes_norm if (b[3] * b[4]) < small_area_thresh}
+
+        # Tái sử dụng mask đa quy mô đã rasterize sẵn (0 lần gọi build_box_mask_at_res!)
+        all_box_mask_all = (s["bg_mask"] < 0.5).to(device, non_blocking=True)    # (total_tokens,) bool
+        small_box_mask_all = s["small_mask"].to(device, non_blocking=True)       # (total_tokens,) bool
+        cls_mask_all = (s["cls_mask"] > 0.5).to(device, non_blocking=True)       # (10, total_tokens) bool
 
         preds, attn_ori, feats, resolutions, slots = model.forward_all(img_t)
         pred_np = preds[0].cpu().numpy()
@@ -1202,89 +1295,94 @@ def evaluate_architecture(
         n3, n4, n5 = H3 * W3, H4 * W4, H5 * W5
         slices = [(0, n3), (n3, n3 + n4), (n3 + n4, n3 + n4 + n5)]
 
-        all_masks_flat = []
-        fg_attn_all_tokens = attn_ori[0, :10, :].sum(dim=0).cpu().numpy()  # (n3+n4+n5,)
+        fg_attn_all_gpu = attn_ori[0, :10, :].sum(dim=0)  # (n3+n4+n5,) trên GPU
 
         # ---------------------------------------------------------------------
-        # A. ĐO TRÊN TỪNG TẦNG P3, P4, P5
+        # A. ĐO TRÊN TỪNG TẦNG P3, P4, P5 (TOÀN BỘ TRÊN GPU)
         # ---------------------------------------------------------------------
         for s_idx, sn in enumerate(scale_names):
             Hs, Ws = resolutions[s_idx]
             t_start, t_end = slices[s_idx]
-            fs = feats[s_idx][0]  # (C, Hs, Ws)
-            l2_map = torch.linalg.vector_norm(fs.float(), dim=0).cpu().numpy()  # (Hs, Ws)
+            fs = feats[s_idx][0].float()  # (C, Hs, Ws) trên GPU
+            C_dim = fs.shape[0]
+            fs_flat = fs.reshape(C_dim, -1)  # (C, N)
+            l2_flat = torch.linalg.vector_norm(fs_flat, dim=0)  # (N,)
 
-            all_box_mask = build_box_mask_at_res(boxes_norm, Hs, Ws)
-            small_box_mask = build_box_mask_at_res(small_boxes, Hs, Ws)
-            bg_mask_bool = ~all_box_mask
-            all_masks_flat.append(all_box_mask.reshape(-1))
+            all_box_m = all_box_mask_all[t_start:t_end]      # (N,) bool
+            small_box_m = small_box_mask_all[t_start:t_end]  # (N,) bool
+            bg_m = ~all_box_m                                # (N,) bool
+            cls_m_s = cls_mask_all[:, t_start:t_end]         # (10, N) bool
+
+            has_fg = bool(all_box_m.any().item())
+            has_bg = bool(bg_m.any().item())
 
             # 1. Energy Contrast Ratio (In-Box / Out-Box)
-            if all_box_mask.any() and bg_mask_bool.any():
-                bg_energy = float(l2_map[bg_mask_bool].mean()) + 1e-6
-                sc_acc[sn]["all_ratios"].append(float(l2_map[all_box_mask].mean()) / bg_energy)
-                if small_box_mask.any():
-                    sc_acc[sn]["small_ratios"].append(float(l2_map[small_box_mask].mean()) / bg_energy)
+            if has_fg and has_bg:
+                bg_energy = float(l2_flat[bg_m].mean().item()) + 1e-6
+                sc_acc[sn]["all_ratios"].append(float(l2_flat[all_box_m].mean().item()) / bg_energy)
+                if bool(small_box_m.any().item()):
+                    sc_acc[sn]["small_ratios"].append(float(l2_flat[small_box_m].mean().item()) / bg_energy)
 
-            # 2a. Full-Dim FG/BG Fisher
-            fs_hwc = fs.detach().cpu().float().permute(1, 2, 0).numpy()  # (Hs, Ws, C)
-            if all_box_mask.any() and bg_mask_bool.any():
-                fg_full = fs_hwc[all_box_mask]
-                bg_full = fs_hwc[bg_mask_bool]
-                mu_fg_f, mu_bg_f = fg_full.mean(axis=0), bg_full.mean(axis=0)
-                var_fg_f = float(np.sum(np.var(fg_full, axis=0)))
-                var_bg_f = float(np.sum(np.var(bg_full, axis=0)))
-                sc_acc[sn]["full_fishers"].append(float(np.sum((mu_fg_f - mu_bg_f) ** 2)) / (var_fg_f + var_bg_f + 1e-6))
+                # 2a. Full-Dim FG/BG Fisher (trên GPU, correction=0 khớp np.var)
+                fg_full = fs_flat[:, all_box_m].transpose(0, 1)  # (N_fg, C)
+                bg_full = fs_flat[:, bg_m].transpose(0, 1)       # (N_bg, C)
+                mu_fg_f = fg_full.mean(dim=0)
+                mu_bg_f = bg_full.mean(dim=0)
+                var_fg_f = fg_full.var(dim=0, correction=0).sum()
+                var_bg_f = bg_full.var(dim=0, correction=0).sum()
+                fisher_f = ((mu_fg_f - mu_bg_f) ** 2).sum() / (var_fg_f + var_bg_f + 1e-6)
+                sc_acc[sn]["full_fishers"].append(float(fisher_f.item()))
 
-            # 2b. PCA-3D FG/BG Fisher
-            pca_rgb = compute_pca_rgb(fs)  # (Hs, Ws, 3)
-            if all_box_mask.any() and bg_mask_bool.any():
-                fg_pts = pca_rgb[all_box_mask]
-                bg_pts = pca_rgb[bg_mask_bool]
-                mu_fg, mu_bg = fg_pts.mean(axis=0), bg_pts.mean(axis=0)
-                var_fg = float(np.sum(np.var(fg_pts, axis=0)))
-                var_bg = float(np.sum(np.var(bg_pts, axis=0)))
-                sc_acc[sn]["pca_fishers"].append(float(np.sum((mu_fg - mu_bg) ** 2)) / (var_fg + var_bg + 1e-6))
+            # 2b. PCA-3D FG/BG Fisher (tính nhanh bằng 64x64 covariance eigh trên GPU)
+            pca_flat = _compute_pca_rgb_gpu(fs)  # (N, 3) trên GPU
+            if has_fg and has_bg:
+                fg_pts = pca_flat[all_box_m]
+                bg_pts = pca_flat[bg_m]
+                mu_fg = fg_pts.mean(dim=0)
+                mu_bg = bg_pts.mean(dim=0)
+                var_fg = fg_pts.var(dim=0, correction=0).sum()
+                var_bg = bg_pts.var(dim=0, correction=0).sum()
+                fisher_p = ((mu_fg - mu_bg) ** 2).sum() / (var_fg + var_bg + 1e-6)
+                sc_acc[sn]["pca_fishers"].append(float(fisher_p.item()))
 
-            # 3. Inter-Class Cosine Separation tại tầng sn
-            fs_norm = F.normalize(fs.float(), dim=0).cpu().numpy()  # (C, Hs, Ws)
-            class_protos = []
-            for c in range(10):
-                c_mask = build_box_mask_at_res(boxes_norm, Hs, Ws, class_filter=c)
-                cnt_c = int(c_mask.sum())
-                if cnt_c > 0:
-                    sc_proto_sum[sn][c] += fs_norm[:, c_mask].sum(axis=1)
-                    sc_proto_cnt[sn][c] += cnt_c
-                if cnt_c >= 2:
-                    proto = fs_norm[:, c_mask].mean(axis=1)
-                    proto = proto / (np.linalg.norm(proto) + 1e-8)
-                    class_protos.append(proto)
-            if len(class_protos) >= 2:
-                P = np.stack(class_protos, axis=0)
-                sim = P @ P.T
-                K = len(class_protos)
-                off_diag = sim[~np.eye(K, dtype=bool)]
-                sc_acc[sn]["class_seps"].append(float(1.0 - off_diag.mean()))
+            # 3. Inter-Class Cosine Separation tại tầng sn (vectorized matmul 1 phát trên GPU!)
+            fs_norm_flat = F.normalize(fs_flat, dim=0)  # (C, N)
+            cnt_c_t = cls_m_s.sum(dim=1)  # (10,)
+            proto_sums_t = cls_m_s.float() @ fs_norm_flat.transpose(0, 1)  # (10, C)
+            sc_proto_sum[sn] += proto_sums_t.cpu().double().numpy()
+            sc_proto_cnt[sn] += cnt_c_t.cpu().numpy()
+
+            valid_c = cnt_c_t >= 2
+            K_valid = int(valid_c.sum().item())
+            if K_valid >= 2:
+                P_gpu = F.normalize(proto_sums_t[valid_c], p=2, dim=1)  # (K, C)
+                sim_gpu = P_gpu @ P_gpu.transpose(0, 1)                 # (K, K)
+                off_diag_mean = (sim_gpu.sum() - K_valid) / (K_valid * (K_valid - 1))
+                sc_acc[sn]["class_seps"].append(float(1.0 - off_diag_mean.item()))
 
             # 4. Foreground Attention Mass rơi trúng GT Box tại tầng sn
-            fg_attn_s = fg_attn_all_tokens[t_start:t_end].reshape(Hs, Ws)
-            if all_box_mask.any():
+            fg_attn_s_flat = fg_attn_all_gpu[t_start:t_end]
+            if has_fg:
                 sc_acc[sn]["fg_mass_pcts"].append(
-                    float(fg_attn_s[all_box_mask].sum()) / (float(fg_attn_s.sum()) + 1e-8) * 100.0
+                    float(fg_attn_s_flat[all_box_m].sum().item()) / (float(fg_attn_s_flat.sum().item()) + 1e-8) * 100.0
                 )
 
+            # Chỉ copy map về CPU cho ảnh đầu tiên (idx == 0) để vẽ lưới trực quan hóa
             if idx == 0:
+                l2_map_np = l2_flat.reshape(Hs, Ws).cpu().numpy()
+                pca_rgb_np = pca_flat.reshape(Hs, Ws, 3).cpu().numpy()
+                fg_attn_s_np = fg_attn_s_flat.reshape(Hs, Ws).cpu().numpy()
                 if sn == "p3":
                     vis_pack = {
                         "img_np": s["img_np"],
                         "boxes_norm": boxes_norm,
-                        "l2_map": l2_map,
-                        "pca_rgb": pca_rgb,
-                        "fg_attn_p3": fg_attn_s,
+                        "l2_map": l2_map_np,
+                        "pca_rgb": pca_rgb_np,
+                        "fg_attn_p3": fg_attn_s_np,
                     }
-                vis_pack[f"l2_map_{sn}"] = l2_map
-                vis_pack[f"pca_rgb_{sn}"] = pca_rgb
-                vis_pack[f"fg_attn_{sn}"] = fg_attn_s
+                vis_pack[f"l2_map_{sn}"] = l2_map_np
+                vis_pack[f"pca_rgb_{sn}"] = pca_rgb_np
+                vis_pack[f"fg_attn_{sn}"] = fg_attn_s_np
 
         # ---------------------------------------------------------------------
         # B. ĐO TRÊN SLOTS CUỐI CÙNG (SAU KHI QUA TOÀN BỘ P3 + P4 + P5)
@@ -1331,15 +1429,14 @@ def evaluate_architecture(
             slot_class_seps.append(float(1.0 - sim_act[~np.eye(K_act, dtype=bool)].mean()))
 
         # 4. Tổng Foreground Attention Mass của Slots trên toàn bộ chuỗi [P3, P4, P5] rơi trúng GT Box
-        combined_box_mask = np.concatenate(all_masks_flat, axis=0)  # (n3+n4+n5,)
-        total_fg_attn_sum = float(fg_attn_all_tokens.sum()) + 1e-8
-        if combined_box_mask.any():
-            slot_fg_mass_pcts.append(float(fg_attn_all_tokens[combined_box_mask].sum()) / total_fg_attn_sum * 100.0)
+        total_fg_attn_sum = float(fg_attn_all_gpu.sum().item()) + 1e-8
+        if bool(all_box_mask_all.any().item()):
+            slot_fg_mass_pcts.append(float(fg_attn_all_gpu[all_box_mask_all].sum().item()) / total_fg_attn_sum * 100.0)
 
         # Tỷ trọng phân bổ Attention của 10 Foreground Slots cho P3 vs P4 vs P5
-        slot_share_p3_pcts.append(float(fg_attn_all_tokens[:n3].sum()) / total_fg_attn_sum * 100.0)
-        slot_share_p4_pcts.append(float(fg_attn_all_tokens[n3 : n3 + n4].sum()) / total_fg_attn_sum * 100.0)
-        slot_share_p5_pcts.append(float(fg_attn_all_tokens[n3 + n4 :].sum()) / total_fg_attn_sum * 100.0)
+        slot_share_p3_pcts.append(float(fg_attn_all_gpu[:n3].sum().item()) / total_fg_attn_sum * 100.0)
+        slot_share_p4_pcts.append(float(fg_attn_all_gpu[n3 : n3 + n4].sum().item()) / total_fg_attn_sum * 100.0)
+        slot_share_p5_pcts.append(float(fg_attn_all_gpu[n3 + n4 :].sum().item()) / total_fg_attn_sum * 100.0)
 
     # Tính ma trận khoảng cách Cosine 10x10 (45 cặp class) cho P3, P4, P5 và cho SLOTS cuối cùng
     pw_p3, mean45_p3 = _build_pairwise_matrix(sc_proto_sum["p3"], sc_proto_cnt["p3"], model.dim)
@@ -2001,7 +2098,8 @@ def main():
     parser.add_argument("--size", type=int, default=384, help="Kích thước ảnh (khuyên dùng 384, chia hết 32 & 6)")
     parser.add_argument("--epochs", type=int, default=15, help="Số epoch train mỗi kiến trúc")
     parser.add_argument("--batch-size", type=int, default=8)
-    parser.add_argument("--num-workers", type=int, default=2, help="Số worker đọc LMDB song song (khuyên dùng 2 trên Windows)")
+    parser.add_argument("--num-workers", type=int, default=2, help="Số worker đọc LMDB song song (tự động về 0 khi bật RAM Cache)")
+    parser.add_argument("--cache-ram-gb", type=float, default=16.0, help="Ngưỡng RAM tối đa (GB) để cache sẵn ảnh uint8 + bool masks (đặt 0 để tắt)")
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--w-cls-attn", type=float, default=0.5, help="Trọng số Per-Class Attention Loss (Dice + Pos CE)")
     parser.add_argument("--w-ortho", type=float, default=0.1, help="Trọng số Slot Orthogonality / Diversity Loss")
@@ -2027,14 +2125,19 @@ def main():
         n_val=args.n_val,
         img_size=args.size,
         seed=args.seed,
+        cache_ram_gb=args.cache_ram_gb,
     )
+    # Khi đã cache toàn bộ ảnh uint8 + bool masks vào RAM, dùng num_workers=0 để tránh Windows spawn/pickle nhân đôi RAM
+    effective_workers = 0 if train_ds.cached else args.num_workers
+    if train_ds.cached and args.num_workers > 0:
+        print(f"[*] RAM Cache đang bật -> tự động dùng num_workers=0 (không nhân bản RAM qua worker, đọc trực tiếp từ RAM siêu nhanh).")
     train_loader = DataLoader(
         train_ds,
         batch_size=args.batch_size,
         shuffle=True,
-        num_workers=args.num_workers,
+        num_workers=effective_workers,
         pin_memory=(device.type == "cuda"),
-        persistent_workers=(args.num_workers > 0),
+        persistent_workers=(effective_workers > 0),
     )
 
     for run_idx in range(1, args.runs + 1):

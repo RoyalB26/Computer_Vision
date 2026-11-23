@@ -32,7 +32,7 @@ data:
   train:
     dataset:
       type: "VisDroneLMDBDataset"
-      data_root: "/content/visdron.lmdb"   # Override via CLI --cfg-options data.train.dataset.data_root=...
+      data_root: "D:/apps/Datasets/VisDrone/VisDrone_data.lmdb"   # Override via CLI --cfg-options data.train.dataset.data_root=...
       split: "train"
       split_ratio: 0.8
       seed: 42
@@ -47,7 +47,7 @@ data:
   val:
     dataset:
       type: "VisDroneLMDBDataset"
-      data_root: "/content/visdron.lmdb"   # Override via CLI --cfg-options data.val.dataset.data_root=...
+      data_root: "D:/apps/Datasets/VisDrone/VisDrone_data.lmdb"   # Override via CLI --cfg-options data.val.dataset.data_root=...
       split: "val"
       split_ratio: 0.8
       seed: 42

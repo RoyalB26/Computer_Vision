@@ -239,6 +239,8 @@ class VisDroneDetector(BaseModel):
         bg_attn_weight: float = 0.5,
         fg_attn_weight: float = 0.5,
         suppress_weight: float = 0.05,
+        cls_attn_weight: float = 0.5,
+        ortho_weight: float = 0.1,
         **kwargs,
     ):
         super().__init__()
@@ -249,6 +251,8 @@ class VisDroneDetector(BaseModel):
         self.bg_attn_weight = float(bg_attn_weight)
         self.fg_attn_weight = float(fg_attn_weight)
         self.suppress_weight = float(suppress_weight)
+        self.cls_attn_weight = float(cls_attn_weight)
+        self.ortho_weight = float(ortho_weight)
         # 1. Backbone MobileNetV3 Small (Nano)
         try:
             weights = MobileNet_V3_Small_Weights.DEFAULT if pretrained else None
@@ -492,16 +496,122 @@ class VisDroneDetector(BaseModel):
 
         return torch.cat(multiscale_masks, dim=1)  # (B, 18900)
 
+    def _create_cls_masks_from_boxes(
+        self,
+        targets: Optional[Union[torch.Tensor, List[Any], Dict[str, Any]]],
+        resolutions: Tuple[Tuple[int, int], Tuple[int, int], Tuple[int, int]],
+        batch_size: int,
+        device: torch.device,
+    ) -> Optional[torch.Tensor]:
+        """Lấy hoặc tạo multi-scale per-class binary mask (B, num_classes, total_tokens)
+        từ Bounding Box và Class Labels (1.0 = Box của class c, 0.0 = vùng khác).
+        """
+        total_tokens = sum(h * w for h, w in resolutions)
+        K = self.num_classes
+
+        # --- Nhánh 1: Dùng trực tiếp `cls_mask` nếu đã được pre-compute ---
+        if isinstance(targets, (list, tuple)) and len(targets) >= batch_size:
+            if all(isinstance(item, dict) and "cls_mask" in item and item["cls_mask"] is not None for item in targets[:batch_size]):
+                first_m = targets[0]["cls_mask"]
+                if hasattr(first_m, "numel") and first_m.numel() == K * total_tokens:
+                    stacked = torch.stack(
+                        [item["cls_mask"].reshape(K, total_tokens) for item in targets[:batch_size]], dim=0
+                    )
+                    return stacked.to(device=device, dtype=torch.float32)
+        elif isinstance(targets, dict) and "cls_mask" in targets and targets["cls_mask"] is not None:
+            cm = targets["cls_mask"]
+            if isinstance(cm, torch.Tensor):
+                if cm.dim() == 2 and cm.shape == (K, total_tokens) and batch_size == 1:
+                    return cm.unsqueeze(0).to(device=device, dtype=torch.float32)
+                elif cm.dim() == 3 and cm.shape == (batch_size, K, total_tokens):
+                    return cm.to(device=device, dtype=torch.float32)
+            elif isinstance(cm, (list, tuple)) and len(cm) >= batch_size:
+                if hasattr(cm[0], "numel") and cm[0].numel() == K * total_tokens:
+                    return torch.stack(
+                        [m.reshape(K, total_tokens) for m in cm[:batch_size]], dim=0
+                    ).to(device=device, dtype=torch.float32)
+
+        # --- Nhánh 2: Rasterize on-the-fly từ (boxes, labels) ---
+        has_boxes_labels = False
+        boxes_list: List[Any] = []
+        labels_list: List[Any] = []
+
+        if isinstance(targets, (list, tuple)):
+            for item in targets:
+                if isinstance(item, dict) and "boxes" in item and "labels" in item:
+                    has_boxes_labels = True
+                    boxes_list.append(item["boxes"])
+                    labels_list.append(item["labels"])
+                else:
+                    boxes_list.append(None)
+                    labels_list.append(None)
+        elif isinstance(targets, dict) and "boxes" in targets and "labels" in targets:
+            has_boxes_labels = True
+            bxs = targets["boxes"]
+            lbls = targets["labels"]
+            if isinstance(bxs, (list, tuple)):
+                boxes_list = list(bxs)
+            elif isinstance(bxs, torch.Tensor) and bxs.dim() == 3:
+                boxes_list = [bxs[b] for b in range(bxs.shape[0])]
+            else:
+                boxes_list = [bxs]
+
+            if isinstance(lbls, (list, tuple)):
+                labels_list = list(lbls)
+            elif isinstance(lbls, torch.Tensor) and lbls.dim() == 2:
+                labels_list = [lbls[b] for b in range(lbls.shape[0])]
+            else:
+                labels_list = [lbls]
+
+        if not has_boxes_labels:
+            return None
+
+        multiscale_cls_masks = []
+        for H, W in resolutions:
+            cls_m = torch.zeros((batch_size, K, H, W), device=device, dtype=torch.float32)
+            for b in range(min(batch_size, len(boxes_list), len(labels_list))):
+                bxs = boxes_list[b]
+                lbls = labels_list[b]
+                if bxs is None or lbls is None or len(bxs) == 0 or len(lbls) == 0:
+                    continue
+                if isinstance(bxs, np.ndarray):
+                    bxs = torch.from_numpy(bxs)
+                if isinstance(lbls, np.ndarray):
+                    lbls = torch.from_numpy(lbls)
+                bxs = bxs.to(device=device, dtype=torch.float32)
+                lbls = lbls.to(device=device, dtype=torch.long)
+
+                valid = (lbls >= 0) & (lbls < K)
+                bxs = bxs[valid]
+                lbls = lbls[valid]
+                if len(bxs) == 0:
+                    continue
+
+                cx, cy, w, h = bxs[:, 0], bxs[:, 1], bxs[:, 2], bxs[:, 3]
+                x1 = ((cx - w / 2.0) * W).long().clamp(0, W - 1)
+                y1 = ((cy - h / 2.0) * H).long().clamp(0, H - 1)
+                x2 = torch.maximum(x1 + 1, ((cx + w / 2.0) * W).ceil().long().clamp(0, W))
+                y2 = torch.maximum(y1 + 1, ((cy + h / 2.0) * H).ceil().long().clamp(0, H))
+
+                for i in range(len(bxs)):
+                    c = int(lbls[i].item())
+                    cls_m[b, c, y1[i]:y2[i], x1[i]:x2[i]] = 1.0
+
+            multiscale_cls_masks.append(cls_m.flatten(2))  # (B, K, H*W)
+
+        return torch.cat(multiscale_cls_masks, dim=2)  # (B, K, total_tokens)
+
     def _compute_losses(
         self,
         inputs: torch.Tensor,
         pred_counts: torch.Tensor,
+        slots: torch.Tensor,
         attn_ori: torch.Tensor,
         resolutions: Tuple[Tuple[int, int], Tuple[int, int], Tuple[int, int]],
         gt_counts: torch.Tensor,
         targets: Optional[Union[torch.Tensor, List[Any], Dict[str, Any]]] = None,
     ) -> Dict[str, torch.Tensor]:
-        """Tính toán tổng hợp: Count Loss + Multi-scale Attention Mask Loss (từ Bounding Box)."""
+        """Tính toán tổng hợp: Count Loss + Multi-scale Attention Mask Loss + Per-Class Attention Loss + Slot Orthogonality Loss."""
         B, num_slots, total_tokens = attn_ori.shape
         (H3, W3), (H4, W4), (H5, W5) = resolutions
         n3 = H3 * W3
@@ -555,12 +665,64 @@ class VisDroneDetector(BaseModel):
                 loss_suppress = torch.tensor(0.0, device=inputs.device)
         else:
             loss_suppress = torch.tensor(0.0, device=inputs.device)
+
+        # 6. Per-Class Attention Loss (Dice Loss + Positive Focused CE cho các class active)
+        active_mask = (gt_counts > 0)  # (B, num_classes)
+        if self.cls_attn_weight > 0 and active_mask.any():
+            cls_mask = self._create_cls_masks_from_boxes(
+                targets=targets,
+                resolutions=resolutions,
+                batch_size=B,
+                device=inputs.device,
+            )
+            if cls_mask is not None:
+                p_cls = attn_ori[:, :self.num_classes, :].clamp(1e-6, 1.0 - 1e-6)  # (B, K, N)
+                inter = (p_cls * cls_mask).sum(dim=-1)  # (B, K)
+                card = p_cls.sum(dim=-1) + cls_mask.sum(dim=-1)  # (B, K)
+                dice = 1.0 - (2.0 * inter + 1.0) / (card + 1.0)
+                loss_dice = dice[active_mask].mean()
+
+                pos_pixels = (cls_mask > 0.5) & active_mask.unsqueeze(-1)
+                if pos_pixels.any():
+                    loss_pos = -torch.log(p_cls[pos_pixels]).mean()
+                else:
+                    loss_pos = torch.tensor(0.0, device=inputs.device)
+
+                loss_cls_attn = loss_dice + 0.5 * loss_pos
+            else:
+                loss_cls_attn = torch.tensor(0.0, device=inputs.device)
+        else:
+            loss_cls_attn = torch.tensor(0.0, device=inputs.device)
+
+        # 7. Slot Orthogonality / Diversity Loss (chống Slot Collapse)
+        if self.ortho_weight > 0 and self.num_classes > 1:
+            K = self.num_classes
+            denom = float(K * (K - 1))
+            eye_k = torch.eye(K, device=inputs.device, dtype=slots.dtype)
+
+            # 7a. Orthogonality trên final class slots: slots[:, :K, :] (B, K, D)
+            norm_slots = F.normalize(slots[:, :K, :], p=2, dim=-1)
+            sim_matrix = torch.bmm(norm_slots, norm_slots.transpose(1, 2))  # (B, K, K)
+            off_diag = sim_matrix * (1.0 - eye_k.unsqueeze(0))
+            loss_slot_ortho = (off_diag ** 2).sum(dim=(-1, -2)).mean() / denom
+
+            # 7b. Orthogonality trên learnable query embeddings ban đầu (1, K, D)
+            norm_queries = F.normalize(self.slot_attention.obj_queries[:, :K, :], p=2, dim=-1)
+            sim_q = torch.bmm(norm_queries, norm_queries.transpose(1, 2))[0] * (1.0 - eye_k)
+            loss_q_ortho = (sim_q ** 2).sum() / denom
+
+            loss_ortho = loss_slot_ortho + 0.5 * loss_q_ortho
+        else:
+            loss_ortho = torch.tensor(0.0, device=inputs.device)
+
         # Tổng hợp loss
         total_loss = (
             self.count_loss_weight * loss_count
             + self.bg_attn_weight * loss_bg_attn
             + self.fg_attn_weight * loss_fg_attn
             + self.suppress_weight * loss_suppress
+            + self.cls_attn_weight * loss_cls_attn
+            + self.ortho_weight * loss_ortho
         )
         return {
             "loss": total_loss,
@@ -568,6 +730,8 @@ class VisDroneDetector(BaseModel):
             "loss_bg_attn": loss_bg_attn,
             "loss_fg_attn": loss_fg_attn,
             "loss_suppress": loss_suppress,
+            "loss_cls_attn": loss_cls_attn,
+            "loss_ortho": loss_ortho,
         }
     def forward_train(
         self,
@@ -583,6 +747,7 @@ class VisDroneDetector(BaseModel):
         return self._compute_losses(
             inputs=inputs,
             pred_counts=pred_counts,
+            slots=slots,
             attn_ori=attn_ori,
             resolutions=resolutions,
             gt_counts=gt_counts,
@@ -602,6 +767,7 @@ class VisDroneDetector(BaseModel):
         loss_dict = self._compute_losses(
             inputs=inputs,
             pred_counts=pred_counts,
+            slots=slots,
             attn_ori=attn_ori,
             resolutions=resolutions,
             gt_counts=gt_counts,

@@ -308,6 +308,12 @@ class TaskAlignedAssigner(nn.Module):
         bs, num_anchors, _ = pred_scores.shape
         _, max_num_gt, _ = gt_bboxes.shape
 
+        # Compute assignment in float32 to avoid AMP Half/Float mismatches and numerical underflow
+        pred_scores = pred_scores.float()
+        pred_bboxes = pred_bboxes.float()
+        anchor_points = anchor_points.float()
+        gt_bboxes = gt_bboxes.float()
+
         if max_num_gt == 0 or not mask_gt.any():
             device = pred_scores.device
             return (
@@ -470,62 +476,66 @@ class YOLOv11DetectionLoss(nn.Module):
             Dict containing 'loss', 'loss_diou', 'loss_focal', 'loss_dfl'.
         """
         device = decoded_bboxes.device
-        pred_dist = preds["boxes"].transpose(1, 2)  # [B, N, 4*reg_max]
-        pred_scores = preds["scores"].transpose(1, 2)  # [B, N, nc]
-        bs, num_anchors, _ = pred_scores.shape
+        with torch.amp.autocast(device_type=device.type, enabled=False):
+            pred_dist = preds["boxes"].transpose(1, 2).float()  # [B, N, 4*reg_max]
+            pred_scores = preds["scores"].transpose(1, 2).float()  # [B, N, nc]
+            decoded_bboxes = decoded_bboxes.float()
+            anchor_points = anchor_points.float()
+            stride_tensor = stride_tensor.float()
+            bs, num_anchors, _ = pred_scores.shape
 
-        # Format targets into padded tensors [B, max_gt, 4] and [B, max_gt, 1]
-        gt_bboxes, gt_labels, mask_gt = self._prepare_targets(targets, img_size, device)
+            # Format targets into padded tensors [B, max_gt, 4] and [B, max_gt, 1]
+            gt_bboxes, gt_labels, mask_gt = self._prepare_targets(targets, img_size, device)
 
-        # Dynamic target assignment
-        target_bboxes, target_scores, fg_mask = self.assigner(
-            pred_scores=pred_scores.sigmoid(),
-            pred_bboxes=decoded_bboxes,
-            anchor_points=anchor_points,
-            gt_labels=gt_labels,
-            gt_bboxes=gt_bboxes,
-            mask_gt=mask_gt,
-        )
+            # Dynamic target assignment
+            target_bboxes, target_scores, fg_mask = self.assigner(
+                pred_scores=pred_scores.sigmoid(),
+                pred_bboxes=decoded_bboxes,
+                anchor_points=anchor_points,
+                gt_labels=gt_labels,
+                gt_bboxes=gt_bboxes,
+                mask_gt=mask_gt,
+            )
 
-        num_pos = max(float(fg_mask.sum().item()), 1.0)
+            num_pos = max(float(fg_mask.sum().item()), 1.0)
 
-        # 1. Classification: Sigmoid Focal Loss across ALL anchors
-        loss_focal = self.focal_loss(
-            pred_scores,
-            target_scores,
-            normalizer=num_pos,
-        ) * self.cls_weight
-
-        # 2. Localization: DIoU Loss and DFL on FOREGROUND anchors
-        if fg_mask.any():
-            pos_pred_bboxes = decoded_bboxes[fg_mask]
-            pos_target_bboxes = target_bboxes[fg_mask]
-
-            # DIoU loss
-            loss_diou = self.diou_loss(
-                pos_pred_bboxes,
-                pos_target_bboxes,
-                xywh=False,
-            ) / num_pos * self.box_weight
-
-            # DFL loss
-            pos_anchor_points = anchor_points.unsqueeze(0).expand(bs, -1, -1)[fg_mask]
-            pos_stride = stride_tensor.unsqueeze(0).expand(bs, -1, -1)[fg_mask]
-
-            # Convert target xyxy to distance (ltrb) in stride units
-            target_ltrb = self._bbox2dist(pos_anchor_points, pos_target_bboxes) / pos_stride
-            pos_pred_dist = pred_dist[fg_mask].view(-1, 4, self.reg_max)
-
-            loss_dfl = self.dfl_loss(
-                pos_pred_dist,
-                target_ltrb,
+            # 1. Classification: Sigmoid Focal Loss across ALL anchors
+            loss_focal = self.focal_loss(
+                pred_scores,
+                target_scores,
                 normalizer=num_pos,
-            ) * self.dfl_weight
-        else:
-            loss_diou = torch.tensor(0.0, device=device)
-            loss_dfl = torch.tensor(0.0, device=device)
+            ) * self.cls_weight
 
-        total_loss = loss_focal + loss_diou + loss_dfl
+            # 2. Localization: DIoU Loss and DFL on FOREGROUND anchors
+            if fg_mask.any():
+                pos_pred_bboxes = decoded_bboxes[fg_mask]
+                pos_target_bboxes = target_bboxes[fg_mask]
+
+                # DIoU loss
+                loss_diou = self.diou_loss(
+                    pos_pred_bboxes,
+                    pos_target_bboxes,
+                    xywh=False,
+                ) / num_pos * self.box_weight
+
+                # DFL loss
+                pos_anchor_points = anchor_points.unsqueeze(0).expand(bs, -1, -1)[fg_mask]
+                pos_stride = stride_tensor.unsqueeze(0).expand(bs, -1, -1)[fg_mask]
+
+                # Convert target xyxy to distance (ltrb) in stride units
+                target_ltrb = self._bbox2dist(pos_anchor_points, pos_target_bboxes) / pos_stride
+                pos_pred_dist = pred_dist[fg_mask].view(-1, 4, self.reg_max)
+
+                loss_dfl = self.dfl_loss(
+                    pos_pred_dist,
+                    target_ltrb,
+                    normalizer=num_pos,
+                ) * self.dfl_weight
+            else:
+                loss_diou = torch.tensor(0.0, device=device)
+                loss_dfl = torch.tensor(0.0, device=device)
+
+            total_loss = loss_focal + loss_diou + loss_dfl
 
         return {
             "loss": total_loss,

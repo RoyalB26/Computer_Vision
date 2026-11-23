@@ -1,0 +1,2 @@
+mAP50,mAP50_95,precision_c25,recall_c25,f1_c25,total_gt,active_classes,mAP50_95_small,mAP50_95_medium,mAP50_95_large,latency_ms,fps,total_eval_sec,params_total_m,params_backbone_m,params_neck_m,params_head_m,head_share_p3_pct,head_share_p4_pct,head_share_p5_pct
+0.61061,0.45163,0.70338,0.53251,0.60613,2152,80,0.13575,0.44067,0.64872,17.45645,57.28542,73.09652,2.62408,1.36547,0.7937,0.46491,16.31127,25.6504,58.03833

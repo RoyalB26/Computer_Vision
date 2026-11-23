@@ -5,6 +5,7 @@ full compatibility with BaseModel training engines, registries, hooks, and metri
 """
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Union
+import math
 import torch
 import torch.nn as nn
 import torchvision.ops
@@ -14,6 +15,7 @@ from BaseModel.model.base_model import BaseModel
 from yolo.yolov11 import YOLOv11, _extract_state_dict
 from yolo.head import make_anchors, dist2bbox
 from .loss import YOLOv11DetectionLoss, DIoULoss, SigmoidFocalLoss
+from .slot_module import PostNeckSlotFiLMRefiner, SlotAuxiliaryLoss
 
 
 @MODELS.register_module(name="VisDroneYOLO11", force=True)
@@ -77,6 +79,18 @@ class VisDroneYOLO11(BaseModel):
         # Load pretrained weights if specified
         if pretrained:
             self.load_pretrained(pretrained)
+
+        # Initialize classification head bias with Focal Loss prior (p=0.01 -> b ≈ -4.595)
+        # Prevents initial loss_focal explosion (~16,000+) when cv3 final conv is randomly initialized
+        self._init_cls_bias(prior_prob=0.01)
+
+    def _init_cls_bias(self, prior_prob: float = 0.01) -> None:
+        """Initialize Detect.cv3 final conv bias for stable Sigmoid Focal Loss."""
+        bias_val = -math.log((1.0 - prior_prob) / prior_prob)
+        for branch in self.net.head.cv3:
+            last_conv = branch[-1]
+            if isinstance(last_conv, nn.Conv2d) and last_conv.bias is not None:
+                nn.init.constant_(last_conv.bias, bias_val)
 
     def load_pretrained(self, weights_path: Union[str, Path]) -> Tuple[List[str], List[str]]:
         """Load pretrained weights into backbone and neck with shape mismatch filtering."""
@@ -329,3 +343,236 @@ class VisDroneYOLO11(BaseModel):
         for param in self.net.backbone.parameters():
             param.requires_grad = True
         print("[VisDroneYOLO11] Backbone parameters unfrozen.")
+
+
+@MODELS.register_module(name="VisDroneYOLO11Slot", force=True)
+@MODELS.register_module(name="VisDroneYOLOv11Slot", force=True)
+class VisDroneYOLO11Slot(VisDroneYOLO11):
+    """YOLOv11 + Post-Neck Decoupled Slot Attention & FiLM Refinement (Method B+C).
+
+    Architecture:
+      1. YOLOv11 Backbone + YOLOv11 PANet Neck -> [P3 (64), P4 (128), P5 (256)].
+      2. PostNeckSlotFiLMRefiner:
+         - Extracts K+1 image-adaptive semantic slots via LightweightSlotAttention.
+         - Broadcasts slots back via `attn_ori` and modulates ONLY the classification branch
+           via Zero-Init FiLM (or Residual), preserving box localization boundaries and
+           100% of pretrained yolo11n.pt behavior at epoch 0.
+         - Optionally adds zero-init direct semantic logit prior to Detect.cv3 outputs.
+      3. Joint loss: YOLOv11 (DIoU + Focal + DFL) + `slot_loss_weight` * SlotAuxiliaryLoss.
+    """
+
+    def __init__(
+        self,
+        num_classes: int = 10,
+        pretrained: Optional[Union[str, Path]] = None,
+        box_weight: float = 7.5,
+        cls_weight: float = 1.0,
+        dfl_weight: float = 1.5,
+        focal_alpha: float = 0.25,
+        focal_gamma: float = 2.0,
+        conf_threshold: float = 0.05,
+        nms_threshold: float = 0.5,
+        max_det: int = 300,
+        # Slot + FiLM (B+C) hyperparameters
+        slot_dim: int = 32,
+        fusion_mode: str = "film",
+        use_bg_slot_write: bool = False,
+        use_logit_prior: bool = True,
+        use_slot_checkpoint: bool = False,
+        slot_loss_weight: float = 0.3,
+        bg_attn_weight: float = 0.5,
+        fg_attn_weight: float = 0.5,
+        suppress_weight: float = 0.05,
+        cls_attn_weight: float = 0.5,
+        ortho_weight: float = 0.1,
+    ):
+        super().__init__(
+            num_classes=num_classes,
+            pretrained=pretrained,
+            box_weight=box_weight,
+            cls_weight=cls_weight,
+            dfl_weight=dfl_weight,
+            focal_alpha=focal_alpha,
+            focal_gamma=focal_gamma,
+            conf_threshold=conf_threshold,
+            nms_threshold=nms_threshold,
+            max_det=max_det,
+        )
+        self.slot_loss_weight = float(slot_loss_weight)
+
+        self.slot_refiner = PostNeckSlotFiLMRefiner(
+            in_channels=(64, 128, 256),
+            num_classes=num_classes,
+            slot_dim=slot_dim,
+            fusion_mode=fusion_mode,
+            use_bg_slot_write=use_bg_slot_write,
+            use_logit_prior=use_logit_prior,
+            use_checkpoint=use_slot_checkpoint,
+        )
+        self.slot_criterion = SlotAuxiliaryLoss(
+            num_classes=num_classes,
+            bg_attn_weight=bg_attn_weight,
+            fg_attn_weight=fg_attn_weight,
+            suppress_weight=suppress_weight,
+            cls_attn_weight=cls_attn_weight,
+            ortho_weight=ortho_weight,
+        )
+
+    def _forward_head_with_slots(
+        self, inputs: torch.Tensor
+    ) -> Tuple[List[torch.Tensor], torch.Tensor, torch.Tensor, Dict[str, Any]]:
+        """Shared backbone -> neck -> slot FiLM -> decoupled head forward."""
+        feat4, feat6, feat10 = self.net.backbone(inputs)
+        p3, p4, p5 = self.net.neck(feat4, feat6, feat10)
+        feats = [p3, p4, p5]
+
+        # Post-neck Slot Attention + FiLM modulation for classification branch only
+        cls_feats, slot_info = self.slot_refiner(feats)
+
+        bs = p3.shape[0]
+        # Box regression uses original neck features (sharp boundaries)
+        boxes_raw = torch.cat(
+            [self.net.head.cv2[i](feats[i]).view(bs, 4 * self.net.head.reg_max, -1) for i in range(self.net.head.nl)],
+            dim=-1,
+        )
+        # Classification uses slot-modulated features
+        scores_raw = torch.cat(
+            [self.net.head.cv3[i](cls_feats[i]).view(bs, self.num_classes, -1) for i in range(self.net.head.nl)],
+            dim=-1,
+        )
+        if slot_info["logit_prior"] is not None:
+            scores_raw = scores_raw + slot_info["logit_prior"]
+
+        return feats, boxes_raw, scores_raw, slot_info
+
+    def forward_train(
+        self,
+        inputs: torch.Tensor,
+        targets: Optional[Union[List[Dict[str, torch.Tensor]], torch.Tensor]] = None,
+        **kwargs,
+    ) -> Dict[str, torch.Tensor]:
+        """Training forward pass computing YOLOv11 detection loss + Slot auxiliary loss."""
+        feats, boxes_raw, scores_raw, slot_info = self._forward_head_with_slots(inputs)
+        preds = {"boxes": boxes_raw, "scores": scores_raw, "feats": feats}
+
+        # Decode bounding boxes for Task-Aligned Assignment
+        a_raw, s_raw = make_anchors(feats, self.net.head.stride, 0.5)
+        anchors, strides = (a.transpose(0, 1).to(inputs.device) for a in (a_raw, s_raw))
+
+        pred_dist = self.net.head.dfl(boxes_raw)
+        decoded_xyxy = dist2bbox(pred_dist, anchors.unsqueeze(0), xywh=False, dim=1) * strides
+        decoded_xyxy = decoded_xyxy.transpose(1, 2)
+
+        anchor_points_pixel = (anchors * strides).transpose(0, 1)
+        stride_tensor = strides.transpose(0, 1)
+        img_size = (inputs.shape[2], inputs.shape[3])
+
+        # 1. Core YOLOv11 detection loss (DIoU + Focal + DFL)
+        loss_dict = self.criterion(
+            preds=preds,
+            targets=targets,
+            decoded_bboxes=decoded_xyxy,
+            anchor_points=anchor_points_pixel,
+            stride_tensor=stride_tensor,
+            img_size=img_size,
+        )
+
+        # 2. Auxiliary Slot semantic supervision (unified pixel xyxy GT boxes)
+        if self.slot_loss_weight > 0 and targets is not None:
+            gt_bboxes, gt_labels, mask_gt = self.criterion._prepare_targets(
+                targets, img_size, inputs.device
+            )
+            slot_losses = self.slot_criterion(
+                slots=slot_info["slots"],
+                attn_ori=slot_info["attn_ori"],
+                obj_queries=self.slot_refiner.slot_attention.obj_queries,
+                resolutions=slot_info["resolutions"],
+                gt_bboxes=gt_bboxes,
+                gt_labels=gt_labels,
+                mask_gt=mask_gt,
+                img_size=img_size,
+            )
+            loss_dict["loss"] = loss_dict["loss"] + self.slot_loss_weight * slot_losses["loss_slot"]
+            loss_dict.update(slot_losses)
+
+        return loss_dict
+
+    def predict(
+        self,
+        inputs: torch.Tensor,
+        conf_threshold: Optional[float] = None,
+        nms_threshold: Optional[float] = None,
+        max_det: Optional[int] = None,
+        output_format: str = "xyxy",
+        **kwargs,
+    ) -> List[Dict[str, torch.Tensor]]:
+        """Inference forward pass with Slot-FiLM classification refinement + Batched NMS."""
+        c_th = conf_threshold if conf_threshold is not None else self.conf_threshold
+        n_th = nms_threshold if nms_threshold is not None else self.nms_threshold
+        m_det = max_det if max_det is not None else self.max_det
+
+        was_training = self.training
+        self.eval()
+
+        with torch.no_grad():
+            bs, _, img_h, img_w = inputs.shape
+            feats, boxes_raw, scores_raw, _ = self._forward_head_with_slots(inputs)
+
+            a_raw, s_raw = make_anchors(feats, self.net.head.stride, 0.5)
+            anchors, strides = (a.transpose(0, 1).to(inputs.device) for a in (a_raw, s_raw))
+
+            pred_dist = self.net.head.dfl(boxes_raw)
+            decoded_boxes = dist2bbox(pred_dist, anchors.unsqueeze(0), xywh=False, dim=1) * strides
+            decoded_boxes = decoded_boxes.transpose(1, 2)
+            probs = scores_raw.sigmoid().transpose(1, 2)
+
+        if was_training:
+            self.train()
+
+        results = []
+        for b in range(bs):
+            b_boxes = decoded_boxes[b]
+            b_probs = probs[b]
+
+            max_scores, labels = b_probs.max(dim=-1)
+            valid_mask = max_scores >= c_th
+
+            if not valid_mask.any():
+                results.append({
+                    "boxes": torch.empty((0, 4), device=inputs.device),
+                    "scores": torch.empty((0,), device=inputs.device),
+                    "labels": torch.empty((0,), dtype=torch.long, device=inputs.device),
+                })
+                continue
+
+            cand_boxes = b_boxes[valid_mask]
+            cand_scores = max_scores[valid_mask]
+            cand_labels = labels[valid_mask]
+
+            if len(cand_scores) > 1000:
+                topk_idx = torch.topk(cand_scores, 1000).indices
+                cand_boxes = cand_boxes[topk_idx]
+                cand_scores = cand_scores[topk_idx]
+                cand_labels = cand_labels[topk_idx]
+
+            cand_boxes[:, [0, 2]] = cand_boxes[:, [0, 2]].clamp(0, img_w)
+            cand_boxes[:, [1, 3]] = cand_boxes[:, [1, 3]].clamp(0, img_h)
+
+            keep = torchvision.ops.batched_nms(cand_boxes, cand_scores, cand_labels, n_th)
+            keep = keep[:m_det]
+
+            final_boxes = cand_boxes[keep]
+            final_scores = cand_scores[keep]
+            final_labels = cand_labels[keep]
+
+            if output_format == "normalized":
+                final_boxes[:, [0, 2]] /= img_w
+                final_boxes[:, [1, 3]] /= img_h
+
+            results.append({
+                "boxes": final_boxes,
+                "scores": final_scores,
+                "labels": final_labels,
+            })
+
+        return results
