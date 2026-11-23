@@ -46,7 +46,8 @@ data:
   train:
     dataset:
       type: "VisDroneLMDBDataset"
-      data_root: "D:/apps/Datasets/VisDrone/VisDrone_data.lmdb"
+      data_root: "/content/visdron.lmdb"
+      bg_lmdb_path: "/content/bg_seg.lmdb"
       split: "train"
       split_ratio: 0.8
       seed: 42
@@ -56,14 +57,15 @@ data:
         - type: "Resize"
           size: [960, 960]
         - type: "ToTensor"
-    batch_size: 8
+    batch_size: 16
     shuffle: true
     num_workers: 4
 
   val:
     dataset:
       type: "VisDroneLMDBDataset"
-      data_root: "D:/apps/Datasets/VisDrone/VisDrone_data.lmdb"
+      data_root: "/content/visdron.lmdb"
+      bg_lmdb_path: "/content/bg_seg.lmdb"
       split: "val"
       split_ratio: 0.8
       seed: 42
@@ -73,7 +75,7 @@ data:
         - type: "Resize"
           size: [960, 960]
         - type: "ToTensor"
-    batch_size: 8
+    batch_size: 16
     shuffle: false
     num_workers: 2
 
@@ -98,16 +100,23 @@ metrics:
 # 6. Training Hyperparameters
 train_cfg:
   max_epochs: 100
-  val_interval: 1
+  val_interval: 10
   grad_clip: 10.0
   use_amp: true
-  accumulate: 2                # effective batch size = 8 * 2 = 16
-
+  accumulate: 1                # effective batch size = 8 * 2 = 16
+  log_interval: 50000
 # 7. Lifecycle Hooks
 hooks:
-  - type: "LoggerHook"
-    interval: 50
   - type: "CheckpointHook"
     interval: 1
     save_best: "mAP_50"
     mode: "max"
+  - type: "ExcelTracker"
+    filename: "training_metrics.xlsx"       # Lưu trực tiếp vào thư mục work_dir
+    track_gradients: true                   # Bật tracking gradient chi tiết
+    grad_interval: 1                        # Chu kỳ lấy mẫu gradient (mỗi 1 batch)
+    track_detection: true                   # Bật tracking tab Detection phân tích động lực học mô hình
+    detection_interval: 5                   # Chu kỳ lấy mẫu phân tích detection (mỗi 5 batch)
+    auto_save: true                         # Tự động ghi ra file Excel sau mỗi epoch
+    resume: true                            # Tự động tiếp tục ghi tiếp vào sheet nếu file đã tồn tại
+    submodules: null

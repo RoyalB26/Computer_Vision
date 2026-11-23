@@ -13,7 +13,7 @@ import VisDrone_yolov11.loss
 import VisDrone_yolov11.model
 import VisDrone_yolov11.metrics
 
-from BaseModel.scripts.train import main
+from BaseModel.scripts.train import main as gpu_main
 
 if __name__ == "__main__":
     # If no configuration file passed via CLI, default to local config.yaml
@@ -21,4 +21,8 @@ if __name__ == "__main__":
         config_path = os.path.join(os.path.dirname(__file__), "config.yaml")
         sys.argv.extend(["--config", config_path])
 
-    main()
+    if "--tpu" in sys.argv:
+        from VisDrone_yolov11.tpu_train import main as tpu_main
+        tpu_main()
+    else:
+        gpu_main()
