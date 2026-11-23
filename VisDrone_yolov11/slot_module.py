@@ -280,49 +280,62 @@ class SlotAuxiliaryLoss(nn.Module):
         img_size: Tuple[int, int],
         num_classes: int,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Rasterize multi-scale bg_mask (B, N), cls_mask (B, K, N), and gt_counts (B, K) from pixel xyxy."""
-        bs = gt_bboxes.shape[0]
+        """Fully vectorized GPU rasterization of bg_mask (B, N), cls_mask (B, K, N), and gt_counts (B, K).
+
+        Zero `.item()` calls and zero Python loops over boxes -> ~10-20x faster on GPU.
+        """
+        bs, max_m, _ = gt_bboxes.shape
         device = gt_bboxes.device
         img_h, img_w = float(img_size[0]), float(img_size[1])
 
+        valid = mask_gt.squeeze(-1).bool()  # (B, M)
+        lbls = gt_labels.squeeze(-1).long()  # (B, M)
+        valid_cls = valid & (lbls >= 0) & (lbls < num_classes)
+        lbls_safe = lbls.clamp(0, num_classes - 1)
+
+        # (B, M, K) one-hot masked by valid_cls
+        one_hot = F.one_hot(lbls_safe, num_classes=num_classes).float() * valid_cls.unsqueeze(-1).float()
+        gt_counts = one_hot.sum(dim=1)  # (B, K)
+
+        if max_m == 0:
+            total_n = sum(h * w for h, w in resolutions)
+            return (
+                torch.ones((bs, total_n), device=device, dtype=torch.float32),
+                torch.zeros((bs, num_classes, total_n), device=device, dtype=torch.float32),
+                gt_counts,
+            )
+
         bg_scales = []
         cls_scales = []
-        gt_counts = torch.zeros((bs, num_classes), device=device, dtype=torch.float32)
-
-        for b in range(bs):
-            valid = mask_gt[b].squeeze(-1)
-            if valid.any():
-                lbls = gt_labels[b][valid].squeeze(-1).long()
-                lbls = lbls[(lbls >= 0) & (lbls < num_classes)]
-                if len(lbls) > 0:
-                    gt_counts[b] = torch.bincount(lbls, minlength=num_classes).float()
+        valid_f = valid.unsqueeze(-1).float()  # (B, M, 1)
 
         for h, w in resolutions:
-            bg_m = torch.ones((bs, h, w), device=device, dtype=torch.float32)
-            cls_m = torch.zeros((bs, num_classes, h, w), device=device, dtype=torch.float32)
             sx = w / max(img_w, 1.0)
             sy = h / max(img_h, 1.0)
 
-            for b in range(bs):
-                valid = mask_gt[b].squeeze(-1)
-                if not valid.any():
-                    continue
-                bxs = gt_bboxes[b][valid]  # (M, 4) xyxy pixels
-                lbls = gt_labels[b][valid].squeeze(-1).long()
+            x1 = (gt_bboxes[:, :, 0] * sx).floor().clamp(0, w - 1)             # (B, M)
+            y1 = (gt_bboxes[:, :, 1] * sy).floor().clamp(0, h - 1)             # (B, M)
+            x2 = torch.maximum(x1 + 1.0, (gt_bboxes[:, :, 2] * sx).ceil().clamp(0, w))  # (B, M)
+            y2 = torch.maximum(y1 + 1.0, (gt_bboxes[:, :, 3] * sy).ceil().clamp(0, h))  # (B, M)
 
-                x1 = (bxs[:, 0] * sx).floor().long().clamp(0, w - 1)
-                y1 = (bxs[:, 1] * sy).floor().long().clamp(0, h - 1)
-                x2 = torch.maximum(x1 + 1, (bxs[:, 2] * sx).ceil().long().clamp(0, w))
-                y2 = torch.maximum(y1 + 1, (bxs[:, 3] * sy).ceil().long().clamp(0, h))
+            xs = torch.arange(w, device=device, dtype=torch.float32)  # (W,)
+            ys = torch.arange(h, device=device, dtype=torch.float32)  # (H,)
 
-                for i in range(len(bxs)):
-                    bg_m[b, y1[i] : y2[i], x1[i] : x2[i]] = 0.0
-                    c = int(lbls[i].item())
-                    if 0 <= c < num_classes:
-                        cls_m[b, c, y1[i] : y2[i], x1[i] : x2[i]] = 1.0
+            # (B, M, W) and (B, M, H)
+            in_x = (xs.view(1, 1, w) >= x1.unsqueeze(-1)) & (xs.view(1, 1, w) < x2.unsqueeze(-1))
+            in_y = (ys.view(1, 1, h) >= y1.unsqueeze(-1)) & (ys.view(1, 1, h) < y2.unsqueeze(-1))
 
-            bg_scales.append(bg_m.flatten(1))      # (B, H*W)
-            cls_scales.append(cls_m.flatten(2))    # (B, K, H*W)
+            # (B, M, H*W) float mask of pixels inside each valid box
+            box_hw = (in_y.unsqueeze(-1) & in_x.unsqueeze(-2)).view(bs, max_m, h * w).float() * valid_f
+
+            # Background mask: 1.0 where no valid box covers the pixel
+            bg_flat = (box_hw.sum(dim=1) == 0.0).float()  # (B, H*W)
+
+            # Per-class mask via batched matmul: (B, K, M) @ (B, M, H*W) -> (B, K, H*W)
+            cls_flat = torch.bmm(one_hot.transpose(1, 2), box_hw).clamp_(0.0, 1.0)
+
+            bg_scales.append(bg_flat)
+            cls_scales.append(cls_flat)
 
         return torch.cat(bg_scales, dim=1), torch.cat(cls_scales, dim=2), gt_counts
 

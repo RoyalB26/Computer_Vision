@@ -55,6 +55,8 @@ class VisDroneLMDBDataset(BaseDataset):
         num_classes: int = 10,
         bg_lmdb_path: Optional[str] = None,
         include_boxes: bool = True,
+        cache_images: Optional[str] = None,   # None | "ram" (shared uint8 tensor) | "jpeg" (compressed bytes)
+        cache_size: Optional[Tuple[int, int]] = None,
         **kwargs,
     ):
         self.split = split.lower()
@@ -63,13 +65,66 @@ class VisDroneLMDBDataset(BaseDataset):
         self.num_classes = num_classes
         self.bg_lmdb_path = bg_lmdb_path
         self.include_boxes = include_boxes
+        self.cache_images = cache_images.lower() if isinstance(cache_images, str) else None
+        self.cache_size = tuple(cache_size) if cache_size is not None else self._infer_resize_from_pipeline(pipeline)
         self.env = None
         self.txn = None
         self.bg_env = None
         self.bg_txn = None
         self._bg_num_tokens = 18900
         self._bg_format = "packbits_uint8"
+        self._ram_images: Optional[torch.Tensor] = None
+        self._ram_targets: Optional[List[Dict[str, Any]]] = None
+        self._jpeg_cache: Optional[List[Tuple[bytes, Dict[str, Any]]]] = None
         super().__init__(data_root=data_root, pipeline=pipeline, test_mode=test_mode)
+
+        if self.cache_images in ("ram", "jpeg") and len(self.data_infos) > 0:
+            self._build_ram_cache()
+
+    @staticmethod
+    def _infer_resize_from_pipeline(pipeline: Optional[Any]) -> Tuple[int, int]:
+        if isinstance(pipeline, list):
+            for step in pipeline:
+                if isinstance(step, dict) and step.get("type") == "Resize" and "size" in step:
+                    sz = step["size"]
+                    return (int(sz[0]), int(sz[1]))
+        return (960, 960)
+
+    def _build_ram_cache(self) -> None:
+        """Pre-load all samples into shared RAM once to eliminate Disk/LMDB + Resize overhead."""
+        n = len(self.data_infos)
+        self._init_db()
+
+        if self.cache_images == "ram":
+            h, w = self.cache_size
+            gb = (n * 3 * h * w) / (1024 ** 3)
+            print(f"[VisDroneLMDBDataset:{self.split}] Caching {n:,} resized images ({h}x{w} uint8) into shared RAM (~{gb:.2f} GB)...")
+            buf = torch.empty((n, 3, h, w), dtype=torch.uint8).share_memory_()
+            targets_cache: List[Dict[str, Any]] = []
+            for idx in range(n):
+                info = self._read_lmdb_sample(idx)
+                img_resized = info["image"].resize((w, h), Image.BILINEAR)
+                arr = np.asarray(img_resized, dtype=np.uint8)  # (H, W, 3)
+                buf[idx] = torch.from_numpy(arr).permute(2, 0, 1)
+                targets_cache.append(info["target"])
+            self._ram_images = buf
+            self._ram_targets = targets_cache
+            print(f"[VisDroneLMDBDataset:{self.split}] RAM cache ready ({gb:.2f} GB shared memory).")
+
+        elif self.cache_images == "jpeg":
+            print(f"[VisDroneLMDBDataset:{self.split}] Caching {n:,} compressed JPEG bytes into RAM...")
+            jpeg_cache: List[Tuple[bytes, Dict[str, Any]]] = []
+            total_bytes = 0
+            for idx in range(n):
+                real_idx = self.data_infos[idx]["lmdb_idx"]
+                key = f"{real_idx:08d}".encode("ascii")
+                data = pickle.loads(self.txn.get(key))
+                img_bytes = data["image"]
+                total_bytes += len(img_bytes)
+                target = self._build_target(data, key)
+                jpeg_cache.append((img_bytes, target))
+            self._jpeg_cache = jpeg_cache
+            print(f"[VisDroneLMDBDataset:{self.split}] JPEG RAM cache ready (~{total_bytes / (1024 ** 3):.2f} GB).")
 
     @staticmethod
     def _load_or_scan_class_counts(data_root: str, txn, total: int, num_classes: int) -> np.ndarray:
@@ -266,18 +321,7 @@ class VisDroneLMDBDataset(BaseDataset):
             if fmt_bytes is not None:
                 self._bg_format = fmt_bytes.decode("ascii")
 
-    def get_data_info(self, idx: int) -> Dict[str, Any]:
-        """Fetch a single sample from the LMDB database."""
-        self._init_db()
-        real_idx = self.data_infos[idx]["lmdb_idx"]
-        key = f"{real_idx:08d}".encode("ascii")
-
-        byteflow = self.txn.get(key)
-        data = pickle.loads(byteflow)
-
-        buffer = io.BytesIO(data["image"])
-        image = Image.open(buffer).convert("RGB")
-
+    def _build_target(self, data: Dict[str, Any], key: bytes) -> Dict[str, Any]:
         raw_boxes = data.get("boxes", [])
         raw_labels = data.get("labels", [])
 
@@ -316,8 +360,35 @@ class VisDroneLMDBDataset(BaseDataset):
                 if len(raw_labels) > 0
                 else torch.empty((0,), dtype=torch.int64)
             )
+        return target
 
+    def _read_lmdb_sample(self, idx: int) -> Dict[str, Any]:
+        self._init_db()
+        real_idx = self.data_infos[idx]["lmdb_idx"]
+        key = f"{real_idx:08d}".encode("ascii")
+
+        byteflow = self.txn.get(key)
+        data = pickle.loads(byteflow)
+
+        buffer = io.BytesIO(data["image"])
+        image = Image.open(buffer).convert("RGB")
+        target = self._build_target(data, key)
         return {"image": image, "target": target}
+
+    def get_data_info(self, idx: int) -> Dict[str, Any]:
+        """Fetch a single sample from RAM cache (if enabled) or LMDB database."""
+        if self._jpeg_cache is not None:
+            img_bytes, target = self._jpeg_cache[idx]
+            image = Image.open(io.BytesIO(img_bytes)).convert("RGB")
+            return {"image": image, "target": target}
+        return self._read_lmdb_sample(idx)
+
+    def prepare_data(self, idx: int) -> Optional[Dict[str, Any]]:
+        """Fast path when resized uint8 images are cached in shared RAM."""
+        if self._ram_images is not None and self._ram_targets is not None:
+            img = self._ram_images[idx].to(dtype=torch.float32).div_(255.0)
+            return {"image": img, "target": self._ram_targets[idx]}
+        return super().prepare_data(idx)
 
     def __getstate__(self):
         """Enable safe pickle serialization across multiprocessing DataLoader workers."""
