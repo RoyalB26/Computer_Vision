@@ -352,6 +352,7 @@ class SlotAuxiliaryLoss(nn.Module):
         gt_labels: torch.Tensor,
         mask_gt: torch.Tensor,
         img_size: Tuple[int, int],
+        dots: Optional[torch.Tensor] = None,
     ) -> Dict[str, torch.Tensor]:
         device = attn_ori.device
         with torch.amp.autocast(device_type=device.type, enabled=False):
@@ -359,17 +360,24 @@ class SlotAuxiliaryLoss(nn.Module):
             attn_ori = attn_ori.float()
             obj_queries = obj_queries.float()
             gt_bboxes = gt_bboxes.float()
+            dots_f = dots.float() if dots is not None else None
 
             n3 = resolutions[0][0] * resolutions[0][1]
             n4 = resolutions[1][0] * resolutions[1][1]
 
             def _balanced_multiscale_bce(pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
-                p = pred.clamp(1e-6, 1.0 - 1e-6)
+                p = pred.clamp(1e-4, 1.0 - 1e-4)
                 if not torch.isfinite(p).all():
-                    p = torch.nan_to_num(p, nan=0.5, posinf=1.0 - 1e-6, neginf=1e-6)
+                    p = torch.nan_to_num(p, nan=0.5, posinf=1.0 - 1e-4, neginf=1e-4)
                 l_p3 = F.binary_cross_entropy(p[..., :n3], target[..., :n3])
                 l_p4 = F.binary_cross_entropy(p[..., n3 : n3 + n4], target[..., n3 : n3 + n4])
                 l_p5 = F.binary_cross_entropy(p[..., n3 + n4 :], target[..., n3 + n4 :])
+                return (l_p3 + l_p4 + l_p5) / 3.0
+
+            def _balanced_multiscale_bce_logits(logits: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+                l_p3 = F.binary_cross_entropy_with_logits(logits[..., :n3], target[..., :n3])
+                l_p4 = F.binary_cross_entropy_with_logits(logits[..., n3 : n3 + n4], target[..., n3 : n3 + n4])
+                l_p5 = F.binary_cross_entropy_with_logits(logits[..., n3 + n4 :], target[..., n3 + n4 :])
                 return (l_p3 + l_p4 + l_p5) / 3.0
 
             bg_mask, cls_mask, gt_counts = self._rasterize_masks_from_xyxy(
@@ -381,17 +389,30 @@ class SlotAuxiliaryLoss(nn.Module):
                 num_classes=self.num_classes,
             )
 
+            # Exact logit for P(bg) = sigmoid(d_bg - logsumexp(d_fg)): bounded gradient in [-1, 1], zero 1/p explosion
+            bg_logit = (
+                dots_f[:, -1, :] - torch.logsumexp(dots_f[:, : self.num_classes, :], dim=1)
+                if dots_f is not None
+                else None
+            )
+
             # 1. Background slot attention loss
             if self.bg_attn_weight > 0:
-                loss_bg = _balanced_multiscale_bce(attn_ori[:, -1, :], bg_mask)
+                if bg_logit is not None:
+                    loss_bg = _balanced_multiscale_bce_logits(bg_logit, bg_mask)
+                else:
+                    loss_bg = _balanced_multiscale_bce(attn_ori[:, -1, :], bg_mask)
             else:
                 loss_bg = torch.tensor(0.0, device=device)
 
-            # 2. Foreground slots sum attention loss
+            # 2. Foreground slots sum attention loss (1 - P(bg) = sigmoid(-bg_logit))
             if self.fg_attn_weight > 0:
                 fg_mask = 1.0 - bg_mask
-                fg_attn_sum = attn_ori[:, : self.num_classes, :].sum(dim=1)
-                loss_fg = _balanced_multiscale_bce(fg_attn_sum, fg_mask)
+                if bg_logit is not None:
+                    loss_fg = _balanced_multiscale_bce_logits(-bg_logit, fg_mask)
+                else:
+                    fg_attn_sum = attn_ori[:, : self.num_classes, :].sum(dim=1)
+                    loss_fg = _balanced_multiscale_bce(fg_attn_sum, fg_mask)
             else:
                 loss_fg = torch.tensor(0.0, device=device)
 
@@ -406,10 +427,10 @@ class SlotAuxiliaryLoss(nn.Module):
             else:
                 loss_suppress = torch.tensor(0.0, device=device)
 
-            # 4. Per-class attention Dice + Positive CE
+            # 4. Per-class attention Dice + Positive CE (using log_softmax when dots is available -> bounded grad)
             active = gt_counts > 0
             if self.cls_attn_weight > 0 and active.any():
-                p_cls = attn_ori[:, : self.num_classes, :].clamp(1e-6, 1.0 - 1e-6)
+                p_cls = attn_ori[:, : self.num_classes, :].clamp(1e-4, 1.0 - 1e-4)
                 inter = (p_cls * cls_mask).sum(dim=-1)
                 card = p_cls.sum(dim=-1) + cls_mask.sum(dim=-1)
                 dice = 1.0 - (2.0 * inter + 1.0) / (card + 1.0)
@@ -417,7 +438,11 @@ class SlotAuxiliaryLoss(nn.Module):
 
                 pos_pixels = (cls_mask > 0.5) & active.unsqueeze(-1)
                 if pos_pixels.any():
-                    loss_pos = -torch.log(p_cls[pos_pixels]).mean()
+                    if dots_f is not None:
+                        log_p_cls = F.log_softmax(dots_f, dim=1)[:, : self.num_classes, :]
+                        loss_pos = -log_p_cls[pos_pixels].mean()
+                    else:
+                        loss_pos = -torch.log(p_cls[pos_pixels]).mean()
                 else:
                     loss_pos = torch.tensor(0.0, device=device)
 

@@ -508,6 +508,7 @@ class VisDroneYOLO11Slot(VisDroneYOLO11):
                 gt_labels=gt_labels,
                 mask_gt=mask_gt,
                 img_size=img_size,
+                dots=slot_info.get("dots"),
             )
             loss_dict["loss"] = loss_dict["loss"] + self.slot_loss_weight * slot_losses["loss_slot"]
             loss_dict.update(slot_losses)
