@@ -205,7 +205,16 @@ class VisDroneYOLO11(BaseModel):
         n_th = nms_threshold if nms_threshold is not None else self.nms_threshold
         m_det = max_det if max_det is not None else self.max_det
 
-        preds = self.predict(inputs, conf_threshold=c_th, nms_threshold=n_th, max_det=m_det)
+        # Match prediction box scale to target box scale (normalized [0, 1] vs pixel)
+        out_fmt = "xyxy"
+        if isinstance(targets, (list, tuple)):
+            for t in targets:
+                if isinstance(t, dict) and "boxes" in t and len(t["boxes"]) > 0:
+                    if (t["boxes"] <= 1.05).all():
+                        out_fmt = "normalized"
+                    break
+
+        preds = self.predict(inputs, conf_threshold=c_th, nms_threshold=n_th, max_det=m_det, output_format=out_fmt)
         output = {"preds": preds}
 
         if targets is not None:

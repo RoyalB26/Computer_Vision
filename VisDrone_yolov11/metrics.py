@@ -89,8 +89,9 @@ class VisDroneMAP(BaseMetric):
             t_boxes = t.get("boxes", torch.empty((0, 4))).detach().cpu()
             t_labels = t.get("labels", torch.empty((0,), dtype=torch.long)).detach().cpu()
 
-            p_boxes_xyxy = convert_to_xyxy(p_boxes, self.box_format)
-            t_boxes_xyxy = convert_to_xyxy(t_boxes, self.box_format)
+            p_boxes_xyxy = convert_to_xyxy(p_boxes, "xyxy")
+            t_fmt = "cxcywh" if t.get("_is_cxcywh", False) else self.box_format
+            t_boxes_xyxy = convert_to_xyxy(t_boxes, t_fmt)
 
             self.predictions.append({
                 "boxes": p_boxes_xyxy,
