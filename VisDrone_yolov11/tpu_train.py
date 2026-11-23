@@ -32,10 +32,12 @@ def _detect_tpu_backend() -> str:
     """Detect available TPU backend: 'torch_tpu' (Colab PrivateUse1), 'torch_xla', or 'fallback'."""
     try:
         import torch_tpu  # noqa: F401
-        if hasattr(torch, "tpu") and torch.tpu.is_available():
+        if hasattr(torch, "tpu"):
+            # Verify this process can actually access the TPU (not locked by another PID)
+            _ = torch.zeros(1, device="tpu")
             return "torch_tpu"
-    except Exception:
-        pass
+    except Exception as e:
+        print(f"[TPU Trainer] `torch_tpu` detected but unavailable in this process: {e}")
     try:
         import torch_xla  # noqa: F401
         return "torch_xla"
