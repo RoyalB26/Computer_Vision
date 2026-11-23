@@ -111,3 +111,12 @@ hooks:
     interval: 1
     save_best: "mAP_50"
     mode: "max"
+  - type: "ExcelTracker"
+    filename: "training_metrics.xlsx"       # Lưu trực tiếp vào thư mục work_dir
+    track_gradients: true                   # Bật tracking gradient chi tiết
+    grad_interval: 1                        # Chu kỳ lấy mẫu gradient (mỗi 1 batch)
+    track_detection: true                   # Bật tracking tab Detection phân tích động lực học mô hình
+    detection_interval: 5                   # Chu kỳ lấy mẫu phân tích detection (mỗi 5 batch)
+    auto_save: true                         # Tự động ghi ra file Excel sau mỗi epoch
+    resume: true                            # Tự động tiếp tục ghi tiếp vào sheet nếu file đã tồn tại
+    submodules: null
