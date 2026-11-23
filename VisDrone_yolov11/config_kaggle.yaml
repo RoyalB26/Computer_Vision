@@ -64,7 +64,8 @@ data:
   val:
     dataset:
       type: "VisDroneLMDBDataset"
-      data_root: "/content/bg_seg.lmdb"
+      data_root: "/content/visdron.lmdb"
+      bg_lmdb_path: "/content/bg_seg.lmdb"
       split: "val"
       split_ratio: 0.8
       seed: 42
