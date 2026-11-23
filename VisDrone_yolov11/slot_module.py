@@ -236,8 +236,8 @@ class PostNeckSlotFiLMRefiner(nn.Module):
 
                 if self.fusion_mode == "film":
                     delta_gamma, delta_beta = self.modulators[i](slot_map_i).chunk(2, dim=1)
-                    # Bound multiplicative FiLM scale to (0, 2) to prevent gradient explosion
-                    f_cls = f * (1.0 + torch.tanh(delta_gamma)) + delta_beta
+                    # Bound both FiLM scale [0.5, 1.5] and shift [-0.5, +0.5] so P3 l2_mean & small_ratio stay clean
+                    f_cls = f * (1.0 + 0.5 * torch.tanh(delta_gamma)) + 0.5 * torch.tanh(delta_beta)
                 else:
                     f_cls = f + self.modulators[i](slot_map_i)
                 cls_feats.append(f_cls.to(dtype=orig_dtype))

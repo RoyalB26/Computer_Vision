@@ -1,0 +1,2 @@
+boundary_contrast_p3,boundary_contrast_p4,boundary_contrast_p5,intra_box_decorr_p3,intra_box_decorr_p4,intra_box_decorr_p5,gt_coverage_all_pct,gt_coverage_small_pct,avg_pos_per_gt,dfl_clipping_rate_pct,dfl_entropy_pos,dfl_top1_prob,grad_cos_box_vs_cls_p3,grad_cos_box_vs_cls_p4,grad_cos_box_vs_cls_p5,grad_ratio_box_over_cls_p3,grad_ratio_box_over_cls_p4,grad_ratio_box_over_cls_p5
+0.7121,0.607,0.6196,0.2313,0.4525,0.6033,95.2704,93.581,6.7235,0.065,0.2941,0.6478,0.0256,0.0246,0.0068,15.9551,16.6126,6.9943
