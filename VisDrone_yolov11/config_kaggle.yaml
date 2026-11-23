@@ -17,7 +17,7 @@ custom_imports:
 model:
   type: "VisDroneYOLO11Slot"
   num_classes: 10
-  pretrained: "/content/yolo11n.pt"
+  pretrained: "/kaggle/input/models/royalb26/yolov11/pytorch/default/1/yolo11n.pt"
   # Core YOLOv11 detection loss weights
   # Core YOLOv11 detection loss weights
   box_weight: 7.5
