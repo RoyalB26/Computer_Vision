@@ -1,2 +1,2 @@
 patch_fg_hit_rate_pct,patch_tiny_gt_coverage_pct,patch_small_gt_coverage_pct,patch_border_gt_coverage_pct,offset_mean_cells,offset_max_cells,scale_mean_factor,scale_std_factor,p3_box_delta_ratio,p3_cls_delta_ratio,p3_box_fisher_delta,p3_cls_fisher_delta,mufasa_iter_gate
-17.08333,10.25641,12.07658,5.26316,0.0,0.0,1.0,0.0,0.0,0.0,0.0,0.0,0.0
+62.80033,54.30444,59.78422,38.21859,0.85821,1.69413,0.96571,0.2511,0.05525,0.12556,-0.0019,-0.004,0.0178

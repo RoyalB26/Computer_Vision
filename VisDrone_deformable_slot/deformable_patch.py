@@ -154,12 +154,16 @@ class DeformableHighResPatchInjector(nn.Module):
         weighted_cls = (attn_p3[:, : self.num_classes, :, :] * self.class_weights).sum(dim=1)  # (B, H3, W3)
         priority = fg_sal * (0.25 + weighted_cls)  # (B, H3, W3)
 
-        # Mild 3x3 max-pool boost so sharp isolated tiny objects (even near borders) win Top-K
-        priority_flat = (0.7 * priority + 0.3 * F.max_pool2d(priority.unsqueeze(1), 3, stride=1, padding=1).squeeze(1)).flatten(1)
-        top_vals, top_idx = torch.topk(priority_flat, k=k_eff, dim=1, sorted=False)  # (B, K)
+        # CenterNet-style 3x3 Local-Peak NMS: prevents Top-K from dumping 6-10 redundant patches
+        # onto the same bright object; spreads the K budget cleanly across distinct small/rare objects.
+        p_4d = priority.unsqueeze(1)
+        is_peak = (p_4d == F.max_pool2d(p_4d, kernel_size=3, stride=1, padding=1)) & (p_4d > 0.0)
+        peak_priority = torch.where(is_peak, p_4d, p_4d * 0.05).flatten(1)
+        _, top_idx = torch.topk(peak_priority, k=k_eff, dim=1, sorted=False)  # (B, K)
 
-        # Normalize gating score smoothly to [0, 1]
-        top_scores = torch.sigmoid((top_vals - 0.15) * 4.0)
+        # Gather un-attenuated priority values for smooth gating score in [0, 1]
+        raw_vals = torch.gather(priority.flatten(1), dim=1, index=top_idx)
+        top_scores = torch.sigmoid((raw_vals - 0.15) * 4.0)
 
         gy = (top_idx // w3).float()
         gx = (top_idx % w3).float()
