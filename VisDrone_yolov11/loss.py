@@ -505,13 +505,17 @@ class YOLOv11DetectionLoss(nn.Module):
             )
 
             # Ultralytics YOLOv11 normalization: weight box/DFL by per-anchor TAL quality `target_scores`
+            num_valid_gt = float(mask_gt.sum().item())
             target_scores_sum = max(float(target_scores.sum().item()), 1.0)
+            # Guard against Epoch-1 loss_focal explosion when initial TAL IoU is tiny:
+            # once training stabilizes, target_scores_sum >> 0.5 * num_valid_gt so behavior is 100% identical.
+            focal_normalizer = max(target_scores_sum, 0.5 * num_valid_gt, 1.0)
 
             # 1. Classification: Sigmoid Focal / BCE Loss across ALL anchors
             loss_focal = self.focal_loss(
                 pred_scores,
                 target_scores,
-                normalizer=target_scores_sum,
+                normalizer=focal_normalizer,
             ) * self.cls_weight
 
             # 2. Localization: TAL-weighted DIoU Loss and DFL on FOREGROUND anchors

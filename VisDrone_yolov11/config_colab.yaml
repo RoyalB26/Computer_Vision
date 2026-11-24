@@ -130,6 +130,10 @@ train_cfg:
   log_interval: 50000
 # 7. Lifecycle Hooks
 hooks:
+  - type: "WarmupLRHook"
+    warmup_epochs: 3                        # Tăng LR tuyến tính 0.05x -> 1.0x và tạm tắt Mosaic 3 epoch đầu
+    start_factor: 0.05
+    disable_mosaic_warmup: true
   - type: "CloseMosaicHook"
     close_epochs: 15                        # Tắt Mosaic 15 epoch cuối để hội tụ về phân phối ảnh thật
   - type: "CheckpointHook"

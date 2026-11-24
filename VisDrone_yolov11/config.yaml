@@ -78,7 +78,7 @@ data:
       mosaic_rare_prob: 0.85       # 85% of Mosaic samples inject 1-2 object-centered rare-class crops (< 45% freq)
       pipeline:
         - type: "Resize"
-          size: [960, 960]
+          size: [1280, 1280]
         - type: "ToTensor"
     batch_size: 8
     shuffle: true
@@ -94,7 +94,7 @@ data:
       augment: false
       pipeline:
         - type: "Resize"
-          size: [960, 960]
+          size: [1280, 1280]
         - type: "ToTensor"
     batch_size: 8
     shuffle: false
@@ -128,6 +128,10 @@ train_cfg:
   log_interval: 50000
 # 7. Lifecycle Hooks
 hooks:
+  - type: "WarmupLRHook"
+    warmup_epochs: 3
+    start_factor: 0.05
+    disable_mosaic_warmup: true
   - type: "CloseMosaicHook"
     close_epochs: 15
   - type: "CheckpointHook"

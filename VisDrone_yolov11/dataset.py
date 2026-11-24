@@ -721,6 +721,84 @@ class VisDroneLMDBDataset(BaseDataset):
         return state
 
 
+@HOOKS.register_module(name="WarmupLRHook", force=True)
+class WarmupLRHook(BaseHook):
+    """Linear per-step LR warmup for the first `warmup_epochs`, optionally deferring Mosaic during warmup.
+
+    Prevents Epoch-1 gradient shock on pretrained yolo11n.pt weights & BatchNorm stats when Mosaic is enabled.
+    """
+
+    def __init__(
+        self,
+        warmup_epochs: int = 3,
+        start_factor: float = 0.05,
+        disable_mosaic_warmup: bool = True,
+    ):
+        self.warmup_epochs = max(0, int(warmup_epochs))
+        self.start_factor = float(start_factor)
+        self.disable_mosaic_warmup = bool(disable_mosaic_warmup)
+        self._base_lrs: Optional[List[float]] = None
+        self._orig_mosaic_prob: Optional[float] = None
+        self._mosaic_paused: bool = False
+
+    @staticmethod
+    def _unwrap_dataset(trainer):
+        ds = getattr(trainer.train_loader, "dataset", None)
+        while ds is not None and not hasattr(ds, "mosaic_prob") and hasattr(ds, "dataset"):
+            ds = ds.dataset
+        return ds
+
+    def before_train(self, trainer) -> None:
+        self._base_lrs = [float(pg["lr"]) for pg in trainer.optimizer.param_groups]
+        ds = self._unwrap_dataset(trainer)
+        if ds is not None and hasattr(ds, "mosaic_prob"):
+            self._orig_mosaic_prob = float(ds.mosaic_prob)
+
+    def before_epoch(self, trainer) -> None:
+        if self._base_lrs is None:
+            self.before_train(trainer)
+        if not self.disable_mosaic_warmup or self.warmup_epochs <= 0:
+            return
+        ds = self._unwrap_dataset(trainer)
+        if ds is None or not hasattr(ds, "mosaic_prob") or not self._orig_mosaic_prob:
+            return
+
+        if trainer.epoch < self.warmup_epochs:
+            if not self._mosaic_paused:
+                ds.mosaic_prob = 0.0
+                self._mosaic_paused = True
+                msg = (
+                    f"[WarmupLRHook] Paused Mosaic during warmup epochs 1..{self.warmup_epochs} "
+                    f"(will restore mosaic_prob={self._orig_mosaic_prob:.2f} at epoch {self.warmup_epochs + 1})."
+                )
+                if getattr(trainer, "logger", None) is not None:
+                    trainer.logger.info(msg)
+                else:
+                    print(msg)
+        elif self._mosaic_paused:
+            ds.mosaic_prob = self._orig_mosaic_prob
+            self._mosaic_paused = False
+            msg = (
+                f"[WarmupLRHook] Warmup complete at epoch {trainer.epoch + 1}: "
+                f"restored mosaic_prob={ds.mosaic_prob:.2f}."
+            )
+            if getattr(trainer, "logger", None) is not None:
+                trainer.logger.info(msg)
+            else:
+                print(msg)
+
+    def before_train_iter(self, trainer, batch_idx: int, data_batch: Dict[str, Any]) -> None:
+        if self.warmup_epochs <= 0 or trainer.epoch >= self.warmup_epochs or self._base_lrs is None:
+            return
+        num_batches = max(len(trainer.train_loader), 1)
+        total_warmup_steps = max(self.warmup_epochs * num_batches, 1)
+        cur_step = trainer.epoch * num_batches + batch_idx + 1
+        progress = min(1.0, float(cur_step) / float(total_warmup_steps))
+        factor = self.start_factor + (1.0 - self.start_factor) * progress
+        for pg, base_lr in zip(trainer.optimizer.param_groups, self._base_lrs):
+            pg["lr"] = base_lr * factor
+
+
 @HOOKS.register_module(name="CloseMosaicHook", force=True)
 class CloseMosaicHook(BaseHook):
     """Automatically disables Mosaic augmentation during the final `close_epochs` of training.
