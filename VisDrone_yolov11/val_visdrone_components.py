@@ -29,7 +29,9 @@ import matplotlib.patches as patches
 import numpy as np
 import torch
 import torch.nn.functional as F
+import torchvision.ops as tv_ops
 import torchvision.transforms.functional as TF
+import yaml
 
 from VisDrone_yolov11.dataset import VISDRONE_CLASSES, VisDroneLMDBDataset
 from VisDrone_yolov11.model import VisDroneYOLO11, VisDroneYOLO11Slot
@@ -47,8 +49,12 @@ from yolo.val_coco_components import (
 )
 
 
-def load_visdrone_model(weights_path: str, device: torch.device) -> Tuple[torch.nn.Module, bool]:
-    """Auto-detect VisDroneYOLO11Slot vs VisDroneYOLO11 from checkpoint and load weights."""
+def load_visdrone_model(
+    weights_path: str,
+    device: torch.device,
+    model_cfg: Optional[Dict[str, Any]] = None,
+) -> Tuple[torch.nn.Module, bool]:
+    """Auto-detect VisDroneYOLO11Slot vs VisDroneYOLO11 from checkpoint (or YAML model_cfg) and load weights."""
     if not os.path.exists(weights_path):
         raise FileNotFoundError(f"Checkpoint not found: {weights_path}")
 
@@ -65,7 +71,25 @@ def load_visdrone_model(weights_path: str, device: torch.device) -> Tuple[torch.
         sd = sd.state_dict()
 
     has_slots = any(k.startswith("slot_refiner.") for k in sd.keys())
-    model = VisDroneYOLO11Slot(num_classes=10) if has_slots else VisDroneYOLO11(num_classes=10)
+    if model_cfg is not None:
+        cfg_kwargs = {k: v for k, v in model_cfg.items() if k not in ("type", "pretrained")}
+        cfg_kwargs["pretrained"] = None
+        if has_slots:
+            cfg_kwargs.setdefault("use_logit_prior", "slot_refiner.logit_prior_scale" in sd)
+            model = VisDroneYOLO11Slot(**cfg_kwargs)
+        else:
+            base_keys = {
+                "num_classes", "pretrained", "box_weight", "cls_weight", "dfl_weight",
+                "focal_alpha", "focal_gamma", "conf_threshold", "nms_threshold", "max_det",
+            }
+            model = VisDroneYOLO11(**{k: v for k, v in cfg_kwargs.items() if k in base_keys})
+    else:
+        if has_slots:
+            has_logit_prior = "slot_refiner.logit_prior_scale" in sd
+            model = VisDroneYOLO11Slot(num_classes=10, use_logit_prior=has_logit_prior, assigner_prior_weight=0.0)
+        else:
+            model = VisDroneYOLO11(num_classes=10)
+
     missing, unexpected = model.load_state_dict(sd, strict=False)
     print(
         f"[Load] {'VisDroneYOLO11Slot' if has_slots else 'VisDroneYOLO11'} from {weights_path} "
@@ -203,6 +227,7 @@ def _generate_visdrone_dashboard(
         ("Head Scale Share & Detection AP Summary", "chart_03_head_and_detection_summary.png"),
         ("Visual Feature Inspection", "chart_04_feature_visual_inspection.png"),
         ("Pairwise Class Cosine Separation (Neck P3)", "chart_05_pairwise_class_separation.png"),
+        ("Slot Attention Confusion Matrix (GT Class vs Predicted Slot)", "chart_06_slot_confusion_matrix.png"),
     ]
     charts_html = "".join(
         f"<div class='card'><h3>{html.escape(title)}</h3><img src='{fname}' style='max-width:100%;'></div>"
@@ -471,39 +496,260 @@ def _measure_neck_gradient_conflict(
     return out
 
 
+def _plot_slot_confusion_matrix(
+    conf_mat: np.ndarray,
+    save_path: str,
+    title: str = "Slot Attention Confusion Matrix (Row-Normalized %: GT Class -> Pred Slot)",
+) -> None:
+    """Plot 10x11 row-normalized confusion matrix of GT classes vs predicted argmax slot (0..9 + BG)."""
+    row_sums = conf_mat.sum(axis=1, keepdims=True)
+    pct = np.divide(conf_mat, np.maximum(row_sums, 1.0)) * 100.0
+    row_names = list(VISDRONE_CLASSES)
+    col_names = list(VISDRONE_CLASSES) + ["BG"]
+
+    fig, ax = plt.subplots(figsize=(11, 8.5))
+    im = ax.imshow(pct, cmap="Blues", vmin=0.0, vmax=100.0)
+    ax.set_xticks(range(len(col_names)))
+    ax.set_yticks(range(len(row_names)))
+    ax.set_xticklabels(col_names, rotation=45, ha="right", fontsize=9)
+    ax.set_yticklabels(row_names, fontsize=9)
+    ax.set_xlabel("Predicted Slot (argmax attn_ori)", fontsize=10, fontweight="bold")
+    ax.set_ylabel("Ground-Truth Class", fontsize=10, fontweight="bold")
+    ax.set_title(title, fontsize=11.5, fontweight="bold")
+    for r in range(len(row_names)):
+        for c in range(len(col_names)):
+            val = pct[r, c]
+            color = "white" if val >= 55.0 else "black"
+            ax.text(c, r, f"{val:.1f}" if val >= 0.5 else "", ha="center", va="center", fontsize=7.5, color=color)
+    fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04, label="% of GT Pixels")
+    plt.tight_layout()
+    plt.savefig(save_path, dpi=160, bbox_inches="tight")
+    plt.close()
+
+
+def _measure_slot_overfit_metrics(
+    model: torch.nn.Module,
+    slot_info: Dict[str, Any],
+    gt_xyxy: np.ndarray,
+    imgsz: int,
+    device: torch.device,
+) -> Tuple[Dict[str, float], np.ndarray, np.ndarray, np.ndarray]:
+    """Compute per-image Slot sharpness, entropy, calibration, BG leak, inactive FA, and confusion counts.
+
+    Returns:
+        metrics: dict of scalar diagnostics for this image.
+        conf_mat: (10, 11) pixel counts [gt_class, argmax_slot].
+        cls_inter: (10,) soft intersection sum(p_c * mask_c) for per-class Dice.
+        cls_card: (10,) soft cardinality sum(p_c) + sum(mask_c) for per-class Dice.
+    """
+    num_classes = 10
+    attn_ori = slot_info["attn_ori"][0].float()   # (11, N)
+    dots = slot_info["dots"][0].float()           # (11, N)
+    resolutions = slot_info["resolutions"]
+
+    conf_mat = np.zeros((num_classes, num_classes + 1), dtype=np.float64)
+    cls_inter = np.zeros(num_classes, dtype=np.float64)
+    cls_card = np.zeros(num_classes, dtype=np.float64)
+
+    out: Dict[str, float] = {
+        "dots_std": float(dots.std().item()),
+        "dots_abs_max": float(dots.abs().max().item()),
+    }
+
+    if len(gt_xyxy) == 0:
+        return out, conf_mat, cls_inter, cls_card
+
+    gt_boxes = torch.from_numpy(gt_xyxy[:, 1:5]).to(device=device, dtype=torch.float32).unsqueeze(0)
+    gt_labels = torch.from_numpy(gt_xyxy[:, 0]).to(device=device, dtype=torch.long).view(1, -1, 1)
+    mask_gt = torch.ones((1, len(gt_xyxy), 1), dtype=torch.bool, device=device)
+
+    bg_mask, cls_mask, gt_counts = model.slot_criterion._rasterize_masks_from_xyxy(
+        gt_bboxes=gt_boxes,
+        gt_labels=gt_labels,
+        mask_gt=mask_gt,
+        resolutions=resolutions,
+        img_size=(imgsz, imgsz),
+        num_classes=num_classes,
+    )
+    bg_m = bg_mask[0] > 0.5         # (N,)
+    fg_m = ~bg_m                    # (N,)
+    cls_m = cls_mask[0]             # (10, N)
+    active = gt_counts[0] > 0       # (10,)
+    inactive = ~active              # (10,)
+
+    # Normalized entropy in [0, 1]
+    p_safe = attn_ori.clamp(min=1e-7)
+    ent = -(p_safe * p_safe.log()).sum(dim=0) / float(np.log(num_classes + 1))  # (N,)
+    if fg_m.any():
+        out["attn_entropy_fg"] = float(ent[fg_m].mean().item())
+        top2 = torch.topk(dots[:, fg_m], k=2, dim=0).values
+        out["dots_margin_fg"] = float((top2[0] - top2[1]).mean().item())
+        pred_slot_fg = attn_ori[:, fg_m].argmax(dim=0)
+        out["slot_bg_leak_pct"] = float((pred_slot_fg == num_classes).float().mean().item() * 100.0)
+    if bg_m.any():
+        out["attn_entropy_bg"] = float(ent[bg_m].mean().item())
+
+    # Inactive class false-alarm: average attention mass on classes absent from this image
+    if inactive.any():
+        out["slot_inactive_fa_pct"] = float(attn_ori[:num_classes][inactive].mean().item() * 100.0)
+
+    # Positive CE (all-pixel vs class-balanced)
+    neg_log_p = -F.log_softmax(dots, dim=0)[:num_classes, :]  # (10, N)
+    pos_m = (cls_m > 0.5).float()
+    pos_cnt = pos_m.sum(dim=-1)  # (10,)
+    valid_c = active & (pos_cnt > 0)
+    if valid_c.any():
+        tot_pos = pos_cnt[valid_c].sum().clamp(min=1.0)
+        out["slot_pos_ce_all"] = float(((neg_log_p * pos_m)[valid_c].sum() / tot_pos).item())
+        per_c_ce = (neg_log_p * pos_m).sum(dim=-1) / pos_cnt.clamp(min=1.0)
+        out["slot_pos_ce_balanced"] = float(per_c_ce[valid_c].mean().item())
+
+    # Per-class Dice accumulators + Confusion matrix (GT class -> argmax slot)
+    pred_slot_all = attn_ori.argmax(dim=0)  # (N,)
+    p_fg = attn_ori[:num_classes]           # (10, N)
+    for c in range(num_classes):
+        if not active[c]:
+            continue
+        cm = cls_m[c] > 0.5
+        if not cm.any():
+            continue
+        cls_inter[c] = float((p_fg[c] * cls_m[c]).sum().item())
+        cls_card[c] = float((p_fg[c].sum() + cls_m[c].sum()).item())
+        binc = torch.bincount(pred_slot_all[cm], minlength=num_classes + 1).cpu().numpy()
+        conf_mat[c] += binc
+
+    return out, conf_mat, cls_inter, cls_card
+
+
+def _predict_film_off_from_neck(
+    model: torch.nn.Module,
+    neck_feats: List[torch.Tensor],
+    boxes_raw_cat: torch.Tensor,
+    imgsz: int,
+    conf_thres: float,
+    iou_thres: float,
+    max_det: int,
+    device: torch.device,
+) -> Tuple[np.ndarray, torch.Tensor]:
+    """Run head.cv3 directly on unmodulated neck_feats (FiLM OFF ablation) + NMS."""
+    bs = neck_feats[0].shape[0]
+    scores_off = torch.cat(
+        [model.net.head.cv3[i](neck_feats[i]).view(bs, model.num_classes, -1) for i in range(model.net.head.nl)],
+        dim=-1,
+    )
+    a_raw, s_raw = make_anchors(neck_feats, model.net.head.stride, 0.5)
+    anchors, strides = (a.transpose(0, 1).to(device) for a in (a_raw, s_raw))
+    pred_dist = model.net.head.dfl(boxes_raw_cat)
+    decoded_boxes = (dist2bbox(pred_dist, anchors.unsqueeze(0), xywh=False, dim=1) * strides).transpose(1, 2)  # (1, N, 4)
+    probs = scores_off.sigmoid().transpose(1, 2)  # (1, N, C)
+
+    b_boxes = decoded_boxes[0]
+    b_probs = probs[0]
+    max_scores, labels = b_probs.max(dim=-1)
+    valid = max_scores >= conf_thres
+    if not valid.any():
+        return np.zeros((0, 6), dtype=np.float32), scores_off
+
+    cand_boxes = b_boxes[valid]
+    cand_scores = max_scores[valid]
+    cand_labels = labels[valid]
+    keep = tv_ops.batched_nms(cand_boxes, cand_scores, cand_labels, iou_thres)[:max_det]
+    det_off = np.column_stack([
+        cand_boxes[keep].cpu().numpy(),
+        cand_scores[keep].cpu().numpy()[:, None],
+        cand_labels[keep].cpu().numpy()[:, None],
+    ]).astype(np.float32)
+    return det_off, scores_off
+
+
 @torch.no_grad()
 def run_visdrone_component_validation(
     weights_path: str,
-    data_root: str,
-    out_dir: str,
-    imgsz: int = 960,
+    data_root: Optional[str] = None,
+    out_dir: str = "VisDrone_yolov11/output_val_epoch50",
+    imgsz: Optional[int] = None,
     max_images: int = 0,
     conf_thres: float = 0.001,
-    iou_thres: float = 0.5,
+    iou_thres: Optional[float] = None,
     vis_conf: float = 0.25,
-    split_ratio: float = 0.8,
-    seed: int = 42,
+    split: str = "val",
+    split_ratio: Optional[float] = None,
+    seed: Optional[int] = None,
     device_str: str = "auto",
+    config_path: Optional[str] = None,
 ) -> None:
+    cfg: Optional[Dict[str, Any]] = None
+    model_cfg: Optional[Dict[str, Any]] = None
+    ds_cfg: Dict[str, Any] = {}
+
+    if config_path:
+        if not os.path.exists(config_path):
+            raise FileNotFoundError(f"Config not found: {config_path}")
+        with open(config_path, "r", encoding="utf-8") as f:
+            cfg = yaml.safe_load(f) or {}
+        model_cfg = cfg.get("model")
+        ds_cfg = cfg.get("data", {}).get(split, {}).get("dataset", {}) or {}
+        print(f"[Config] Loaded {config_path} (section: data.{split}.dataset)")
+
+    # Resolve settings (CLI overrides YAML; YAML overrides defaults)
+    resolved_data_root = data_root or ds_cfg.get("data_root") or "D:/apps/Datasets/VisDrone/VisDrone_data.lmdb"
+    if imgsz is None:
+        pipe_imgsz = None
+        for step in ds_cfg.get("pipeline", []) or []:
+            if isinstance(step, dict) and step.get("type") == "Resize":
+                sz = step.get("size")
+                if isinstance(sz, (list, tuple)) and len(sz) >= 1:
+                    pipe_imgsz = int(sz[0])
+                elif isinstance(sz, int):
+                    pipe_imgsz = sz
+                break
+        resolved_imgsz = pipe_imgsz if pipe_imgsz is not None else 960
+    else:
+        resolved_imgsz = int(imgsz)
+
+    resolved_iou_thres = iou_thres if iou_thres is not None else float((model_cfg or {}).get("nms_threshold", 0.5))
+    resolved_seed = seed if seed is not None else int(ds_cfg.get("seed", (cfg or {}).get("seed", 42)))
+
+    if config_path:
+        # Respect config's dataset split settings (e.g. None when train_data.lmdb / val_data.lmdb are separate files)
+        ds_split = ds_cfg.get("split", None)
+        ds_split_ratio = split_ratio if split_ratio is not None else ds_cfg.get("split_ratio", None)
+    else:
+        ds_split = split
+        ds_split_ratio = split_ratio if split_ratio is not None else 0.8
+
+    imgsz = resolved_imgsz
+    iou_thres = resolved_iou_thres
+
     os.makedirs(out_dir, exist_ok=True)
+    if device_str == "auto" and cfg and cfg.get("device"):
+        device_str = str(cfg["device"])
     device = torch.device("cuda" if (device_str == "auto" and torch.cuda.is_available()) else ("cpu" if device_str == "auto" else device_str))
 
     print("=" * 80)
-    print(f"VisDrone YOLOv11 Component-by-Component Validation | Device: {device} | imgsz: {imgsz}")
+    print(f"VisDrone YOLOv11 Component-by-Component Validation | Split: {split} | Device: {device} | imgsz: {imgsz}")
     print("=" * 80)
 
-    model, has_slots = load_visdrone_model(weights_path, device)
+    model, has_slots = load_visdrone_model(weights_path, device, model_cfg=model_cfg)
     probe = YOLOv11ComponentProbe(model.net)
 
-    # Optional hook on slot_refiner to inspect modulated cls_feats & slot attention
+    # Optional hooks on slot_refiner & its FiLM modulators to inspect modulated cls_feats, slot attention, and FiLM stats
     slot_cache: Dict[str, Any] = {}
+    film_mod_cache: Dict[int, torch.Tensor] = {}
     slot_handle = None
+    mod_handles: List[Any] = []
     if has_slots and hasattr(model, "slot_refiner"):
         def _slot_hook(_mod, _inp, out):
             cls_feats, slot_info = out
             slot_cache["cls_feats"] = cls_feats
             slot_cache["slot_info"] = slot_info
         slot_handle = model.slot_refiner.register_forward_hook(_slot_hook)
+        for mi, mod in enumerate(model.slot_refiner.modulators):
+            def _make_mod_hook(idx_m: int):
+                def _mh(_m, _in, out_t):
+                    film_mod_cache[idx_m] = out_t.detach()
+                return _mh
+            mod_handles.append(mod.register_forward_hook(_make_mod_hook(mi)))
 
     component_order = list(BASE_COMPONENT_ORDER)
     if has_slots:
@@ -536,10 +782,18 @@ def run_visdrone_component_validation(
     p_neck = sum(p.numel() for p in model.net.neck.parameters()) / 1e6
     p_head = sum(p.numel() for p in model.net.head.parameters()) / 1e6
 
-    # Load VisDrone val dataset
-    ds = VisDroneLMDBDataset(data_root=data_root, split="val", split_ratio=split_ratio, seed=seed, include_boxes=True)
+    # Load VisDrone dataset (val or train split; never augment during component evaluation)
+    ds = VisDroneLMDBDataset(
+        data_root=resolved_data_root,
+        split=ds_split,
+        split_ratio=ds_split_ratio,
+        seed=resolved_seed,
+        num_classes=int(ds_cfg.get("num_classes", 10)),
+        include_boxes=True,
+        augment=False,
+    )
     num_samples = len(ds) if max_images <= 0 else min(len(ds), max_images)
-    print(f"[Dataset] VisDrone val samples: {num_samples} / {len(ds)}")
+    print(f"[Dataset] {resolved_data_root} ({split}, split={ds_split}, ratio={ds_split_ratio}): {num_samples} / {len(ds)}")
 
     metric_keys = [
         "act_mean", "act_std", "neg_frac", "zero_frac", "l2_mean",
@@ -548,7 +802,22 @@ def run_visdrone_component_validation(
     ]
     comp_acc: Dict[str, Dict[str, List[float]]] = {c: {k: [] for k in metric_keys} for c in component_order}
     head_scale_share: Dict[str, List[float]] = {"p3": [], "p4": [], "p5": []}
-    slot_stats: Dict[str, List[float]] = {"slot_fg_mass_pct": [], "slot_share_p3": [], "slot_share_p4": [], "slot_share_p5": [], "slot_cos_sep": []}
+    slot_stats: Dict[str, List[float]] = {
+        "slot_fg_mass_pct": [], "slot_share_p3": [], "slot_share_p4": [], "slot_share_p5": [], "slot_cos_sep": [],
+        "dots_std": [], "dots_abs_max": [], "dots_margin_fg": [],
+        "attn_entropy_fg": [], "attn_entropy_bg": [],
+        "slot_pos_ce_all": [], "slot_pos_ce_balanced": [],
+        "slot_bg_leak_pct": [], "slot_inactive_fa_pct": [],
+        "film_gamma_abs_p3": [], "film_gamma_abs_p4": [], "film_gamma_abs_p5": [],
+        "film_beta_abs_p3": [], "film_beta_abs_p4": [], "film_beta_abs_p5": [],
+        "film_sat_pct_p3": [], "film_sat_pct_p4": [], "film_sat_pct_p5": [],
+        "loss_focal_film_on": [], "loss_focal_film_off": [],
+    }
+    slot_conf_mat = np.zeros((10, 11), dtype=np.float64)
+    slot_cls_inter = np.zeros(10, dtype=np.float64)
+    slot_cls_card = np.zeros(10, dtype=np.float64)
+    slot_vecs_list: List[np.ndarray] = []
+    all_preds_film_off: List[np.ndarray] = []
     box_diag_acc: Dict[str, List[float]] = {
         "boundary_contrast_p3": [], "boundary_contrast_p4": [], "boundary_contrast_p5": [],
         "intra_box_decorr_p3": [], "intra_box_decorr_p4": [], "intra_box_decorr_p5": [],
@@ -593,6 +862,7 @@ def run_visdrone_component_validation(
 
         probe.clear()
         slot_cache.clear()
+        film_mod_cache.clear()
         if device.type == "cuda":
             torch.cuda.synchronize()
         t_start = time.perf_counter()
@@ -621,9 +891,30 @@ def run_visdrone_component_validation(
             slot_stats["slot_share_p5"].append(s_p5 / s_tot * 100.0)
 
             slots_fg = F.normalize(s_info["slots"][0, :10, :].float(), dim=-1)
+            slot_vecs_list.append(slots_fg.cpu().numpy())
             sim = slots_fg @ slots_fg.T
             off_diag = sim[~torch.eye(10, dtype=torch.bool, device=sim.device)]
             slot_stats["slot_cos_sep"].append(float((1.0 - off_diag).mean().item()))
+
+            # Slot overfit diagnostics: sharpness, entropy, calibration, BG leak, inactive FA, confusion
+            so_m, c_mat, c_int, c_card = _measure_slot_overfit_metrics(model, s_info, gt_xyxy, imgsz, device)
+            for k, v in so_m.items():
+                slot_stats[k].append(v)
+            slot_conf_mat += c_mat
+            slot_cls_inter += c_int
+            slot_cls_card += c_card
+
+            # FiLM modulation magnitude & tanh saturation per scale
+            if model.slot_refiner.fusion_mode == "film":
+                for mi, pname in enumerate(["p3", "p4", "p5"]):
+                    mod_out = film_mod_cache.get(mi)
+                    if mod_out is not None:
+                        dg, db = mod_out.float().chunk(2, dim=1)
+                        tg, tb = torch.tanh(dg), torch.tanh(db)
+                        slot_stats[f"film_gamma_abs_{pname}"].append(float((0.5 * tg.abs()).mean().item()))
+                        slot_stats[f"film_beta_abs_{pname}"].append(float((0.5 * tb.abs()).mean().item()))
+                        sat = ((tg.abs() > 0.9).float().mean() + (tb.abs() > 0.9).float().mean()) * 50.0
+                        slot_stats[f"film_sat_pct_{pname}"].append(float(sat.item()))
 
         for cname in component_order:
             feat = probe.features.get(cname)
@@ -665,25 +956,50 @@ def run_visdrone_component_validation(
             if "intra_box_decorr" in sp_m:
                 box_diag_acc[f"intra_box_decorr_{pname}"].append(sp_m["intra_box_decorr"])
 
-        # TAL coverage & DFL entropy/clipping
+        # TAL coverage, DFL entropy/clipping, and FiLM ON/OFF ablation
+        neck_feats = [
+            probe.features["neck.c3k2_16 (P3 //8)"],
+            probe.features["neck.c3k2_19 (P4 //16)"],
+            probe.features["neck.c3k2_22 (P5 //32)"],
+        ]
+        boxes_raw_cat = torch.cat([
+            probe.features["head.cv2_p3 (Box //8)"].flatten(2),
+            probe.features["head.cv2_p4 (Box //16)"].flatten(2),
+            probe.features["head.cv2_p5 (Box //32)"].flatten(2),
+        ], dim=-1)
+        scores_raw_cat = torch.cat([
+            probe.features["head.cv3_p3 (Cls //8)"].flatten(2),
+            probe.features["head.cv3_p4 (Cls //16)"].flatten(2),
+            probe.features["head.cv3_p5 (Cls //32)"].flatten(2),
+        ], dim=-1)
+        if has_slots and "slot_info" in slot_cache and slot_cache["slot_info"].get("logit_prior") is not None:
+            scores_raw_cat = scores_raw_cat + slot_cache["slot_info"]["logit_prior"]
+
+        if has_slots:
+            det_off, scores_off = _predict_film_off_from_neck(
+                model, neck_feats, boxes_raw_cat, imgsz, conf_thres, iou_thres, 300, device
+            )
+            all_preds_film_off.append(det_off)
+            if len(gt_xyxy) > 0:
+                a_raw, s_raw = make_anchors(neck_feats, model.net.head.stride, 0.5)
+                anchors, strides = (a.transpose(0, 1).to(device) for a in (a_raw, s_raw))
+                pred_dist = model.net.head.dfl(boxes_raw_cat)
+                dec_xyxy = (dist2bbox(pred_dist, anchors.unsqueeze(0), xywh=False, dim=1) * strides).transpose(1, 2)
+                ap_px = (anchors * strides).transpose(0, 1)
+                st_t = strides.transpose(0, 1)
+                t_list = [{"boxes": target["boxes"].to(device), "labels": target["labels"].to(device), "_is_cxcywh": True}]
+                l_on = model.criterion(
+                    preds={"boxes": boxes_raw_cat, "scores": scores_raw_cat, "feats": neck_feats},
+                    targets=t_list, decoded_bboxes=dec_xyxy, anchor_points=ap_px, stride_tensor=st_t, img_size=(imgsz, imgsz),
+                )
+                l_off = model.criterion(
+                    preds={"boxes": boxes_raw_cat, "scores": scores_off, "feats": neck_feats},
+                    targets=t_list, decoded_bboxes=dec_xyxy, anchor_points=ap_px, stride_tensor=st_t, img_size=(imgsz, imgsz),
+                )
+                slot_stats["loss_focal_film_on"].append(float(l_on["loss_focal"].item()))
+                slot_stats["loss_focal_film_off"].append(float(l_off["loss_focal"].item()))
+
         if len(gt_xyxy) > 0:
-            neck_feats = [
-                probe.features["neck.c3k2_16 (P3 //8)"],
-                probe.features["neck.c3k2_19 (P4 //16)"],
-                probe.features["neck.c3k2_22 (P5 //32)"],
-            ]
-            boxes_raw_cat = torch.cat([
-                probe.features["head.cv2_p3 (Box //8)"].flatten(2),
-                probe.features["head.cv2_p4 (Box //16)"].flatten(2),
-                probe.features["head.cv2_p5 (Box //32)"].flatten(2),
-            ], dim=-1)
-            scores_raw_cat = torch.cat([
-                probe.features["head.cv3_p3 (Cls //8)"].flatten(2),
-                probe.features["head.cv3_p4 (Cls //16)"].flatten(2),
-                probe.features["head.cv3_p5 (Cls //32)"].flatten(2),
-            ], dim=-1)
-            if has_slots and "slot_info" in slot_cache and slot_cache["slot_info"].get("logit_prior") is not None:
-                scores_raw_cat = scores_raw_cat + slot_cache["slot_info"]["logit_prior"]
             tal_dfl_m = _measure_tal_and_dfl_metrics(model, neck_feats, boxes_raw_cat, scores_raw_cat, gt_xyxy, imgsz, device)
             for k, v in tal_dfl_m.items():
                 box_diag_acc[k].append(v)
@@ -729,6 +1045,8 @@ def run_visdrone_component_validation(
     probe.remove()
     if slot_handle is not None:
         slot_handle.remove()
+    for mh in mod_handles:
+        mh.remove()
     total_sec = time.perf_counter() - t0_all
 
     overall_det, per_class_rows = compute_coco_map(all_preds, all_gts)
@@ -777,6 +1095,7 @@ def run_visdrone_component_validation(
         np.fill_diagonal(pw_mat, np.nan)
 
     slot_summary = None
+    slot_per_class_rows: List[Dict[str, object]] = []
     if has_slots and slot_stats["slot_cos_sep"]:
         slot_summary = {
             "slot_cos_sep": round(float(np.mean(slot_stats["slot_cos_sep"])), 4),
@@ -784,6 +1103,90 @@ def run_visdrone_component_validation(
             "slot_share_p4_pct": round(float(np.mean(slot_stats["slot_share_p4"])), 2),
             "slot_share_p5_pct": round(float(np.mean(slot_stats["slot_share_p5"])), 2),
         }
+
+        # Group 1: FiLM ON vs OFF Ablation
+        if all_preds_film_off:
+            film_off_det, _ = compute_coco_map(all_preds_film_off, all_gts)
+            slot_summary["film_on_mAP50"] = round(float(overall_det["mAP50"]), 4)
+            slot_summary["film_off_mAP50"] = round(float(film_off_det["mAP50"]), 4)
+            slot_summary["film_delta_mAP50"] = round(float(overall_det["mAP50"] - film_off_det["mAP50"]), 4)
+            slot_summary["film_off_mAP50_95"] = round(float(film_off_det["mAP50_95"]), 4)
+            slot_summary["film_delta_mAP50_95"] = round(float(overall_det["mAP50_95"] - film_off_det["mAP50_95"]), 4)
+        if slot_stats["loss_focal_film_on"] and slot_stats["loss_focal_film_off"]:
+            f_on = float(np.mean(slot_stats["loss_focal_film_on"]))
+            f_off = float(np.mean(slot_stats["loss_focal_film_off"]))
+            slot_summary["loss_focal_film_on"] = round(f_on, 4)
+            slot_summary["loss_focal_film_off"] = round(f_off, 4)
+            slot_summary["loss_focal_film_delta"] = round(f_on - f_off, 4)
+
+        # Group 2: Attention sharpness, entropy, calibration, BG leak, inactive FA
+        for k in [
+            "dots_std", "dots_abs_max", "dots_margin_fg",
+            "attn_entropy_fg", "attn_entropy_bg",
+            "slot_pos_ce_all", "slot_pos_ce_balanced",
+            "slot_bg_leak_pct", "slot_inactive_fa_pct",
+            "film_gamma_abs_p3", "film_gamma_abs_p4", "film_gamma_abs_p5",
+            "film_beta_abs_p3", "film_beta_abs_p4", "film_beta_abs_p5",
+            "film_sat_pct_p3", "film_sat_pct_p4", "film_sat_pct_p5",
+        ]:
+            if slot_stats[k]:
+                slot_summary[k] = round(float(np.mean(slot_stats[k])), 4)
+
+        # Group 4: Query orthogonality, cross-image slot variance, and submodule weight L2 norms
+        q_fg = F.normalize(model.slot_refiner.slot_attention.obj_queries[0, :10, :].detach().float(), dim=-1)
+        q_sim = q_fg @ q_fg.T
+        q_off = q_sim[~torch.eye(10, dtype=torch.bool, device=q_sim.device)]
+        slot_summary["query_cos_sep"] = round(float((1.0 - q_off).mean().item()), 4)
+        if len(slot_vecs_list) >= 2:
+            sv = np.stack(slot_vecs_list, axis=0)  # (N_img, 10, D)
+            slot_summary["slot_cross_img_std"] = round(float(sv.std(axis=0).mean()), 4)
+
+        def _wnorm(mod: torch.nn.Module) -> float:
+            sq = sum(float(p.detach().float().pow(2).sum().item()) for p in mod.parameters())
+            return round(float(np.sqrt(sq)), 4)
+
+        slot_summary["wnorm_proj_in"] = _wnorm(model.slot_refiner.proj_in)
+        slot_summary["wnorm_slot_attn"] = _wnorm(model.slot_refiner.slot_attention)
+        slot_summary["wnorm_modulators"] = _wnorm(model.slot_refiner.modulators)
+
+        # Group 3: Per-class Slot Dice, Recall, BG leak & top confused slot
+        col_names_11 = list(VISDRONE_CLASSES) + ["BG"]
+        dices_valid = []
+        for c in range(10):
+            tot_px = float(slot_conf_mat[c].sum())
+            dice_c = (2.0 * slot_cls_inter[c] / max(slot_cls_card[c], 1e-8)) if slot_cls_card[c] > 0 else np.nan
+            rec_c = (slot_conf_mat[c, c] / tot_px * 100.0) if tot_px > 0 else np.nan
+            bg_leak_c = (slot_conf_mat[c, 10] / tot_px * 100.0) if tot_px > 0 else np.nan
+            wrong = slot_conf_mat[c].copy()
+            wrong[c] = -1.0
+            top_w_idx = int(np.argmax(wrong)) if tot_px > 0 else -1
+            top_w_str = f"{col_names_11[top_w_idx]} ({wrong[top_w_idx] / tot_px * 100.0:.1f}%)" if (tot_px > 0 and wrong[top_w_idx] > 0) else "-"
+            if np.isfinite(dice_c):
+                dices_valid.append(dice_c)
+            slot_per_class_rows.append({
+                "class_id": c,
+                "class_name": VISDRONE_CLASSES[c],
+                "gt_pixels": int(tot_px),
+                "slot_dice": round(float(dice_c), 4) if np.isfinite(dice_c) else np.nan,
+                "slot_recall_pct": round(float(rec_c), 2) if np.isfinite(rec_c) else np.nan,
+                "bg_leak_pct": round(float(bg_leak_c), 2) if np.isfinite(bg_leak_c) else np.nan,
+                "top_confused_slot": top_w_str,
+            })
+        if dices_valid:
+            slot_summary["slot_mean_dice"] = round(float(np.mean(dices_valid)), 4)
+
+        with open(os.path.join(out_dir, "slot_overfit_diagnostics.csv"), "w", newline="", encoding="utf-8") as f:
+            w = csv.DictWriter(f, fieldnames=list(slot_summary.keys()))
+            w.writeheader()
+            w.writerow(slot_summary)
+
+        with open(os.path.join(out_dir, "slot_per_class_diagnostics.csv"), "w", newline="", encoding="utf-8") as f:
+            w = csv.DictWriter(f, fieldnames=list(slot_per_class_rows[0].keys()))
+            w.writeheader()
+            w.writerows(slot_per_class_rows)
+
+        if slot_conf_mat.sum() > 0:
+            _plot_slot_confusion_matrix(slot_conf_mat, os.path.join(out_dir, "chart_06_slot_confusion_matrix.png"))
 
     box_diag = {
         k: round(float(np.mean(v)), 4)
@@ -829,7 +1232,21 @@ def run_visdrone_component_validation(
     print(f"  mAP@0.50:0.95 : {overall_det['mAP50_95']:.4f} (S: {overall_det['mAP50_95_small']:.4f} | M: {overall_det['mAP50_95_medium']:.4f} | L: {overall_det['mAP50_95_large']:.4f})")
     print(f"  P / R / F1    : {overall_det['precision_c25']:.4f} / {overall_det['recall_c25']:.4f} / {overall_det['f1_c25']:.4f} (conf>=0.25)")
     if slot_summary:
-        print(f"  Slot Cos Sep  : {slot_summary['slot_cos_sep']:.4f} | Share P3/P4/P5: {slot_summary['slot_share_p3_pct']:.1f}% / {slot_summary['slot_share_p4_pct']:.1f}% / {slot_summary['slot_share_p5_pct']:.1f}%")
+        print("  --- Slot Overfit & FiLM Diagnostics ---")
+        print(f"  Slot Cos Sep / Query Sep / Std : {slot_summary.get('slot_cos_sep', 0):.4f} / {slot_summary.get('query_cos_sep', 0):.4f} / {slot_summary.get('slot_cross_img_std', 0):.4f}")
+        print(f"  Slot Share P3/P4/P5            : {slot_summary.get('slot_share_p3_pct', 0):.1f}% / {slot_summary.get('slot_share_p4_pct', 0):.1f}% / {slot_summary.get('slot_share_p5_pct', 0):.1f}%")
+        if "film_off_mAP50" in slot_summary:
+            print(f"  FiLM Ablation mAP@50 (ON/OFF)  : {slot_summary['film_on_mAP50']:.4f} / {slot_summary['film_off_mAP50']:.4f} (delta: {slot_summary['film_delta_mAP50']:+.4f})")
+        if "loss_focal_film_on" in slot_summary:
+            print(f"  FiLM Ablation Focal  (ON/OFF)  : {slot_summary['loss_focal_film_on']:.4f} / {slot_summary['loss_focal_film_off']:.4f} (delta: {slot_summary['loss_focal_film_delta']:+.4f})")
+        print(f"  Dots Std / AbsMax / FG Margin  : {slot_summary.get('dots_std', 0):.3f} / {slot_summary.get('dots_abs_max', 0):.3f} / {slot_summary.get('dots_margin_fg', 0):.3f}")
+        print(f"  Attn Entropy (FG / BG)         : {slot_summary.get('attn_entropy_fg', 0):.3f} / {slot_summary.get('attn_entropy_bg', 0):.3f}")
+        print(f"  Slot PosCE (All / Balanced)    : {slot_summary.get('slot_pos_ce_all', 0):.3f} / {slot_summary.get('slot_pos_ce_balanced', 0):.3f} | Mean Dice: {slot_summary.get('slot_mean_dice', 0):.4f}")
+        print(f"  BG Leak / Inactive FA          : {slot_summary.get('slot_bg_leak_pct', 0):.2f}% / {slot_summary.get('slot_inactive_fa_pct', 0):.3f}%")
+        print(f"  FiLM |d_gamma| P3/P4/P5        : {slot_summary.get('film_gamma_abs_p3', 0):.3f} / {slot_summary.get('film_gamma_abs_p4', 0):.3f} / {slot_summary.get('film_gamma_abs_p5', 0):.3f}")
+        print(f"  FiLM |d_beta|  P3/P4/P5        : {slot_summary.get('film_beta_abs_p3', 0):.3f} / {slot_summary.get('film_beta_abs_p4', 0):.3f} / {slot_summary.get('film_beta_abs_p5', 0):.3f}")
+        print(f"  FiLM Sat(>0.9) P3/P4/P5        : {slot_summary.get('film_sat_pct_p3', 0):.2f}% / {slot_summary.get('film_sat_pct_p4', 0):.2f}% / {slot_summary.get('film_sat_pct_p5', 0):.2f}%")
+        print(f"  Weight Norms (proj/attn/mod)   : {slot_summary.get('wnorm_proj_in', 0):.2f} / {slot_summary.get('wnorm_slot_attn', 0):.2f} / {slot_summary.get('wnorm_modulators', 0):.2f}")
     if box_diag:
         print("  --- Box Learning Mechanism Diagnostics ---")
         print(f"  Boundary Contrast (P3/P4/P5)   : {box_diag.get('boundary_contrast_p3', 0):.3f} / {box_diag.get('boundary_contrast_p4', 0):.3f} / {box_diag.get('boundary_contrast_p5', 0):.3f}")
@@ -845,16 +1262,18 @@ def run_visdrone_component_validation(
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Component-by-component validation of VisDrone YOLOv11.")
+    p.add_argument("--config", type=str, default=None, help="Optional YAML config path (e.g. VisDrone_yolov11/config.yaml).")
     p.add_argument("--weights", type=str, default=r"D:\Downloads\Picture\epoch_50.pth", help="Path to checkpoint (.pth or .pt).")
-    p.add_argument("--data-root", type=str, default="D:/apps/Datasets/VisDrone/VisDrone_data.lmdb", help="Path to VisDrone LMDB.")
+    p.add_argument("--data-root", type=str, default=None, help="Path to VisDrone LMDB (overrides --config if set).")
     p.add_argument("--out-dir", type=str, default="VisDrone_yolov11/output_val_epoch50", help="Output directory.")
-    p.add_argument("--imgsz", type=int, default=960, help="Input image size.")
-    p.add_argument("--max-images", type=int, default=0, help="Max val images (0 = all).")
+    p.add_argument("--imgsz", type=int, default=None, help="Input image size (defaults to config Resize or 960).")
+    p.add_argument("--max-images", type=int, default=0, help="Max images to evaluate (0 = all).")
     p.add_argument("--conf-thres", type=float, default=0.001, help="Confidence threshold for mAP.")
-    p.add_argument("--iou-thres", type=float, default=0.5, help="IoU threshold for NMS.")
+    p.add_argument("--iou-thres", type=float, default=None, help="IoU threshold for NMS (defaults to config nms_threshold or 0.5).")
     p.add_argument("--vis-conf", type=float, default=0.25, help="Confidence threshold for visual inspection.")
-    p.add_argument("--split-ratio", type=float, default=0.8, help="Train/val split ratio.")
-    p.add_argument("--seed", type=int, default=42, help="Random seed for split.")
+    p.add_argument("--split", type=str, default="val", choices=["val", "train"], help="Dataset split to evaluate ('val' or 'train').")
+    p.add_argument("--split-ratio", type=float, default=None, help="Train/val split ratio (overrides --config if set).")
+    p.add_argument("--seed", type=int, default=None, help="Random seed for split (defaults to config seed or 42).")
     p.add_argument("--device", type=str, default="auto", help="'auto', 'cuda', or 'cpu'.")
     return p.parse_args()
 
@@ -870,7 +1289,9 @@ if __name__ == "__main__":
         conf_thres=args.conf_thres,
         iou_thres=args.iou_thres,
         vis_conf=args.vis_conf,
+        split=args.split,
         split_ratio=args.split_ratio,
         seed=args.seed,
         device_str=args.device,
+        config_path=args.config,
     )

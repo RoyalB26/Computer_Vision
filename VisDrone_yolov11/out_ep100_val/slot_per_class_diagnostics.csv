@@ -1,0 +1,11 @@
+class_id,class_name,gt_pixels,slot_dice,slot_recall_pct,bg_leak_pct,top_confused_slot
+0,pedestrian,171099,0.3513,43.41,25.74,BG (25.7%)
+1,people,94741,0.2677,30.1,15.03,pedestrian (25.9%)
+2,bicycle,31815,0.0827,13.13,32.64,BG (32.6%)
+3,car,826836,0.6027,62.3,14.83,BG (14.8%)
+4,van,127557,0.1776,25.56,20.09,car (38.7%)
+5,truck,90342,0.1331,13.95,48.68,BG (48.7%)
+6,tricycle,50051,0.0934,13.04,29.15,BG (29.1%)
+7,awning-tricycle,25636,0.062,2.79,27.52,BG (27.5%)
+8,bus,28472,0.1494,11.77,30.65,BG (30.6%)
+9,motorcycle,121174,0.2369,24.09,20.61,people (20.6%)

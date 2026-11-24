@@ -1,4 +1,5 @@
 """VisDrone Dataset loaders: LMDB format (inherited from Visdrone) and standard directory formats."""
+import hashlib
 import io
 import os
 import pickle
@@ -39,8 +40,8 @@ class VisDroneLMDBDataset(BaseDataset):
     Args:
         data_root: Path to the LMDB database folder or file.
         pipeline: Data augmentation pipeline (e.g. Resize, ToTensor).
-        split: 'train' or 'val'.
-        split_ratio: Ratio for training set (e.g. 0.8 for 80% train, 20% val).
+        split: Optional 'train', 'val', or None. When None (or 'all'), loads 100% of data_root.
+        split_ratio: Ratio for training set (e.g. 0.8 for 80% train, 20% val) when splitting a single LMDB.
         seed: Random seed ensuring disjoint train/val splits across runs.
         test_mode: Whether in evaluation mode.
     """
@@ -49,8 +50,8 @@ class VisDroneLMDBDataset(BaseDataset):
         self,
         data_root: str,
         pipeline: Optional[Union[List[Dict[str, Any]], Callable]] = None,
-        split: str = "train",
-        split_ratio: float = 0.8,
+        split: Optional[str] = None,
+        split_ratio: Optional[float] = None,
         seed: int = 42,
         test_mode: bool = False,
         num_classes: int = 10,
@@ -61,15 +62,15 @@ class VisDroneLMDBDataset(BaseDataset):
         augment: bool = False,                # Fast tensor augmentation (HFlip + ColorJitter + Scale/Crop)
         **kwargs,
     ):
-        self.split = split.lower()
-        self.split_ratio = split_ratio
+        self.split = split.lower() if isinstance(split, str) else None
+        self.split_ratio = float(split_ratio) if split_ratio is not None else None
         self.seed = seed
         self.num_classes = num_classes
         self.bg_lmdb_path = bg_lmdb_path
         self.include_boxes = include_boxes
         self.cache_images = cache_images.lower() if isinstance(cache_images, str) else None
         self.cache_size = tuple(cache_size) if cache_size is not None else self._infer_resize_from_pipeline(pipeline)
-        self.augment = bool(augment) and (self.split == "train") and (not test_mode)
+        self.augment = bool(augment) and (self.split not in ("val", "test")) and (not test_mode)
         self.env = None
         self.txn = None
         self.bg_env = None
@@ -81,6 +82,8 @@ class VisDroneLMDBDataset(BaseDataset):
         self._jpeg_cache: Optional[List[Tuple[bytes, Dict[str, Any]]]] = None
         super().__init__(data_root=data_root, pipeline=pipeline, test_mode=test_mode)
 
+        if self.augment:
+            print(f"[VisDroneLMDBDataset:{self.split}] Data augmentation ENABLED (flip + scale/crop + color jitter).")
         if self.cache_images in ("ram", "jpeg") and len(self.data_infos) > 0:
             self._build_ram_cache()
 
@@ -139,7 +142,8 @@ class VisDroneLMDBDataset(BaseDataset):
     def _load_or_scan_class_counts(data_root: str, txn, total: int, num_classes: int) -> np.ndarray:
         """Đọc hoặc quét và cache số lượng box của từng class cho toàn bộ ảnh trong LMDB."""
         cache_dir = os.path.dirname(os.path.abspath(__file__))
-        cache_path = os.path.join(cache_dir, ".lmdb_class_counts_cache.npz")
+        root_hash = hashlib.md5(os.path.abspath(data_root).encode("utf-8")).hexdigest()[:8]
+        cache_path = os.path.join(cache_dir, f".lmdb_class_counts_cache_{root_hash}.npz")
 
         if os.path.exists(cache_path):
             try:
@@ -294,7 +298,7 @@ class VisDroneLMDBDataset(BaseDataset):
         return train_list, val_list
 
     def load_annotations(self) -> List[Dict[str, Any]]:
-        """Scan LMDB total entries and generate stratified train/val split indices."""
+        """Scan LMDB total entries and optionally apply stratified train/val split."""
         if not os.path.exists(self.data_root):
             return []
 
@@ -305,10 +309,18 @@ class VisDroneLMDBDataset(BaseDataset):
         else:
             total = int(total_len_bytes.decode("ascii"))
 
+        should_split = (
+            self.split in ("train", "val")
+            and (self.split_ratio is None or 0.0 < self.split_ratio < 1.0)
+        )
+        if not should_split:
+            return [{"lmdb_idx": idx} for idx in range(total)]
+
+        ratio = 0.8 if self.split_ratio is None else self.split_ratio
         all_counts = self._load_or_scan_class_counts(self.data_root, txn, total, self.num_classes)
         train_indices, val_indices = self._stratified_train_val_split(
             all_counts=all_counts,
-            split_ratio=self.split_ratio,
+            split_ratio=ratio,
             seed=self.seed,
         )
 

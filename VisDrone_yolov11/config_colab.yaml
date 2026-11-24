@@ -19,7 +19,6 @@ model:
   num_classes: 10
   pretrained: "/content/yolo11n.pt"
   # Core YOLOv11 detection loss weights
-  # Core YOLOv11 detection loss weights
   box_weight: 7.5
   cls_weight: 1.0
   dfl_weight: 1.5
@@ -34,7 +33,7 @@ model:
   fusion_mode: "film"          # "film" (Method C) or "residual"
   use_bg_slot_write: false     # false = 10 fg slots only (natural bg gating), true = all 11 slots
   use_logit_prior: false       # keep head.cv3 clean (no logit co-adaptation)
-  assigner_prior_weight: 0.25  # decoupled slot-guided prior ONLY for TaskAlignedAssigner (fast box learning)
+  assigner_prior_weight: 0.0   # 0.0 = clean TAL assignment
   use_slot_checkpoint: false   # set true to further cut activation VRAM on small GPUs
   slot_loss_weight: 0.3        # auxiliary slot supervision multiplier
   bg_attn_weight: 0.5
@@ -48,14 +47,12 @@ data:
   train:
     dataset:
       type: "VisDroneLMDBDataset"
-      data_root: "/content/visdron.lmdb"
-      bg_lmdb_path: "/content/bg_seg.lmdb"
+      data_root: "/content/train_data.lmdb"
       cache_images: "ram"
-      split: "train"
-      split_ratio: 0.8
       seed: 42
       num_classes: 10
       include_boxes: true
+      augment: true
       pipeline:
         - type: "Resize"
           size: [960, 960]
@@ -64,18 +61,15 @@ data:
     shuffle: true
     num_workers: 4
     pin_memory: true
-    augment: true
   val:
     dataset:
       type: "VisDroneLMDBDataset"
-      data_root: "/content/visdron.lmdb"
-      bg_lmdb_path: "/content/bg_seg.lmdb"
+      data_root: "/content/val_data.lmdb"
       cache_images: "ram"
-      split: "val"
-      split_ratio: 0.8
       seed: 42
       num_classes: 10
       include_boxes: true
+      augment: false
       pipeline:
         - type: "Resize"
           size: [960, 960]
@@ -89,7 +83,7 @@ data:
 optimizer:
   type: "AdamW"
   lr: 0.0012
-  weight_decay: 0.0005
+  weight_decay: 0.001
 
 # 4. Learning Rate Scheduler
 lr_scheduler:
