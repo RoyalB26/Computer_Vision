@@ -193,7 +193,8 @@ class LightweightSlotAttention(nn.Module):
             attn_for_agg = attn_sub + self.eps
         attn_norm = attn_for_agg / attn_for_agg.sum(dim=-1, keepdim=True).clamp(min=self.eps)
 
-        slots_sub = torch.einsum("bnd,bsn->bsd", v.float(), attn_norm).to(dtype=v.dtype)
+        updates = torch.einsum("bnd,bsn->bsd", v.float(), attn_norm).to(dtype=v.dtype)
+        slots_sub = slots + updates
         slots_sub = slots_sub + self.fc2(self.dropout(F.silu(self.fc1(self.norm_pre_ff(slots_sub)))))
 
         # Aggregate sub-slots -> class-level (K + 1)
@@ -394,9 +395,11 @@ class PostNeckSlotFiLMRefiner(nn.Module):
 
             tokens = torch.cat(tokens_list, dim=1)  # (B, N, D)
 
-            # [MUFASA Coarse-to-Fine T>=2 + 1-Step Implicit Diff]
-            # Iter 1..T-1 read coarse P4+P5 (4,500 tokens) to build image-contextualized slots,
-            # then detach before the final full-resolution P3+P4+P5 pass.
+            # [MUFASA Coarse-to-Fine T>=2 + Straight-Through Anchored Implicit Diff]
+            # Iter 1..T-1 read coarse P4+P5 (4,500 tokens) to build image-contextualized slots.
+            # Anchored straight-through `q0 + (cur_slots - q0).detach()` keeps exact `cur_slots`
+            # forward value & cuts Iter-1 backward graph (saving VRAM) while letting semantic
+            # gradients from Iter-2 (`loss_cls_attn`, `loss_bg_attn`, FiLM) flow directly to `obj_queries`.
             init_slots = None
             if self.num_iters >= 2 and len(tokens_list) >= 2:
                 coarse_tokens = torch.cat(tokens_list[1:], dim=1)  # P4 + P5
@@ -405,7 +408,11 @@ class PostNeckSlotFiLMRefiner(nn.Module):
                     cur_slots, _, _, _, _ = self.slot_attention(
                         coarse_tokens, slots=cur_slots, presence_gate=presence_gate
                     )
-                init_slots = cur_slots.detach() if self.use_implicit_diff else cur_slots
+                if self.use_implicit_diff:
+                    q0 = self.slot_attention.obj_queries.expand(bs, -1, -1)
+                    init_slots = q0 + (cur_slots - q0).detach()
+                else:
+                    init_slots = cur_slots
 
             if self.use_checkpoint and self.training:
                 slots_sub, attn_sub, slots, attn_ori, dots = checkpoint(
