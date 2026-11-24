@@ -193,8 +193,7 @@ class LightweightSlotAttention(nn.Module):
             attn_for_agg = attn_sub + self.eps
         attn_norm = attn_for_agg / attn_for_agg.sum(dim=-1, keepdim=True).clamp(min=self.eps)
 
-        updates = torch.einsum("bnd,bsn->bsd", v.float(), attn_norm).to(dtype=v.dtype)
-        slots_sub = slots + updates
+        slots_sub = torch.einsum("bnd,bsn->bsd", v.float(), attn_norm).to(dtype=v.dtype)
         slots_sub = slots_sub + self.fc2(self.dropout(F.silu(self.fc1(self.norm_pre_ff(slots_sub)))))
 
         # Aggregate sub-slots -> class-level (K + 1)
@@ -318,6 +317,13 @@ class PostNeckSlotFiLMRefiner(nn.Module):
         self.num_prototypes = self.slot_attention.num_prototypes
         self.slot_drop = nn.Dropout2d(slot_dropout)
 
+        # Zero-init residual gate for MUFASA T>=2: starts at 0.0 (= exact T=1 fast convergence),
+        # then opens smoothly to blend P4+P5 coarse image context into `obj_queries` without collapse.
+        if self.num_iters >= 2:
+            self.iter_gate = nn.Parameter(torch.zeros(1, 1, 1))
+        else:
+            self.register_parameter("iter_gate", None)
+
         # Zero-initialized FiLM or Residual projections back to each scale's channel dim
         if fusion_mode == "film":
             self.modulators = nn.ModuleList([
@@ -395,11 +401,10 @@ class PostNeckSlotFiLMRefiner(nn.Module):
 
             tokens = torch.cat(tokens_list, dim=1)  # (B, N, D)
 
-            # [MUFASA Coarse-to-Fine T>=2 + Straight-Through Anchored Implicit Diff]
-            # Iter 1..T-1 read coarse P4+P5 (4,500 tokens) to build image-contextualized slots.
-            # Anchored straight-through `q0 + (cur_slots - q0).detach()` keeps exact `cur_slots`
-            # forward value & cuts Iter-1 backward graph (saving VRAM) while letting semantic
-            # gradients from Iter-2 (`loss_cls_attn`, `loss_bg_attn`, FiLM) flow directly to `obj_queries`.
+            # [MUFASA Coarse-to-Fine T>=2 + Zero-Init Gated Implicit Diff]
+            # Iter 1..T-1 read coarse P4+P5 (4,500 tokens) to extract image-contextualized slots.
+            # Zero-init `iter_gate` guarantees exact T=1 convergence at Epoch 1 (no slot collapse),
+            # then smoothly blends coarse context into `q0` while keeping full gradient to `obj_queries`.
             init_slots = None
             if self.num_iters >= 2 and len(tokens_list) >= 2:
                 coarse_tokens = torch.cat(tokens_list[1:], dim=1)  # P4 + P5
@@ -408,11 +413,10 @@ class PostNeckSlotFiLMRefiner(nn.Module):
                     cur_slots, _, _, _, _ = self.slot_attention(
                         coarse_tokens, slots=cur_slots, presence_gate=presence_gate
                     )
-                if self.use_implicit_diff:
-                    q0 = self.slot_attention.obj_queries.expand(bs, -1, -1)
-                    init_slots = q0 + (cur_slots - q0).detach()
-                else:
-                    init_slots = cur_slots
+                q0 = self.slot_attention.obj_queries.expand(bs, -1, -1)
+                delta = (cur_slots - q0).detach() if self.use_implicit_diff else (cur_slots - q0)
+                gate = torch.tanh(self.iter_gate) if self.iter_gate is not None else 1.0
+                init_slots = q0 + gate * delta
 
             if self.use_checkpoint and self.training:
                 slots_sub, attn_sub, slots, attn_ori, dots = checkpoint(
