@@ -75,8 +75,10 @@ class VisDroneLMDBDataset(BaseDataset):
         self.cache_images = cache_images.lower() if isinstance(cache_images, str) else None
         self.cache_size = tuple(cache_size) if cache_size is not None else self._infer_resize_from_pipeline(pipeline)
         self.augment = bool(augment) and (self.split not in ("val", "test")) and (not test_mode)
-        self.mosaic_prob = float(mosaic_prob) if self.augment else 0.0
-        self.mosaic_rare_prob = float(mosaic_rare_prob) if self.mosaic_prob > 0.0 else 0.0
+        # Shared-memory scalar so WarmupLRHook & CloseMosaicHook propagate immediately to persistent_workers!
+        init_mp = float(mosaic_prob) if self.augment else 0.0
+        self._mosaic_prob_shared = torch.tensor([init_mp], dtype=torch.float32).share_memory_()
+        self.mosaic_rare_prob = float(mosaic_rare_prob) if init_mp > 0.0 else 0.0
         self.mosaic_rare_classes = list(mosaic_rare_classes) if mosaic_rare_classes is not None else None
         self._rare_class_pools: Dict[int, List[int]] = {}
         self._rare_class_weights: List[float] = []
@@ -101,6 +103,21 @@ class VisDroneLMDBDataset(BaseDataset):
             self._build_ram_cache()
         if self.mosaic_rare_prob > 0.0 and len(self.data_infos) >= 4:
             self._build_rare_class_pools()
+
+    @property
+    def mosaic_prob(self) -> float:
+        buf = self.__dict__.get("_mosaic_prob_shared")
+        if buf is not None:
+            return float(buf[0].item())
+        return float(self.__dict__.get("_mosaic_prob_fallback", 0.0))
+
+    @mosaic_prob.setter
+    def mosaic_prob(self, value: float) -> None:
+        buf = self.__dict__.get("_mosaic_prob_shared")
+        if buf is not None:
+            buf[0] = float(value)
+        else:
+            self.__dict__["_mosaic_prob_fallback"] = float(value)
 
     @staticmethod
     def _infer_resize_from_pipeline(pipeline: Optional[Any]) -> Tuple[int, int]:

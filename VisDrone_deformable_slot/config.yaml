@@ -26,7 +26,7 @@ model:
   nms_threshold: 0.5
   max_det: 300
   # Dual-Resolution & Deformable High-Res Micro-Patch Injector (Approach 2)
-  backbone_size: 640
+  backbone_size: 960
   use_deformable_patch: true
   num_patches: 192
   patch_size: 32

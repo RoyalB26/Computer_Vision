@@ -22,4 +22,5 @@ action_depth/
 
 outputs/
 VisDrone_yolov11/out*/
+VisDrone_deformable_slot/output_val_deformable/
 Visdrone/analysis
