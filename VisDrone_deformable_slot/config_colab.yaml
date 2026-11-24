@@ -78,7 +78,7 @@ data:
     dataset:
       type: "VisDroneDualResLMDBDataset"
       data_root: "/content/train_data.lmdb"
-      cache_images: "jpeg"       # ~0.8 GB RAM (keeps full original JPEG sharpness without 30GB RAM footprint)
+      cache_images: null         # LMDB mmap shares OS page cache across all DDP ranks & workers (0 RAM duplication!)
       seed: 42
       num_classes: 10
       include_boxes: true
@@ -91,13 +91,13 @@ data:
         - type: "ToTensor"
     batch_size: 16
     shuffle: true
-    num_workers: 4
+    num_workers: 2
     pin_memory: true
   val:
     dataset:
       type: "VisDroneDualResLMDBDataset"
       data_root: "/content/val_data.lmdb"
-      cache_images: "jpeg"
+      cache_images: null
       seed: 42
       num_classes: 10
       include_boxes: true

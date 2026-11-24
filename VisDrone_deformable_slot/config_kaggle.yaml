@@ -1,10 +1,10 @@
 # ==============================================================================
-# VisDrone YOLOv11 + Slot FiLM + Deformable High-Res Micro-Patch (Colab L4)
-# High-Res Input: 1280x1280 | Backbone: 640x640 (6.9 GFLOPs) | Deformable Patches: +1.5 GFLOPs
-# Total ~8.5 GFLOPs (nearly 2x LIGHTER than 960x960!) while reading 1280x1280 pixel detail!
+# Kaggle 2xT4 DDP Config: VisDrone YOLOv11 + Slot FiLM + Deformable High-Res Micro-Patch
+# - `cache_images: null` uses LMDB mmap OS page cache (0 RAM duplication across DDP workers)
+# - `batch_size: 8` x 2 GPUs x `accumulate: 2` = effective batch size 32 (safe for 15GB T4 VRAM)
 # ==============================================================================
 
-work_dir: "./work_dirs/visdrone_deformable_slot_1280_bb640"
+work_dir: "./work_dirs/visdrone_deformable_slot_kaggle"
 device: "cuda"
 seed: 42
 tqdm: true
@@ -20,7 +20,6 @@ model:
   type: "VisDroneYOLO11DeformableSlot"
   num_classes: 10
   pretrained: "/kaggle/input/models/royalb26/yolov11/pytorch/default/1/yolo11n.pt"
-  # Core YOLOv11 detection loss weights
   box_weight: 7.5
   cls_weight: 1.0
   dfl_weight: 1.5
@@ -30,14 +29,14 @@ model:
   nms_threshold: 0.5
   max_det: 300
   # Dual-Resolution & Deformable High-Res Micro-Patch Injector (Approach 2)
-  backbone_size: 640             # Backbone runs fast at 640x640 (~6.9 GFLOPs) or set 960 (~15.7 GFLOPs)
+  backbone_size: 640
   use_deformable_patch: true
-  num_patches: 192               # Top-192 foreground P3 locations sampled from 1280x1280
+  num_patches: 192
   patch_size: 32                 # 32x32 RGB micro-patch (preserves ~100% sharpness; divides cleanly 32->16->8->4)
-  base_patch_radius: 0.035       # 45x45px span on 1280x1280 (scales dynamically 27x27..63x63px covering Tiny->Small p90)
-  max_offset_cells: 1.5          # Learned deformable shift up to +-1.5 P3 cells
+  base_patch_radius: 0.035       # 45x45px span on 1280x1280 (dynamic 27x27..63x63px covering Tiny->Small p90)
+  max_offset_cells: 1.5
   class_focus_weights: [2.0, 2.0, 3.0, 0.3, 0.5, 0.5, 3.0, 3.0, 0.3, 2.0]
-  spread_local_3x3: true         # Spread high-res residual to immediate 3x3 P3 neighbors
+  spread_local_3x3: true
   patch_dropout: 0.1
   # Slot + FiLM hyperparameters
   slot_dim: 64
@@ -72,13 +71,13 @@ model:
   use_class_freq_weight: true
   class_freq_max_weight: 2.0
 
-# 2. Dual-Resolution Dataset Configuration (loads 1280x1280; model downsamples to backbone_size on GPU)
+# 2. Dual-Resolution Dataset Configuration (update data_root to your Kaggle LMDB dataset path)
 data:
   train:
     dataset:
       type: "VisDroneDualResLMDBDataset"
-      data_root: "/content/train_data.lmdb"
-      cache_images: "jpeg"       # ~0.8 GB RAM (keeps full original JPEG sharpness without 30GB RAM footprint)
+      data_root: "/kaggle/working/train_data.lmdb"
+      cache_images: null         # CRITICAL for Kaggle DDP: avoids forkserver RAM duplication (SIGKILL -9)
       seed: 42
       num_classes: 10
       include_boxes: true
@@ -89,15 +88,15 @@ data:
         - type: "Resize"
           size: [1280, 1280]
         - type: "ToTensor"
-    batch_size: 16
+    batch_size: 8                # 8 per T4 x 2 GPUs x accumulate 2 = effective batch 32
     shuffle: true
-    num_workers: 4
+    num_workers: 2
     pin_memory: true
   val:
     dataset:
       type: "VisDroneDualResLMDBDataset"
-      data_root: "/content/val_data.lmdb"
-      cache_images: "jpeg"
+      data_root: "/kaggle/working/val_data.lmdb"
+      cache_images: null
       seed: 42
       num_classes: 10
       include_boxes: true
@@ -106,7 +105,7 @@ data:
         - type: "Resize"
           size: [1280, 1280]
         - type: "ToTensor"
-    batch_size: 16
+    batch_size: 8
     shuffle: false
     num_workers: 2
     pin_memory: true
@@ -134,7 +133,7 @@ train_cfg:
   val_interval: 10
   grad_clip: 10.0
   use_amp: true
-  accumulate: 2                  # effective batch size = 16 * 2 = 32
+  accumulate: 2
   log_interval: 50000
 
 # 6. Lifecycle Hooks
