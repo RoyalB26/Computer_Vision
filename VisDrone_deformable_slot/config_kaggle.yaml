@@ -83,11 +83,11 @@ data:
       num_classes: 10
       include_boxes: true
       augment: true
-      mosaic_prob: 0.5
+      mosaic_prob: 0.35          # Balanced for Kaggle 4-vCPU speed + rare-class boost
       mosaic_rare_prob: 0.75
       pipeline:
         - type: "Resize"
-          size: [1280, 1280]
+          size: [1024, 1024]     # 36% fewer CPU pixels than 1280 while matching val median (1360x765)
         - type: "ToTensor"
     batch_size: 8                # 8 per T4 x 2 GPUs x accumulate 2 = effective batch 32
     shuffle: true
@@ -104,7 +104,7 @@ data:
       augment: false
       pipeline:
         - type: "Resize"
-          size: [1280, 1280]
+          size: [1024, 1024]
         - type: "ToTensor"
     batch_size: 8
     shuffle: false
