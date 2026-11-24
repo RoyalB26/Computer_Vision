@@ -76,7 +76,7 @@ data:
   train:
     dataset:
       type: "VisDroneDualResLMDBDataset"
-      data_root: "/kaggle/working/train_data.lmdb"
+      data_root: "/content/train_data.lmdb"
       cache_images: null         # CRITICAL for Kaggle DDP: avoids forkserver RAM duplication (SIGKILL -9)
       seed: 42
       num_classes: 10
@@ -95,7 +95,7 @@ data:
   val:
     dataset:
       type: "VisDroneDualResLMDBDataset"
-      data_root: "/kaggle/working/val_data.lmdb"
+      data_root: "/content/val_data.lmdb"
       cache_images: null
       seed: 42
       num_classes: 10
