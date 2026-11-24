@@ -31,7 +31,7 @@ model:
   # Dual-Resolution & Deformable High-Res Micro-Patch Injector (Approach 2)
   backbone_size: 640
   use_deformable_patch: true
-  num_patches: 192
+  num_patches: 256               # Top-256 foreground P3 locations (+33% small-object coverage)
   patch_size: 32                 # 32x32 RGB micro-patch (preserves ~100% sharpness; divides cleanly 32->16->8->4)
   base_patch_radius: 0.035       # 45x45px span on 1280x1280 (dynamic 27x27..63x63px covering Tiny->Small p90)
   max_offset_cells: 1.5
@@ -89,7 +89,7 @@ data:
         - type: "Resize"
           size: [1024, 1024]     # 36% fewer CPU pixels than 1280 while matching val median (1360x765)
         - type: "ToTensor"
-    batch_size: 8                # 8 per T4 x 2 GPUs x accumulate 2 = effective batch 32
+    batch_size: 16               # 16 per T4 x 2 GPUs x accumulate 1 = effective batch 32 (~7GB VRAM)
     shuffle: true
     num_workers: 2
     pin_memory: true
@@ -106,7 +106,7 @@ data:
         - type: "Resize"
           size: [1024, 1024]
         - type: "ToTensor"
-    batch_size: 8
+    batch_size: 16
     shuffle: false
     num_workers: 2
     pin_memory: true
@@ -134,7 +134,7 @@ train_cfg:
   val_interval: 10
   grad_clip: 10.0
   use_amp: true
-  accumulate: 2
+  accumulate: 1
   log_interval: 50000
 
 # 6. Lifecycle Hooks
