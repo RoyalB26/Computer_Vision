@@ -62,6 +62,8 @@ class VisDroneLMDBDataset(BaseDataset):
         cache_size: Optional[Tuple[int, int]] = None,
         augment: bool = False,                # Fast tensor augmentation (HFlip + ColorJitter + Scale/Crop)
         mosaic_prob: float = 0.0,             # 4-image full-resolution Mosaic probability (active when augment=True)
+        mosaic_rare_prob: float = 0.0,        # Prob that 1 of 3 extra Mosaic images is sampled from a rare class
+        mosaic_rare_classes: Optional[List[int]] = None,  # Explicit rare class IDs (None = auto-detect < 35% freq)
         **kwargs,
     ):
         self.split = split.lower() if isinstance(split, str) else None
@@ -74,6 +76,9 @@ class VisDroneLMDBDataset(BaseDataset):
         self.cache_size = tuple(cache_size) if cache_size is not None else self._infer_resize_from_pipeline(pipeline)
         self.augment = bool(augment) and (self.split not in ("val", "test")) and (not test_mode)
         self.mosaic_prob = float(mosaic_prob) if self.augment else 0.0
+        self.mosaic_rare_prob = float(mosaic_rare_prob) if self.mosaic_prob > 0.0 else 0.0
+        self.mosaic_rare_classes = list(mosaic_rare_classes) if mosaic_rare_classes is not None else None
+        self._rare_class_pools: Dict[int, List[int]] = {}
         self.env = None
         self.txn = None
         self.bg_env = None
@@ -86,10 +91,14 @@ class VisDroneLMDBDataset(BaseDataset):
         super().__init__(data_root=data_root, pipeline=pipeline, test_mode=test_mode)
 
         if self.augment:
-            m_str = f" + mosaic4 (p={self.mosaic_prob:.2f})" if self.mosaic_prob > 0.0 else ""
+            m_str = f" + mosaic4 (p={self.mosaic_prob:.2f}" if self.mosaic_prob > 0.0 else ""
+            if m_str:
+                m_str += f", rare_p={self.mosaic_rare_prob:.2f})" if self.mosaic_rare_prob > 0.0 else ")"
             print(f"[VisDroneLMDBDataset:{self.split}] Data augmentation ENABLED (flip + scale/crop + color jitter{m_str}).")
         if self.cache_images in ("ram", "jpeg") and len(self.data_infos) > 0:
             self._build_ram_cache()
+        if self.mosaic_rare_prob > 0.0 and len(self.data_infos) >= 4:
+            self._build_rare_class_pools()
 
     @staticmethod
     def _infer_resize_from_pipeline(pipeline: Optional[Any]) -> Tuple[int, int]:
@@ -514,14 +523,71 @@ class VisDroneLMDBDataset(BaseDataset):
             return None, {}
         return data.get("image"), data.get("target", {})
 
+    def _build_rare_class_pools(self) -> None:
+        """Build per-class image index pools for Class-Aware Online Mosaic sampling."""
+        n = len(self.data_infos)
+        cls_pools: Dict[int, List[int]] = {c: [] for c in range(self.num_classes)}
+
+        if self._ram_targets is not None:
+            for idx, t_np in enumerate(self._ram_targets):
+                cnts = t_np.get("counts")
+                if cnts is not None:
+                    for c in np.flatnonzero(cnts > 0):
+                        if c < self.num_classes:
+                            cls_pools[int(c)].append(idx)
+        elif self._jpeg_cache is not None:
+            for idx, (_, t) in enumerate(self._jpeg_cache):
+                cnts = t.get("counts")
+                if cnts is not None:
+                    arr = cnts.numpy() if isinstance(cnts, torch.Tensor) else np.asarray(cnts)
+                    for c in np.flatnonzero(arr > 0):
+                        if c < self.num_classes:
+                            cls_pools[int(c)].append(idx)
+        else:
+            self._init_db()
+            total_len_bytes = self.txn.get(b"__len__")
+            total = int(total_len_bytes.decode("ascii")) if total_len_bytes is not None else self.env.stat()["entries"]
+            all_counts = self._load_or_scan_class_counts(self.data_root, self.txn, total, self.num_classes)
+            for idx, info in enumerate(self.data_infos):
+                row = all_counts[info["lmdb_idx"]]
+                for c in np.flatnonzero(row > 0):
+                    if c < self.num_classes:
+                        cls_pools[int(c)].append(idx)
+
+        if self.mosaic_rare_classes is not None:
+            rare_ids = [c for c in self.mosaic_rare_classes if 0 <= c < self.num_classes and len(cls_pools[c]) > 0]
+        else:
+            # Auto-detect rare classes appearing in < 35% of images (fallback to 3 rarest non-empty classes)
+            non_empty = [(c, len(cls_pools[c])) for c in range(self.num_classes) if len(cls_pools[c]) > 0]
+            rare_ids = [c for c, cnt in non_empty if (cnt / max(n, 1)) < 0.35]
+            if not rare_ids and non_empty:
+                non_empty.sort(key=lambda x: x[1])
+                rare_ids = [c for c, _ in non_empty[:3]]
+
+        self._rare_class_pools = {c: cls_pools[c] for c in rare_ids}
+        if self._rare_class_pools:
+            summary = ", ".join(
+                f"{VISDRONE_CLASSES[c] if c < len(VISDRONE_CLASSES) else c}({len(idxs)})"
+                for c, idxs in self._rare_class_pools.items()
+            )
+            print(f"[VisDroneLMDBDataset:{self.split}] Class-Aware Mosaic rare pools (p={self.mosaic_rare_prob:.2f}): {summary}")
+
     def _apply_mosaic4(self, idx: int) -> Tuple[torch.Tensor, Dict[str, Any]]:
         """4-image full-resolution Mosaic (Ultralytics-style) preserving small VisDrone object resolution.
 
         Aligns 4 images at a random split point (xc, yc) in [0.25, 0.75] of (W, H) without shrinking
         objects, clamps each quadrant's boxes strictly inside its quadrant, and filters sliver boxes.
+        When `mosaic_rare_prob > 0`, 1 of the 3 extra images is preferentially sampled from a rare class.
         """
         n_total = len(self.data_infos)
-        indices = [idx] + [random.randint(0, n_total - 1) for _ in range(3)]
+        if self.mosaic_rare_prob > 0.0 and self._rare_class_pools and random.random() < self.mosaic_rare_prob:
+            rare_cls = random.choice(list(self._rare_class_pools.keys()))
+            rare_idx = random.choice(self._rare_class_pools[rare_cls])
+            extra = [rare_idx, random.randint(0, n_total - 1), random.randint(0, n_total - 1)]
+            random.shuffle(extra)
+            indices = [idx] + extra
+        else:
+            indices = [idx] + [random.randint(0, n_total - 1) for _ in range(3)]
         samples = [self._load_raw_tensor_sample(i) for i in indices]
 
         img0, t0 = samples[0]

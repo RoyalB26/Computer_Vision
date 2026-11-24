@@ -75,6 +75,7 @@ data:
       include_boxes: true
       augment: true
       mosaic_prob: 0.5             # 4-image Mosaic augmentation (disabled in final 15 epochs via CloseMosaicHook)
+      mosaic_rare_prob: 0.5        # 50% of Mosaic samples inject 1 rare-class image (auto-detected < 35% freq)
       pipeline:
         - type: "Resize"
           size: [960, 960]
