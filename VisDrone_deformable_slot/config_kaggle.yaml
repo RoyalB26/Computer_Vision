@@ -29,7 +29,7 @@ model:
   nms_threshold: 0.5
   max_det: 300
   # Dual-Resolution & Deformable High-Res Micro-Patch Injector (Approach 2)
-  backbone_size: 640
+  backbone_size: 960
   use_deformable_patch: true
   num_patches: 256               # Top-256 foreground P3 locations (+33% small-object coverage)
   patch_size: 32                 # 32x32 RGB micro-patch (preserves ~100% sharpness; divides cleanly 32->16->8->4)
@@ -87,7 +87,7 @@ data:
       mosaic_rare_prob: 0.75
       pipeline:
         - type: "Resize"
-          size: [1024, 1024]     # 36% fewer CPU pixels than 1280 while matching val median (1360x765)
+          size: [1280, 1280]     # 36% fewer CPU pixels than 1280 while matching val median (1360x765)
         - type: "ToTensor"
     batch_size: 16               # 16 per T4 x 2 GPUs x accumulate 1 = effective batch 32 (~7GB VRAM)
     shuffle: true
@@ -104,7 +104,7 @@ data:
       augment: false
       pipeline:
         - type: "Resize"
-          size: [1024, 1024]
+          size: [1280, 1280]
         - type: "ToTensor"
     batch_size: 16
     shuffle: false
