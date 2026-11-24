@@ -1,0 +1,68 @@
+# ==============================================================================
+# Config for Slot-Guided Glance-and-Focus (SG-GF) with legacy epoch_70.pth
+# Matches exact epoch_70.pth architecture: M=3, slot_dim=64, T=1, Cosine + ASA
+# ==============================================================================
+
+device: "cuda"
+weights: "D:/Downloads/Picture/epoch_70.pth"
+
+model:
+  type: "VisDroneYOLO11Slot"
+  num_classes: 10
+  pretrained: null
+  box_weight: 7.5
+  cls_weight: 1.0
+  dfl_weight: 1.5
+  focal_alpha: -1.0
+  focal_gamma: 0.0
+  conf_threshold: 0.001
+  nms_threshold: 0.5
+  max_det: 300
+  # Exact epoch_70.pth Slot + FiLM hyperparameters
+  slot_dim: 64
+  num_prototypes: 3
+  num_iters: 1
+  use_cosine_attn: true
+  fusion_mode: "film"
+  use_bg_slot_write: false
+  use_logit_prior: false
+  assigner_prior_weight: 0.25
+  use_slot_checkpoint: false
+  slot_dropout: 0.1
+  use_asa_gate: true
+  asa_gate_floor: 0.05
+  asa_logit_weight: 0.25
+  sparse_thresh: 0.05
+
+data:
+  val:
+    dataset:
+      type: "VisDroneLMDBDataset"
+      data_root: "D:/apps/Datasets/VisDrone/val_data.lmdb"
+      num_classes: 10
+      include_boxes: true
+      augment: false
+
+# Slot-Guided Glance-and-Focus (SG-GF) Inference Hyperparameters
+glance_focus:
+  glance_size: 960                 # Resolution for full-image Glance pass
+  focus_size: 512                  # Balanced 512x512 Focus crops (avoids over-zoom FP while keeping ~100% sharpness)
+  max_crops: 5                     # Up to 5 non-overlapping Focus crops (adaptive early-stop skips empty/solved scenes)
+  crop_ratio: 0.30                 # 30% crop (~408x230 on 1360x765 val -> clean zoom without distorting Precision)
+  overlap_suppress: 0.85           # Suppress inner 85% of selected crop saliency
+  max_crop_iou: 0.15               # Hard IoU cap between any two Focus crops (eliminates redundant overlap)
+  min_peak_score: 0.45             # Calibrated adaptive early-stop for weighted avg+max pooling
+  pool_max_weight: 0.40            # 0.6*avg_pool + 0.4*max_pool so sharp small clusters at image borders aren't diluted
+  # Per-class focus priority: [ped, people, bicycle, car, van, truck, tricycle, awning-tri, bus, moto]
+  class_focus_weights: [2.0, 2.0, 3.0, 0.2, 0.3, 0.3, 3.0, 3.0, 0.2, 2.0]
+  solved_conf_thresh: 0.45         # Downweight regions already confidently detected in Glance
+  solved_min_area_frac: 0.0015     # Suppress solved boxes >= 0.15% of image area (keeps tiny unsolved clusters alive)
+  edge_margin_px: 6                # Drop truncated Focus boxes touching internal crop borders (keeps true image borders!)
+  max_focus_box_frac: 0.65         # Drop partial giant boxes covering > 65% of a Focus crop (Glance handles them)
+  fusion_mode: "wbf"               # "wbf" (Weighted Boxes Fusion) or "nms"
+  wbf_iou_thresh: 0.50             # IoU threshold for merging overlapping Glance & Focus boxes in WBF
+  glance_weight: 1.0               # WBF score weight for Glance detections
+  focus_weight: 1.15               # WBF score weight for Focus detections
+  conf_threshold: 0.001            # Detection confidence cutoff for mAP evaluation
+  nms_threshold: 0.5               # Per-pass NMS IoU threshold
+  max_det: 500                     # Max final detections per image (VisDrone crowded scenes have 300+ objects)
