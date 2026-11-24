@@ -5,11 +5,6 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch import Tensor
 
-try:
-    from .metrics.taco_labels import get_taco_actor_pos_weight_ratios
-except ImportError:
-    from action_slot.metrics.taco_labels import get_taco_actor_pos_weight_ratios
-
 def inter_and_union(pred, mask, num_class=1, start_class=0):
     pred = pred.data.cpu().numpy().squeeze().astype(np.uint8)
     mask = mask.data.cpu().numpy().astype(np.uint8)
@@ -25,50 +20,23 @@ def inter_and_union(pred, mask, num_class=1, start_class=0):
 
 
 class ActionSlotLoss(nn.Module):
-    def __init__(
-        self,
-        num_actor_class,
-        attention_res=None,
-        bce_pos_weight=10,
-        num_slots: int = 32,
-        actions_per_slot=None,
-        feat_recon_weight: float = 0.15,
-        action_attn_weight: float = 1.0,
-        bg_attn_weight: float = 0.5,
-        ego_loss_weight: float = 0.2,
-        dual_stream_aux_weight: float = 0.5,
-        use_class_pos_weight: bool = True,
-        device=None,
-    ):
+    def __init__(self, num_actor_class, attention_res=None, bce_pos_weight = 10, num_slots: int= 32, device = None):
         super(ActionSlotLoss, self).__init__()
         self.num_actor_class = num_actor_class
         self.num_slots = num_slots
-        if actions_per_slot is not None:
-            self.actions_per_slot = list(actions_per_slot)
-        elif num_slots == 3 and num_actor_class == 64:
-            self.actions_per_slot = [24, 24, 16]
-        elif num_slots > 0 and num_actor_class % num_slots == 0:
-            self.actions_per_slot = [num_actor_class // num_slots] * num_slots
-        else:
-            self.actions_per_slot = None
         self.attention_res = attention_res
         self.bce_pos_weight = bce_pos_weight
-        self.feat_recon_weight = float(feat_recon_weight)
 
         self.bg_mask = True
         self.bg_slot = True
         self.obj_mask = False
-        self.action_attn_weight = float(action_attn_weight)
-        self.bg_attn_weight = float(bg_attn_weight)
-        self.ego_loss_weight = float(ego_loss_weight)
-        self.dual_stream_aux_weight = float(dual_stream_aux_weight)
-        self.use_class_pos_weight = bool(use_class_pos_weight)
+        self.action_attn_weight = 1
+        self.bg_attn_weight = 0.5
 
         self.seq_len = 16
         self.mask_every_frame = 4
         self.bg_upsample = 4
-        if self.attention_res:
-            self.attention_res = (self.attention_res[0] * self.bg_upsample, self.attention_res[1] * self.bg_upsample)
+        if self.attention_res: self.attention_res = (self.attention_res[0] * self.bg_upsample, self.attention_res[1] * self.bg_upsample)
 
         self.device = device
 
@@ -77,14 +45,7 @@ class ActionSlotLoss(nn.Module):
         self.attn_loss_type = self._parse_attn_loss()
 
     def _parse_actor_loss(self):
-        if self.use_class_pos_weight:
-            ratios = get_taco_actor_pos_weight_ratios()
-            if self.num_actor_class == len(ratios):
-                pos_weight = torch.tensor(ratios, dtype=torch.float32) * self.bce_pos_weight
-            else:
-                pos_weight = torch.ones([self.num_actor_class], dtype=torch.float32) * self.bce_pos_weight
-        else:
-            pos_weight = torch.ones([self.num_actor_class], dtype=torch.float32) * self.bce_pos_weight
+        pos_weight = torch.ones([self.num_actor_class])*self.bce_pos_weight
         self.bce = nn.BCEWithLogitsLoss(reduction='mean', pos_weight=pos_weight)
 
         weight_matrix = torch.tensor([
@@ -211,64 +172,55 @@ class ActionSlotLoss(nn.Module):
             class_idx = torch.permute(class_idx, (0, 2, 1, 3, 4))
 
             attn_gt = torch.zeros([b, l, self.num_actor_class, h, w], dtype=torch.float32, device=action_attn.device)
-            if class_idx.any():
-                attn_loss = self.obj_bce(action_attn[class_idx].clamp(1e-6, 1.0 - 1e-6), attn_gt[class_idx])
-            else:
-                attn_loss = action_attn.sum() * 0.0
+            attn_loss = self.obj_bce(action_attn[class_idx], attn_gt[class_idx])
 
         # Action-slot, background mask + negative mask
         elif self.attn_loss_type == 3:
             b, l, n, h, w = attn.shape
-            target_hw = bg_seg.shape[-2:]
-            if (h, w) != target_hw:
+
+
+            if self.bg_upsample != 1:
                 attn = attn.reshape(-1, 1, h, w)
-                attn = F.interpolate(attn, size=target_hw, mode='bilinear', align_corners=False)
+                attn = F.interpolate(attn, size=self.attention_res, mode='bilinear')
                 _, _, h, w = attn.shape
                 attn = attn.reshape(b, l, n, h, w)
 
             action_attn = attn[:, :, :self.num_slots, :, :]
-            step = max(1, l // max(1, bg_seg.shape[1]))
-            bg_attn = attn[:, ::step, -1, :, :][:, :bg_seg.shape[1], :, :].reshape(b, -1, h, w)
+            bg_attn = attn[:, ::self.mask_every_frame, -1, :, :].reshape(b, -1, h, w)
 
-            mask_64 = (label['actor'] == 0.0)  # shape: (B, 64), True where class is absent
-            c1 = mask_64[:, 0:24].all(dim=1)   # Suppress Car slot only when ALL car classes are 0
-            c2 = mask_64[:, 24:48].all(dim=1)  # Suppress Bike slot only when ALL bike classes are 0
-            c3 = mask_64[:, 48:64].all(dim=1)  # Suppress Ped slot only when ALL ped classes are 0
+            mask_64 = (label['actor'] == 0.0)  # shape: (B, 64), dtype: torch.bool
+            B = mask_64.shape[0]
 
-            class_idx = torch.stack([c1, c2, c3], dim=-1).to(mask_64.dtype)  # (B, 3)
+            
+            p1 = mask_64[:, 0:24].reshape(B, 2, 12).transpose(1, 2)
+            p2 = mask_64[:, 24:48].reshape(B, 2, 12).transpose(1, 2)
+            p3 = mask_64[:, 48:64].reshape(B, 2, 8).transpose(1, 2)
+            fg_mask = torch.cat([p1, p2, p3], dim=1)  # shape: (B, 32, 2)
+
+            class_idx = fg_mask.all(dim=-1)     # shape: (B, 32), dtype: torch.bool
             class_idx = class_idx.view(b, self.num_slots, 1, 1, 1).repeat(1, 1, l, h, w)
             class_idx = torch.permute(class_idx, (0, 2, 1, 3, 4))
 
             attn_gt = torch.zeros([b, l, self.num_slots, h, w], dtype=torch.float32, device=action_attn.device)
-
-            if class_idx.any():
-                attn_loss = self.action_attn_weight * self.obj_bce(
-                    action_attn[class_idx].clamp(1e-6, 1.0 - 1e-6),
-                    attn_gt[class_idx],
-                )
-            else:
-                attn_loss = action_attn.sum() * 0.0
-            bg_attn_loss = self.obj_bce(bg_attn.clamp(1e-6, 1.0 - 1e-6), bg_seg.clamp(0.0, 1.0))
+            
+            attn_loss = self.obj_bce(action_attn[class_idx], attn_gt[class_idx])
+            bg_attn_loss = self.obj_bce(bg_attn, bg_seg)
         # background mask only
         elif self.attn_loss_type == 4:
             b, l, n, h, w = attn.shape
-            target_hw = bg_seg.shape[-2:]
-            if (h, w) != target_hw:
+
+            if self.bg_upsample != 1:
                 attn = attn.reshape(-1, 1, h, w)
-                attn = F.interpolate(attn, size=target_hw, mode='bilinear', align_corners=False)
+                attn = F.interpolate(attn, size=self.attention_res, mode='bilinear')
                 _, _, h, w = attn.shape
                 attn = attn.reshape(b, l, n, h, w)
 
-            step = max(1, l // max(1, bg_seg.shape[1]))
-            bg_attn = attn[:, ::step, -1, :, :][:, :bg_seg.shape[1], :, :].reshape(b, -1, h, w)
-            bg_attn_loss = self.obj_bce(bg_attn.clamp(1e-6, 1.0 - 1e-6), bg_seg.clamp(0.0, 1.0))
-            return {'loss_bg_attn': self.bg_attn_weight * bg_attn_loss}
+            bg_attn = attn[:, ::self.mask_every_frame, -1, :, :].reshape(b, l//self.mask_every_frame, h, w)
+            bg_attn_loss = self.obj_bce(bg_attn, bg_seg)
+            loss = {'bg_attn_loss': 0.5 * bg_attn_loss}
+            return loss
 
-        loss = {}
-        if attn_loss is not None:
-            loss['loss_attn_suppress'] = attn_loss
-        if bg_attn_loss is not None:
-            loss['loss_bg_attn'] = self.bg_attn_weight * bg_attn_loss
+        loss = {'attn_loss':attn_loss,'bg_attn_loss': 0.5 * bg_attn_loss}
 
         if validate:
             loss['action_inter'] = None
@@ -276,7 +228,7 @@ class ActionSlotLoss(nn.Module):
             loss['bg_inter'] = None
             loss['bg_union'] = None
 
-            if action_attn is not None and class_idx.any():
+            if action_attn is not None:
                 action_attn_pred = action_attn[class_idx] > 0.5
                 inter, union = inter_and_union(action_attn_pred.reshape(-1, h, w), attn_gt[class_idx].reshape(-1, h, w), 1, 0)
                 loss['action_inter'] = inter
@@ -301,104 +253,32 @@ class ActionSlotLoss(nn.Module):
         loss = (raw_loss * sample_weights).sum() / sample_weights.sum()
         return loss
 
-    def feat_recon_loss(self, recon_feats, target_feats):
-        """Compute MSE feature reconstruction loss (DINOSAUR-style)."""
-        if recon_feats is None or target_feats is None or self.feat_recon_weight <= 0:
-            return None
-        return self.feat_recon_weight * F.mse_loss(
-            recon_feats,
-            target_feats.detach().to(device=recon_feats.device, dtype=recon_feats.dtype),
-        )
-
-    def dual_stream_aux_loss(self, pred_var, pred_dir, actor_gt):
-        """Auxiliary BCE losses supervising Stream A (single/group+) and Stream B (directions)."""
-        if self.dual_stream_aux_weight <= 0 or (pred_var is None and pred_dir is None):
-            return None, None
-        if self.actions_per_slot is None or sum(self.actions_per_slot) != actor_gt.shape[1]:
-            return None, None
-
-        b = actor_gt.shape[0]
-        num_variants = 2
-        var_gt_list = []
-        dir_gt_list = []
-        offset = 0
-        for a_cnt in self.actions_per_slot:
-            n_dir = a_cnt // num_variants
-            gt_i = actor_gt[:, offset : offset + a_cnt].view(b, num_variants, n_dir) > 0.5
-            var_gt_list.append(gt_i.any(dim=-1))   # (B, 2)
-            dir_gt_list.append(gt_i.any(dim=-2))   # (B, n_dir)
-            offset += a_cnt
-
-        pos_w_val = min(float(self.bce_pos_weight), 3.0) if float(self.bce_pos_weight) > 1.0 else None
-
-        loss_var = None
-        if pred_var is not None:
-            var_gt = torch.stack(var_gt_list, dim=1).to(device=pred_var.device, dtype=pred_var.dtype)
-            pos_w = (
-                torch.full((pred_var.shape[-1],), pos_w_val, device=pred_var.device, dtype=pred_var.dtype)
-                if pos_w_val is not None
-                else None
-            )
-            loss_var = self.dual_stream_aux_weight * F.binary_cross_entropy_with_logits(
-                pred_var, var_gt, pos_weight=pos_w, reduction="mean"
-            )
-
-        loss_dir = None
-        if pred_dir is not None:
-            dir_gt = torch.cat(dir_gt_list, dim=1).to(device=pred_dir.device, dtype=pred_dir.dtype)
-            pos_w = (
-                torch.full((pred_dir.shape[-1],), pos_w_val, device=pred_dir.device, dtype=pred_dir.dtype)
-                if pos_w_val is not None
-                else None
-            )
-            loss_dir = self.dual_stream_aux_weight * F.binary_cross_entropy_with_logits(
-                pred_dir, dir_gt, pos_weight=pos_w, reduction="mean"
-            )
-
-        return loss_var, loss_dir
-
     def forward(self, pred, label, validate=False):
 
-        # actor = label['actor']  # shape: (B, 64)
-        # B = actor.shape[0]
+        actor = label['actor']  # shape: (B, 64)
+        B = actor.shape[0]
 
-        # # Gom thành (B, 32, 2)
-        # part1 = actor[:, 0:24].reshape(B, 2, 12).transpose(1, 2)
-        # part2 = actor[:, 24:48].reshape(B, 2, 12).transpose(1, 2)
-        # part3 = actor[:, 48:64].reshape(B, 2, 8).transpose(1, 2)
-        # fg = torch.cat([part1, part2, part3], dim=1)  # shape: (B, 32, 2)
+        # Gom thành (B, 32, 2)
+        part1 = actor[:, 0:24].reshape(B, 2, 12).transpose(1, 2)
+        part2 = actor[:, 24:48].reshape(B, 2, 12).transpose(1, 2)
+        part3 = actor[:, 48:64].reshape(B, 2, 8).transpose(1, 2)
+        fg = torch.cat([part1, part2, part3], dim=1)  # shape: (B, 32, 2)
 
-        # # Chuyển thẳng thành index {0, 1, 2} kiểu torch.long:
-        # # [1, 0] -> 0 | [0, 1] -> 1 | [0, 0] -> 2
-        # targets = torch.where(
-        #     fg.sum(dim=-1) == 0,
-        #     2,
-        #     fg.argmax(dim=-1)
-        # ).long()  # shape: (B, 32), dtype: torch.long
+        # Chuyển thẳng thành index {0, 1, 2} kiểu torch.long:
+        # [1, 0] -> 0 | [0, 1] -> 1 | [0, 0] -> 2
+        targets = torch.where(
+            fg.sum(dim=-1) == 0,
+            2,
+            fg.argmax(dim=-1)
+        ).long()  # shape: (B, 32), dtype: torch.long
 
 
 
-        ego_loss = self.ego_loss(pred['ego'], label['ego'])
-        actor_loss = self.actor_loss(pred['actor'], label['actor'])
-        feat_recon_loss = self.feat_recon_loss(pred.get('recon_feats'), pred.get('target_feats'))
-        loss_stream_var, loss_stream_dir = self.dual_stream_aux_loss(
-            pred.get('var_logits'), pred.get('dir_logits'), label['actor']
-        )
-        attention_loss = {}
-        if pred.get('attn') is not None and isinstance(label, dict) and 'bg_seg' in label:
-            attention_loss = self.attn_loss(pred['attn'], label, validate)
+        ego_loss = self.ego_loss(pred['ego'],label['ego'])
+        actor_loss = self.actor_loss_reduce(pred['actor'],targets)
+        attention_loss = self.attn_loss(pred['attn'],label,validate)
 
-        loss = {"loss_actor": actor_loss}
-        if ego_loss is not None:
-            loss["loss_ego"] = self.ego_loss_weight * ego_loss
-        if feat_recon_loss is not None:
-            loss["loss_feat_recon"] = feat_recon_loss
-        if loss_stream_var is not None:
-            loss["loss_stream_var"] = loss_stream_var
-        if loss_stream_dir is not None:
-            loss["loss_stream_dir"] = loss_stream_dir
-        for k, v in attention_loss.items():
-            if v is not None and "loss" in k:
-                loss[k] = v
+        loss = {"loss_ego": 0.5 * ego_loss, "loss_actor": actor_loss} 
+        loss |= attention_loss
 
         return loss

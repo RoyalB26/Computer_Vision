@@ -10,7 +10,8 @@ from PIL import Image
 import torch
 import torch.nn.functional as F
 
-from BaseModel.core import DATASETS
+from BaseModel.core import DATASETS, HOOKS
+from BaseModel.core.hooks.base_hook import BaseHook
 from BaseModel.dataset import BaseDataset, open_lmdb
 
 
@@ -60,6 +61,7 @@ class VisDroneLMDBDataset(BaseDataset):
         cache_images: Optional[str] = None,   # None | "ram" (shared uint8 tensor) | "jpeg" (compressed bytes)
         cache_size: Optional[Tuple[int, int]] = None,
         augment: bool = False,                # Fast tensor augmentation (HFlip + ColorJitter + Scale/Crop)
+        mosaic_prob: float = 0.0,             # 4-image full-resolution Mosaic probability (active when augment=True)
         **kwargs,
     ):
         self.split = split.lower() if isinstance(split, str) else None
@@ -71,6 +73,7 @@ class VisDroneLMDBDataset(BaseDataset):
         self.cache_images = cache_images.lower() if isinstance(cache_images, str) else None
         self.cache_size = tuple(cache_size) if cache_size is not None else self._infer_resize_from_pipeline(pipeline)
         self.augment = bool(augment) and (self.split not in ("val", "test")) and (not test_mode)
+        self.mosaic_prob = float(mosaic_prob) if self.augment else 0.0
         self.env = None
         self.txn = None
         self.bg_env = None
@@ -83,7 +86,8 @@ class VisDroneLMDBDataset(BaseDataset):
         super().__init__(data_root=data_root, pipeline=pipeline, test_mode=test_mode)
 
         if self.augment:
-            print(f"[VisDroneLMDBDataset:{self.split}] Data augmentation ENABLED (flip + scale/crop + color jitter).")
+            m_str = f" + mosaic4 (p={self.mosaic_prob:.2f})" if self.mosaic_prob > 0.0 else ""
+            print(f"[VisDroneLMDBDataset:{self.split}] Data augmentation ENABLED (flip + scale/crop + color jitter{m_str}).")
         if self.cache_images in ("ram", "jpeg") and len(self.data_infos) > 0:
             self._build_ram_cache()
 
@@ -489,8 +493,8 @@ class VisDroneLMDBDataset(BaseDataset):
         }
         return img, new_target
 
-    def prepare_data(self, idx: int) -> Optional[Dict[str, Any]]:
-        """Fast path when resized uint8 images are cached in shared RAM, with optional tensor augmentation."""
+    def _load_raw_tensor_sample(self, idx: int) -> Tuple[Optional[torch.Tensor], Dict[str, Any]]:
+        """Load a single un-augmented (img [3, H, W] float32 in [0, 1], target dict) from RAM cache or LMDB."""
         if self._ram_images is not None and self._ram_targets is not None:
             img = self._ram_images[idx].to(dtype=torch.float32).div_(255.0)
             t_np = self._ram_targets[idx]
@@ -503,16 +507,110 @@ class VisDroneLMDBDataset(BaseDataset):
                 target["labels"] = torch.from_numpy(t_np["labels"])
             if "bg_mask" in t_np and not self.augment:
                 target["bg_mask"] = torch.from_numpy(t_np["bg_mask"])
-            if self.augment:
-                img, target = self._apply_tensor_augment(img, target)
-            return {"image": img, "target": target}
+            return img, target
 
         data = super().prepare_data(idx)
-        if data is not None and self.augment and isinstance(data.get("image"), torch.Tensor):
-            img, target = self._apply_tensor_augment(data["image"], data["target"])
-            data["image"] = img
-            data["target"] = target
-        return data
+        if data is None:
+            return None, {}
+        return data.get("image"), data.get("target", {})
+
+    def _apply_mosaic4(self, idx: int) -> Tuple[torch.Tensor, Dict[str, Any]]:
+        """4-image full-resolution Mosaic (Ultralytics-style) preserving small VisDrone object resolution.
+
+        Aligns 4 images at a random split point (xc, yc) in [0.25, 0.75] of (W, H) without shrinking
+        objects, clamps each quadrant's boxes strictly inside its quadrant, and filters sliver boxes.
+        """
+        n_total = len(self.data_infos)
+        indices = [idx] + [random.randint(0, n_total - 1) for _ in range(3)]
+        samples = [self._load_raw_tensor_sample(i) for i in indices]
+
+        img0, t0 = samples[0]
+        _, h, w = img0.shape
+        yc = random.randint(int(0.25 * h), int(0.75 * h))
+        xc = random.randint(int(0.25 * w), int(0.75 * w))
+
+        canvas = torch.full((3, h, w), 0.447, dtype=img0.dtype)
+        all_boxes: List[torch.Tensor] = []
+        all_labels: List[torch.Tensor] = []
+
+        # (src_y1, src_y2, src_x1, src_x2, dst_y1, dst_y2, dst_x1, dst_x2, dx, dy)
+        quads = [
+            (h - yc, h, w - xc, w, 0, yc, 0, xc, xc - w, yc - h),       # Top-Left
+            (h - yc, h, 0, w - xc, 0, yc, xc, w, xc, yc - h),           # Top-Right
+            (0, h - yc, w - xc, w, yc, h, 0, xc, xc - w, yc),           # Bottom-Left
+            (0, h - yc, 0, w - xc, yc, h, xc, w, xc, yc),               # Bottom-Right
+        ]
+
+        for (img_q, t_q), (sy1, sy2, sx1, sx2, dy1, dy2, dx1, dx2, dx, dy) in zip(samples, quads):
+            if img_q is None:
+                continue
+            # Ensure matching spatial size if loaded from non-RAM path
+            if img_q.shape[1] != h or img_q.shape[2] != w:
+                img_q = F.interpolate(img_q.unsqueeze(0), size=(h, w), mode="bilinear", align_corners=False).squeeze(0)
+            canvas[:, dy1:dy2, dx1:dx2] = img_q[:, sy1:sy2, sx1:sx2]
+
+            boxes_q = t_q.get("boxes", torch.empty((0, 4), dtype=torch.float32))
+            labels_q = t_q.get("labels", torch.empty((0,), dtype=torch.int64))
+            if len(boxes_q) == 0:
+                continue
+
+            cx = boxes_q[:, 0] * w
+            cy = boxes_q[:, 1] * h
+            bw = boxes_q[:, 2] * w
+            bh = boxes_q[:, 3] * h
+            orig_area = (bw * bh).clamp(min=1.0)
+
+            bx1 = (cx - 0.5 * bw + dx).clamp(float(dx1), float(dx2))
+            by1 = (cy - 0.5 * bh + dy).clamp(float(dy1), float(dy2))
+            bx2 = (cx + 0.5 * bw + dx).clamp(float(dx1), float(dx2))
+            by2 = (cy + 0.5 * bh + dy).clamp(float(dy1), float(dy2))
+
+            nbw = bx2 - bx1
+            nbh = by2 - by1
+            new_area = nbw * nbh
+            keep = (nbw >= 2.5) & (nbh >= 2.5) & ((new_area / orig_area) >= 0.15)
+            if keep.any():
+                ncx = ((bx1 + bx2) * 0.5) / float(w)
+                ncy = ((by1 + by2) * 0.5) / float(h)
+                nbw_n = nbw / float(w)
+                nbh_n = nbh / float(h)
+                all_boxes.append(torch.stack([ncx, ncy, nbw_n, nbh_n], dim=-1)[keep])
+                all_labels.append(labels_q[keep])
+
+        if all_boxes:
+            boxes_cat = torch.cat(all_boxes, dim=0)
+            labels_cat = torch.cat(all_labels, dim=0)
+        else:
+            boxes_cat = torch.empty((0, 4), dtype=torch.float32)
+            labels_cat = torch.empty((0,), dtype=torch.int64)
+
+        counts = torch.zeros(self.num_classes, dtype=torch.float32)
+        if len(labels_cat) > 0:
+            valid = labels_cat[(labels_cat >= 0) & (labels_cat < self.num_classes)]
+            if len(valid) > 0:
+                counts = torch.bincount(valid, minlength=self.num_classes).float()
+
+        target: Dict[str, Any] = {
+            "_is_cxcywh": True,
+            "counts": counts,
+            "boxes": boxes_cat,
+            "labels": labels_cat,
+        }
+        return canvas, target
+
+    def prepare_data(self, idx: int) -> Optional[Dict[str, Any]]:
+        """Fast path when resized uint8 images are cached in shared RAM, with optional Mosaic + tensor augment."""
+        if self.augment and self.mosaic_prob > 0.0 and len(self.data_infos) >= 4 and random.random() < self.mosaic_prob:
+            img, target = self._apply_mosaic4(idx)
+            img, target = self._apply_tensor_augment(img, target)
+            return {"image": img, "target": target}
+
+        img, target = self._load_raw_tensor_sample(idx)
+        if img is None:
+            return None
+        if self.augment and isinstance(img, torch.Tensor):
+            img, target = self._apply_tensor_augment(img, target)
+        return {"image": img, "target": target}
 
     def __getstate__(self):
         """Enable safe pickle serialization across multiprocessing DataLoader workers."""
@@ -520,6 +618,38 @@ class VisDroneLMDBDataset(BaseDataset):
         state["env"], state["txn"] = None, None
         state["bg_env"], state["bg_txn"] = None, None
         return state
+
+
+@HOOKS.register_module(name="CloseMosaicHook", force=True)
+class CloseMosaicHook(BaseHook):
+    """Automatically disables Mosaic augmentation during the final `close_epochs` of training.
+
+    Helps the detector & presence_head converge cleanly to the true single-image distribution.
+    """
+
+    def __init__(self, close_epochs: int = 15):
+        self.close_epochs = max(0, int(close_epochs))
+        self._closed = False
+
+    def before_epoch(self, trainer) -> None:
+        if self._closed or self.close_epochs <= 0:
+            return
+        if trainer.epoch >= trainer.max_epochs - self.close_epochs:
+            ds = getattr(trainer.train_loader, "dataset", None)
+            # Unwrap Subset / wrapper datasets if any
+            while ds is not None and not hasattr(ds, "mosaic_prob") and hasattr(ds, "dataset"):
+                ds = ds.dataset
+            if ds is not None and hasattr(ds, "mosaic_prob") and ds.mosaic_prob > 0.0:
+                ds.mosaic_prob = 0.0
+                self._closed = True
+                msg = (
+                    f"[CloseMosaicHook] Disabled Mosaic augmentation at epoch "
+                    f"{trainer.epoch + 1}/{trainer.max_epochs} (final {self.close_epochs} epochs)."
+                )
+                if getattr(trainer, "logger", None) is not None:
+                    trainer.logger.info(msg)
+                else:
+                    print(msg)
 
 
 # Backward-compatible alias matching Visdrone/dataset.py

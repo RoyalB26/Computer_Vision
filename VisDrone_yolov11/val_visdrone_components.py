@@ -662,9 +662,15 @@ def _measure_slot_overfit_metrics(
 
         # Group 3: T=1 static query vs T=2 adapted slot alignment with mean GT key
         if k_tok is not None and q_static is not None and q_step2 is not None:
-            m_proto = getattr(model.slot_refiner.slot_attention, "num_prototypes", 1)
+            sa = model.slot_refiner.slot_attention
+            cls_ranges = getattr(sa, "cls_slot_ranges", None)
+            if cls_ranges is not None:
+                s_st, s_ed = cls_ranges[c]
+            else:
+                m_proto = int(getattr(sa, "num_prototypes", 1))
+                s_st, s_ed = c * m_proto, (c + 1) * m_proto
             k_mean = F.normalize(k_tok[cm].mean(dim=0), dim=0)
-            q1_sub = F.normalize(q_static[c * m_proto : (c + 1) * m_proto], dim=-1)  # (M, D)
+            q1_sub = F.normalize(q_static[s_st:s_ed], dim=-1)  # (M_c, D)
             cos_q1_best = float((q1_sub @ k_mean).max().item())
             q2_n = F.normalize(q_step2[c], dim=0)
             extra["cos_q_k"][c].append(cos_q1_best)
@@ -1255,9 +1261,11 @@ def run_visdrone_component_validation(
                 slot_summary[k] = round(float(np.mean(slot_stats[k])), 4)
 
         # Group 4: Query orthogonality, cross-image slot variance, and submodule weight L2 norms
-        q_fg = F.normalize(model.slot_refiner.slot_attention.obj_queries[0, :10, :].detach().float(), dim=-1)
+        sa = model.slot_refiner.slot_attention
+        n_fg_q = getattr(sa, "num_fg_slots", 10)
+        q_fg = F.normalize(sa.obj_queries[0, :n_fg_q, :].detach().float(), dim=-1)
         q_sim = q_fg @ q_fg.T
-        q_off = q_sim[~torch.eye(10, dtype=torch.bool, device=q_sim.device)]
+        q_off = q_sim[~torch.eye(n_fg_q, dtype=torch.bool, device=q_sim.device)]
         slot_summary["query_cos_sep"] = round(float((1.0 - q_off).mean().item()), 4)
         if len(slot_vecs_list) >= 2:
             sv = np.stack(slot_vecs_list, axis=0)  # (N_img, 10, D)
@@ -1271,12 +1279,15 @@ def run_visdrone_component_validation(
         slot_summary["wnorm_slot_attn"] = _wnorm(model.slot_refiner.slot_attention)
         slot_summary["wnorm_modulators"] = _wnorm(model.slot_refiner.modulators)
 
-        # Group 4 (static): ||q_c||_2 for all 10 FG classes (mean over M prototypes) + BG
-        sa = model.slot_refiner.slot_attention
-        m_proto = getattr(sa, "num_prototypes", 1)
-        q_all_static = sa.to_q(sa.norm_slots(sa.obj_queries.detach().float()))[0]  # (K*M + 1, D)
+        # Group 4 (static): ||q_c||_2 for all 10 FG classes (mean over M_c prototypes) + BG
+        q_all_static = sa.to_q(sa.norm_slots(sa.obj_queries.detach().float()))[0]  # (sum(M_c) + 1, D)
         q_norms_raw = torch.linalg.vector_norm(q_all_static, dim=-1).cpu().numpy()
-        q_norms_fg = q_norms_raw[: 10 * m_proto].reshape(10, m_proto).mean(axis=1)
+        cls_ranges = getattr(sa, "cls_slot_ranges", None)
+        if cls_ranges is not None:
+            q_norms_fg = np.array([q_norms_raw[s_st:s_ed].mean() for s_st, s_ed in cls_ranges], dtype=np.float64)
+        else:
+            m_proto = int(getattr(sa, "num_prototypes", 1))
+            q_norms_fg = q_norms_raw[: 10 * m_proto].reshape(10, m_proto).mean(axis=1)
         q_norms_11 = np.concatenate([q_norms_fg, q_norms_raw[-1:]])  # (11,)
         slot_summary["q_norm_fg_mean"] = round(float(q_norms_11[:10].mean()), 4)
         slot_summary["q_norm_fg_min"] = round(float(q_norms_11[:10].min()), 4)

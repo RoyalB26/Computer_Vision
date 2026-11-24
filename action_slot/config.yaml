@@ -19,39 +19,13 @@ model:
   type: "ActionSlotModel"
   num_ego_class: 4
   num_actor_class: 64
-  num_slots: 3
-  mamba_layers: 4
+  num_slots: 32
   slot_dim: 256
   ego_c: 128
   bg_slot: true
-  use_feat_recon: true
-  feat_recon_weight: 0.15
-  action_attn_weight: 1.0
-  bg_attn_weight: 0.5
-  mamba_grad_scale: 1.0
-  backbone_grad_scale: 1.0
-  ego_loss_weight: 0.2
-  ego_backbone_grad_scale: 0.05
-  bce_pos_weight: 3.0
-  use_class_pos_weight: true
-  resolution3d: [16, 8, 24]
   dropout: 0.5
-  head_type: "dual_stream"
-  head_dropout: 0.35
-  slot_head_dropout: 0.2
-  dual_stream_aux_weight: 0.2
-  use_slot_trajectory: false
-  use_motion_weighted_traj: true
-  use_mamba: false
-  use_attn_tube: true
-  use_tube_vis: true
-  tube_vis_dim: 32
-  use_tube_coord_conv: true
-  use_tube_depth: true
-  use_ego_comp: true
-  use_ego_film: true
-  tube_only_head: true
-  unfreeze_all: true
+  finetune_last_n_stages: 2  # Chỉ fine-tune 2 stage cuối của backbone (đặt unfreeze_all: true nếu muốn mở toàn bộ như v7)
+
 # 2. Dataset Configuration
 # Hỗ trợ cấu hình nhiều data_root dưới dạng danh sách (list) hoặc đường dẫn đơn (str)
 data:
@@ -66,7 +40,6 @@ data:
       seed: 42
       pipeline:
         - type: "Action_Slot_Transform"
-          photometric_aug: true
     batch_size: 2
     shuffle: true
     num_workers: 0
@@ -92,11 +65,9 @@ optimizer:
   lr: 0.0005
   weight_decay: 0.07
 
-# 4. Learning Rate Scheduler Configuration
+# 4. Learning Rate Scheduler Configuration (Đồng bộ chuẩn xác với D:\v7\Action-slot: tăng x1.1 mỗi epoch trong 11 epoch đầu, sau đó giảm theo 0.7^(epoch//3))
 lr_scheduler:
-  type: "CosineAnnealingLR"
-  T_max: 100
-  eta_min: 0.00001
+  type: "TACOLRScheduler"
 
 # 5. Evaluation Metrics Configuration
 metrics:
@@ -136,6 +107,5 @@ train_cfg:
   max_epochs: 1
   val_interval: 1                           # Đánh giá validation và tính mAP ở MỌI epoch để tracking liên tục
   log_interval: 2500                        # In log tiến trình mỗi 2500 batches
-  grad_clip: 1.0
-  accumulate: 4                             # Hiệu dụng batch = 2 * 4 = 8 để ổn định gradient
+  grad_clip: null                           # Không clip gradient (đồng bộ với D:\v7\Action-slot)
   use_amp: false                            # Chạy FP32 chính xác cao

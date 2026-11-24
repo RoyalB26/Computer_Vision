@@ -8,7 +8,7 @@ import torch.nn.functional as F
 def build_3d_grid(resolution):
     """Construct a normalized 3D coordinate grid with complement coordinates."""
     ranges = [torch.linspace(0.0, 1.0, steps=res) for res in resolution]
-    grid = torch.meshgrid(*ranges, indexing="ij" if hasattr(torch, "meshgrid") else None)
+    grid = torch.meshgrid(*ranges, indexing='ij' if hasattr(torch, 'meshgrid') else None)
     grid = torch.stack(grid, dim=-1)
     grid = torch.reshape(grid, [resolution[0], resolution[1], resolution[2], -1]).unsqueeze(0)
     return torch.cat([grid, 1.0 - grid], dim=-1)
@@ -39,18 +39,18 @@ class SoftPositionEmbed3D(nn.Module):
 
 
 class SlotAttention(nn.Module):
-    """Spatiotemporal 3D Slot Attention mechanism."""
+    """Spatiotemporal 3D Slot Attention mechanism with regularized attention dropout."""
 
     def __init__(
         self,
-        num_slots: int = 24,
-        dim: int = 256,
-        num_actor_class: int = 48,
-        eps: float = 1e-8,
-        input_dim: int = 256,
-        resolution=(16, 7, 7),
-        allocated_slot: bool = True,
-        slot_dropout: float = 0.0,
+        num_slots,
+        dim,
+        num_actor_class=64,
+        eps=1e-8,
+        input_dim=64,
+        resolution=[16, 8, 24],
+        allocated_slot=False,
+        slot_dropout=0.1,
     ):
         super().__init__()
         self.dim = dim
@@ -62,8 +62,10 @@ class SlotAttention(nn.Module):
         self.resolution = resolution
         self.slot_dropout = slot_dropout
 
-        # Learnable class-specific slot prototypes (each allocated object/bg slot gets its own query)
-        self.obj_queries = nn.Parameter(torch.randn(1, num_slots, dim) * 0.05)
+        # Learnable Gaussian parameters for slot initialization
+        self.slots_mu = nn.Parameter(torch.randn(1, 1, dim))
+        self.slots_sigma = nn.Parameter(torch.randn(1, 1, dim).abs())
+        self.register_buffer("slots_eps", torch.randn(1, num_slots, dim))
 
         self.FC1 = nn.Linear(dim, dim)
         self.FC2 = nn.Linear(dim, dim)
@@ -80,45 +82,45 @@ class SlotAttention(nn.Module):
         self.norm_input = nn.LayerNorm(dim)
         self.norm_slots = nn.LayerNorm(dim)
         self.norm_pre_ff = nn.LayerNorm(dim)
-
+        
         self.pool = nn.AdaptiveAvgPool1d(1)
-        self.pe = SoftPositionEmbed3D(dim, list(resolution))
+        self.pe = SoftPositionEmbed3D(dim, [resolution[0], resolution[1], resolution[2]])
 
-    def get_3d_slot(self, slots, inputs, return_temporal_slots: bool = False):
+    def get_3d_slot(self, slots, inputs):
         b, l, h, w, d = inputs.shape
         inputs = self.pe(inputs)
         inputs = torch.reshape(inputs, (b, -1, d))
 
-        inputs = inputs + self.FC2(F.relu(self.FC1(self.LN(inputs))))
+        inputs = self.LN(inputs)
+        inputs = self.FC1(inputs)
+        inputs = F.relu(inputs)
+        inputs = self.FC2(inputs)
 
+        slots_prev = slots
+
+        b, n, d = inputs.shape
         inputs = self.norm_input(inputs)
         k, v = self.to_k(inputs), self.to_v(inputs)
         slots = self.norm_slots(slots)
         q = self.to_q(slots)
-        dots = torch.einsum("bid,bjd->bij", q, k) * self.scale
+        dots = torch.einsum('bid,bjd->bij', q, k) * self.scale
         attn_ori = dots.softmax(dim=1) + self.eps
-
-        if return_temporal_slots:
-            s = attn_ori.shape[1]
-            hw = h * w
-            attn_t = attn_ori.view(b, s, l, hw)
-            attn_norm = attn_t / attn_t.sum(dim=-1, keepdim=True).clamp(min=self.eps)
-            v_t = v.view(b, l, hw, d)
-            slots = torch.einsum("bljd,bilj->blid", v_t, attn_norm)
-            slots = slots + self.fc2(F.relu(self.fc1(self.norm_pre_ff(slots))))
-            return slots, attn_ori
-
-        attn_norm = attn_ori / attn_ori.sum(dim=-1, keepdim=True).clamp(min=self.eps)
-        slots = torch.einsum("bjd,bij->bid", v, attn_norm)
+        attn = attn_ori / attn_ori.sum(dim=-1, keepdim=True)
+        slots = torch.einsum('bjd,bij->bid', v, attn)
 
         slots = slots.reshape(b, -1, d)
+        if self.allocated_slot:
+            slots = slots[:, :self.num_actor_class, :]
+        else:
+            slots = slots[:, :self.num_slots, :]
         slots = slots + self.fc2(F.relu(self.fc1(self.norm_pre_ff(slots))))
         return slots, attn_ori
 
-    def forward(self, inputs, num_slots=None, return_temporal_slots: bool = False):
+    
+    def forward(self, inputs, num_slots=None):
         b, nf, h, w, d = inputs.shape
-        slots = self.obj_queries.expand(b, -1, -1).contiguous()
-        slots_out, attns = self.get_3d_slot(
-            slots, inputs, return_temporal_slots=return_temporal_slots
-        )
+        mu = self.slots_mu.expand(1, self.num_slots, -1)
+        sigma = self.slots_sigma.expand(1, self.num_slots, -1)
+        slots = (mu + sigma * self.slots_eps).expand(b, -1, -1)
+        slots_out, attns = self.get_3d_slot(slots, inputs)
         return slots_out, attns

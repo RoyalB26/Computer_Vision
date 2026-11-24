@@ -63,7 +63,7 @@ class LightweightSlotAttention(nn.Module):
         self,
         dim: int = 32,
         num_classes: int = 10,
-        num_prototypes: int = 1,
+        num_prototypes: Union[int, List[int], Tuple[int, ...]] = 1,
         eps: float = 1e-8,
         slot_dropout: float = 0.1,
         sparse_thresh: float = 0.0,
@@ -73,14 +73,44 @@ class LightweightSlotAttention(nn.Module):
         super().__init__()
         self.dim = dim
         self.num_classes = num_classes
-        self.num_prototypes = max(1, int(num_prototypes))
-        self.num_fg_slots = num_classes * self.num_prototypes
-        self.num_slots = self.num_fg_slots + 1  # K*M foreground sub-slots + 1 background slot
+        if isinstance(num_prototypes, (list, tuple)):
+            assert len(num_prototypes) == num_classes, (
+                f"num_prototypes list length ({len(num_prototypes)}) must match num_classes ({num_classes})"
+            )
+            self.prototypes_per_class: List[int] = [max(1, int(m)) for m in num_prototypes]
+        else:
+            m_val = max(1, int(num_prototypes))
+            self.prototypes_per_class = [m_val] * num_classes
+
+        self.is_uniform_prototypes: bool = len(set(self.prototypes_per_class)) == 1
+        self.num_prototypes: Union[int, List[int]] = (
+            self.prototypes_per_class[0] if self.is_uniform_prototypes else list(self.prototypes_per_class)
+        )
+        self.num_fg_slots = sum(self.prototypes_per_class)
+        self.num_slots = self.num_fg_slots + 1  # sum(M_c) foreground sub-slots + 1 background slot
         self.eps = eps
         self.scale = dim ** -0.5
         self.sparse_thresh = float(sparse_thresh)
         self.use_cosine_attn = bool(use_cosine_attn)
         self.asa_logit_weight = float(asa_logit_weight)
+
+        # Precompute sub-slot -> class mapping and per-class `-ln(M_c)` prior correction
+        slot_to_cls: List[int] = []
+        prior_bias: List[float] = []
+        self.cls_slot_ranges: List[Tuple[int, int]] = []
+        cursor = 0
+        for c, m_c in enumerate(self.prototypes_per_class):
+            self.cls_slot_ranges.append((cursor, cursor + m_c))
+            cursor += m_c
+            slot_to_cls.extend([c] * m_c)
+            prior_bias.extend([-math.log(float(m_c))] * m_c)
+
+        self.register_buffer("slot_to_cls", torch.tensor(slot_to_cls, dtype=torch.long), persistent=False)
+        self.register_buffer(
+            "proto_prior_bias",
+            torch.tensor(prior_bias, dtype=torch.float32).view(1, self.num_fg_slots, 1),
+            persistent=False,
+        )
 
         self.obj_queries = nn.Parameter(torch.randn(1, self.num_slots, dim) * 0.05)
         self.norm_input = nn.LayerNorm(dim)
@@ -110,15 +140,14 @@ class LightweightSlotAttention(nn.Module):
         """Run Slot Attention.
 
         Returns:
-            slots_sub: (B, K*M + 1, D) updated sub-slots (for rich FiLM broadcast & ortho).
-            attn_sub:  (B, K*M + 1, N) per-pixel sub-slot posterior.
+            slots_sub: (B, sum(M_c) + 1, D) updated sub-slots (for rich FiLM broadcast & ortho).
+            attn_sub:  (B, sum(M_c) + 1, N) per-pixel sub-slot posterior.
             slots_cls: (B, K + 1, D) class-level mean-pooled slots.
-            attn_cls:  (B, K + 1, N) class-level posterior (sum over M sub-slots per class).
+            attn_cls:  (B, K + 1, N) class-level posterior (sum over M_c sub-slots per class).
             dots_cls:  (B, K + 1, N) class-level logsumexp logits (exact pre-softmax of attn_cls).
         """
         bs, n_tok, _ = inputs.shape
         k_cls = self.num_classes
-        m_proto = self.num_prototypes
 
         inputs = self.norm_input(inputs)
         k = self.to_k(inputs)
@@ -138,23 +167,22 @@ class LightweightSlotAttention(nn.Module):
         else:
             dots_sub = (torch.einsum("bsd,bnd->bsn", q.float(), k.float()) * self.scale).clamp(-30.0, 30.0)
 
-        # Prior correction `-ln(M)` so M FG sub-slots don't get an artificial +ln(M) bias over the 1 BG slot
-        if m_proto > 1:
-            fg_sub = dots_sub[:, : self.num_fg_slots, :] - math.log(float(m_proto))
+        # Per-class prior correction `-ln(M_c)` so multi-prototype classes don't get artificial +ln(M_c) bias
+        if self.num_fg_slots > k_cls:
+            fg_sub = dots_sub[:, : self.num_fg_slots, :] + self.proto_prior_bias
             bg_sub = dots_sub[:, self.num_fg_slots :, :]
             dots_sub = torch.cat([fg_sub, bg_sub], dim=1)
 
         # [ASA Presence Gate] Gentle detached log-bias on FG sub-slots (full gating happens at slot_broadcast)
         if presence_gate is not None and self.asa_logit_weight > 0.0:
             gate_bias = self.asa_logit_weight * torch.log(presence_gate.detach().float().clamp(min=1e-4))  # (B, K)
-            if m_proto > 1:
-                gate_bias = gate_bias.repeat_interleave(m_proto, dim=1)  # (B, K*M)
+            gate_bias_sub = gate_bias[:, self.slot_to_cls]  # (B, sum(M_c))
             dots_sub = torch.cat(
-                [dots_sub[:, : self.num_fg_slots, :] + gate_bias.unsqueeze(-1), dots_sub[:, self.num_fg_slots :, :]],
+                [dots_sub[:, : self.num_fg_slots, :] + gate_bias_sub.unsqueeze(-1), dots_sub[:, self.num_fg_slots :, :]],
                 dim=1,
             ).clamp(-30.0, 30.0)
 
-        attn_sub = dots_sub.softmax(dim=1)  # (B, K*M + 1, N)
+        attn_sub = dots_sub.softmax(dim=1)  # (B, sum(M_c) + 1, N)
 
         # [Sparse attn_norm] Prune tiny background tails on FG sub-slots before aggregating prototypes
         if self.sparse_thresh > 0.0:
@@ -169,7 +197,12 @@ class LightweightSlotAttention(nn.Module):
         slots_sub = slots_sub + self.fc2(self.dropout(F.silu(self.fc1(self.norm_pre_ff(slots_sub)))))
 
         # Aggregate sub-slots -> class-level (K + 1)
-        if m_proto > 1:
+        if self.num_fg_slots == k_cls:
+            dots_cls = dots_sub
+            attn_cls = attn_sub
+            slots_cls = slots_sub
+        elif self.is_uniform_prototypes:
+            m_proto = self.prototypes_per_class[0]
             dots_fg_cls = torch.logsumexp(dots_sub[:, : self.num_fg_slots, :].view(bs, k_cls, m_proto, n_tok), dim=2)
             dots_cls = torch.cat([dots_fg_cls, dots_sub[:, self.num_fg_slots :, :]], dim=1)
             attn_fg_cls = attn_sub[:, : self.num_fg_slots, :].view(bs, k_cls, m_proto, n_tok).sum(dim=2)
@@ -177,9 +210,17 @@ class LightweightSlotAttention(nn.Module):
             slots_fg_cls = slots_sub[:, : self.num_fg_slots, :].view(bs, k_cls, m_proto, self.dim).mean(dim=2)
             slots_cls = torch.cat([slots_fg_cls, slots_sub[:, self.num_fg_slots :, :]], dim=1)
         else:
-            dots_cls = dots_sub
-            attn_cls = attn_sub
-            slots_cls = slots_sub
+            dots_splits = torch.split(dots_sub[:, : self.num_fg_slots, :], self.prototypes_per_class, dim=1)
+            attn_splits = torch.split(attn_sub[:, : self.num_fg_slots, :], self.prototypes_per_class, dim=1)
+            slot_splits = torch.split(slots_sub[:, : self.num_fg_slots, :], self.prototypes_per_class, dim=1)
+
+            dots_fg_cls = torch.stack([torch.logsumexp(t, dim=1) for t in dots_splits], dim=1)
+            attn_fg_cls = torch.stack([t.sum(dim=1) for t in attn_splits], dim=1)
+            slots_fg_cls = torch.stack([t.mean(dim=1) for t in slot_splits], dim=1)
+
+            dots_cls = torch.cat([dots_fg_cls, dots_sub[:, self.num_fg_slots :, :]], dim=1)
+            attn_cls = torch.cat([attn_fg_cls, attn_sub[:, self.num_fg_slots :, :]], dim=1)
+            slots_cls = torch.cat([slots_fg_cls, slots_sub[:, self.num_fg_slots :, :]], dim=1)
 
         return slots_sub, attn_sub, slots_cls, attn_cls, dots_cls
 
@@ -199,7 +240,9 @@ class PostNeckSlotFiLMRefiner(nn.Module):
         in_channels: Tuple[int, int, int] = (64, 128, 256),
         num_classes: int = 10,
         slot_dim: int = 32,
-        num_prototypes: int = 1,
+        num_prototypes: Union[int, List[int], Tuple[int, ...]] = 1,
+        num_iters: int = 1,
+        use_implicit_diff: bool = True,
         fusion_mode: str = "film",
         use_bg_slot_write: bool = False,
         use_logit_prior: bool = True,
@@ -208,6 +251,9 @@ class PostNeckSlotFiLMRefiner(nn.Module):
         use_asa_gate: bool = False,
         asa_gate_floor: float = 0.05,
         asa_logit_weight: float = 0.25,
+        asa_topk: int = 16,
+        presence_hidden_dim: int = 32,
+        presence_dropout: float = 0.3,
         sparse_thresh: float = 0.0,
         use_cosine_attn: bool = False,
     ):
@@ -218,13 +264,15 @@ class PostNeckSlotFiLMRefiner(nn.Module):
         self.in_channels = in_channels
         self.num_classes = num_classes
         self.slot_dim = slot_dim
-        self.num_prototypes = max(1, int(num_prototypes))
+        self.num_iters = max(1, int(num_iters))
+        self.use_implicit_diff = bool(use_implicit_diff)
         self.fusion_mode = fusion_mode
         self.use_bg_slot_write = use_bg_slot_write
         self.use_logit_prior = use_logit_prior
         self.use_checkpoint = use_checkpoint
         self.use_asa_gate = bool(use_asa_gate)
         self.asa_gate_floor = float(asa_gate_floor)
+        self.asa_topk = max(1, int(asa_topk))
 
         # Lateral 1x1 projections using GroupNorm (zero running stats -> immune to AMP inf/NaN poisoning!)
         gn_groups = min(8, slot_dim)
@@ -242,14 +290,17 @@ class PostNeckSlotFiLMRefiner(nn.Module):
         self.pos_emb = PositionEmbeddingSine(num_pos_feats=slot_dim // 2)
         self.level_embed = nn.Parameter(torch.randn(len(in_channels), slot_dim) * 0.02)
 
-        # [ASA Presence Gate] GAP + GMP over P3 + P4 + P5 (preserves peak signal of tiny small objects)
+        # [ASA Presence Gate] Compact MLP on normalized `proj_in` features using GAP + Top-K Mean Pooling
+        # (~13K params vs 116K on raw neck features; Top-K Mean resists single-pixel noise spikes)
         if self.use_asa_gate:
-            asa_in_dim = 2 * sum(in_channels)
+            asa_in_dim = 2 * len(in_channels) * slot_dim
             self.presence_head = nn.Sequential(
-                nn.Linear(asa_in_dim, slot_dim * 2),
+                nn.LayerNorm(asa_in_dim),
+                nn.Dropout(float(presence_dropout)),
+                nn.Linear(asa_in_dim, int(presence_hidden_dim)),
                 nn.SiLU(inplace=True),
-                nn.Dropout(slot_dropout),
-                nn.Linear(slot_dim * 2, num_classes),
+                nn.Dropout(float(presence_dropout)),
+                nn.Linear(int(presence_hidden_dim), num_classes),
             )
         else:
             self.presence_head = None
@@ -257,12 +308,13 @@ class PostNeckSlotFiLMRefiner(nn.Module):
         self.slot_attention = LightweightSlotAttention(
             dim=slot_dim,
             num_classes=num_classes,
-            num_prototypes=self.num_prototypes,
+            num_prototypes=num_prototypes,
             slot_dropout=slot_dropout,
             sparse_thresh=sparse_thresh,
             use_cosine_attn=use_cosine_attn,
             asa_logit_weight=asa_logit_weight,
         )
+        self.num_prototypes = self.slot_attention.num_prototypes
         self.slot_drop = nn.Dropout2d(slot_dropout)
 
         # Zero-initialized FiLM or Residual projections back to each scale's channel dim
@@ -307,19 +359,8 @@ class PostNeckSlotFiLMRefiner(nn.Module):
         with torch.amp.autocast(device_type=device.type, enabled=False):
             feats_f = [torch.nan_to_num(f.float(), nan=0.0, posinf=1e4, neginf=-1e4) for f in feats]
 
-            # [ASA Presence Gate] GAP + GMP over P3, P4, P5 with soft floor so tiny objects are never hard-killed
-            presence_logits = None
-            presence_gate = None
-            if self.presence_head is not None:
-                pooled = torch.cat(
-                    [t for f in feats_f for t in (f.mean(dim=(2, 3)), f.amax(dim=(2, 3)))],
-                    dim=-1,
-                )
-                presence_logits = self.presence_head(pooled)
-                fl = self.asa_gate_floor
-                presence_gate = fl + (1.0 - fl) * torch.sigmoid(presence_logits)
-
-            tokens_list = []
+            proj_list: List[torch.Tensor] = []
+            tokens_list: List[torch.Tensor] = []
             resolutions: List[Tuple[int, int]] = []
             counts: List[int] = []
 
@@ -329,26 +370,57 @@ class PostNeckSlotFiLMRefiner(nn.Module):
                 counts.append(h * w)
 
                 proj = self.proj_in[i](f)
-                proj = proj + self.pos_emb(proj)
-                tok = proj.flatten(2).transpose(1, 2) + self.level_embed[i]  # (B, H*W, D)
+                proj_list.append(proj)
+                proj_pos = proj + self.pos_emb(proj)
+                tok = proj_pos.flatten(2).transpose(1, 2) + self.level_embed[i]  # (B, H*W, D)
                 tokens_list.append(tok)
+
+            # [ASA Presence Gate] GAP + Top-K Mean Pooling over normalized `proj_in` maps (P3, P4, P5)
+            presence_logits = None
+            presence_gate = None
+            if self.presence_head is not None:
+                pool_parts = []
+                for p in proj_list:
+                    flat = p.flatten(2)  # (B, D, H*W)
+                    gap = flat.mean(dim=-1)
+                    k_eff = min(self.asa_topk, flat.shape[-1])
+                    topk_mean = flat.topk(k_eff, dim=-1).values.mean(dim=-1)
+                    pool_parts.append(gap)
+                    pool_parts.append(topk_mean)
+                pooled = torch.cat(pool_parts, dim=-1)  # (B, 6 * D)
+                presence_logits = self.presence_head(pooled)
+                fl = self.asa_gate_floor
+                presence_gate = fl + (1.0 - fl) * torch.sigmoid(presence_logits)
 
             tokens = torch.cat(tokens_list, dim=1)  # (B, N, D)
 
+            # [MUFASA Coarse-to-Fine T>=2 + 1-Step Implicit Diff]
+            # Iter 1..T-1 read coarse P4+P5 (4,500 tokens) to build image-contextualized slots,
+            # then detach before the final full-resolution P3+P4+P5 pass.
+            init_slots = None
+            if self.num_iters >= 2 and len(tokens_list) >= 2:
+                coarse_tokens = torch.cat(tokens_list[1:], dim=1)  # P4 + P5
+                cur_slots = None
+                for _ in range(self.num_iters - 1):
+                    cur_slots, _, _, _, _ = self.slot_attention(
+                        coarse_tokens, slots=cur_slots, presence_gate=presence_gate
+                    )
+                init_slots = cur_slots.detach() if self.use_implicit_diff else cur_slots
+
             if self.use_checkpoint and self.training:
                 slots_sub, attn_sub, slots, attn_ori, dots = checkpoint(
-                    self.slot_attention, tokens, None, presence_gate, use_reentrant=False
+                    self.slot_attention, tokens, init_slots, presence_gate, use_reentrant=False
                 )
             else:
                 slots_sub, attn_sub, slots, attn_ori, dots = self.slot_attention(
-                    tokens, presence_gate=presence_gate
+                    tokens, slots=init_slots, presence_gate=presence_gate
                 )
 
             # Write-back (Broadcast) using rich sub-slots (each pixel gets its exact sub-prototype!)
             s_write = self.slot_attention.num_slots if self.use_bg_slot_write else self.slot_attention.num_fg_slots
             attn_write = attn_sub[:, :s_write, :]
             if presence_gate is not None:
-                g_sub = presence_gate.repeat_interleave(self.num_prototypes, dim=1)  # (B, K*M)
+                g_sub = presence_gate[:, self.slot_attention.slot_to_cls]  # (B, sum(M_c))
                 if self.use_bg_slot_write:
                     g_sub = torch.cat([g_sub, torch.ones((bs, 1), device=device, dtype=g_sub.dtype)], dim=1)
                 attn_write = attn_write * g_sub.unsqueeze(-1)
@@ -401,7 +473,14 @@ class SlotAuxiliaryLoss(nn.Module):
         suppress_weight: float = 0.05,
         cls_attn_weight: float = 0.8,
         ortho_weight: float = 0.1,
-        presence_loss_weight: float = 0.5,
+        presence_loss_weight: float = 0.25,
+        presence_label_smoothing: float = 0.05,
+        use_overlap_soft_target: bool = False,
+        use_ellipse_mask: bool = False,
+        ellipse_min_side: float = 3.0,
+        use_class_freq_weight: bool = False,
+        class_freq_max_weight: float = 2.0,
+        class_freq_momentum: float = 0.99,
     ):
         super().__init__()
         self.num_classes = num_classes
@@ -411,6 +490,14 @@ class SlotAuxiliaryLoss(nn.Module):
         self.cls_attn_weight = float(cls_attn_weight)
         self.ortho_weight = float(ortho_weight)
         self.presence_loss_weight = float(presence_loss_weight)
+        self.presence_label_smoothing = float(presence_label_smoothing)
+        self.use_overlap_soft_target = bool(use_overlap_soft_target)
+        self.use_ellipse_mask = bool(use_ellipse_mask)
+        self.ellipse_min_side = float(ellipse_min_side)
+        self.use_class_freq_weight = bool(use_class_freq_weight)
+        self.class_freq_max_weight = float(class_freq_max_weight)
+        self.class_freq_momentum = float(class_freq_momentum)
+        self.register_buffer("cls_img_freq_ema", torch.full((num_classes,), 0.5, dtype=torch.float32))
 
     @staticmethod
     def _rasterize_masks_from_xyxy(
@@ -420,10 +507,14 @@ class SlotAuxiliaryLoss(nn.Module):
         resolutions: Tuple[Tuple[int, int], ...],
         img_size: Tuple[int, int],
         num_classes: int,
+        use_ellipse_mask: bool = False,
+        ellipse_min_side: float = 3.0,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Fully vectorized GPU rasterization of bg_mask (B, N), cls_mask (B, K, N), and gt_counts (B, K).
 
-        Zero `.item()` calls and zero Python loops over boxes -> ~10-20x faster on GPU.
+        When `use_ellipse_mask=True`, boxes whose width & height on a feature scale are >= `ellipse_min_side`
+        use an inscribed ellipse mask so the 4 road/background corners of large vehicles (truck, bus)
+        are not forced into FG slots, while small objects (< `ellipse_min_side`) remain full rectangles.
         """
         bs, max_m, _ = gt_bboxes.shape
         device = gt_bboxes.device
@@ -465,9 +556,28 @@ class SlotAuxiliaryLoss(nn.Module):
             # (B, M, W) and (B, M, H)
             in_x = (xs.view(1, 1, w) >= x1.unsqueeze(-1)) & (xs.view(1, 1, w) < x2.unsqueeze(-1))
             in_y = (ys.view(1, 1, h) >= y1.unsqueeze(-1)) & (ys.view(1, 1, h) < y2.unsqueeze(-1))
+            in_rect = in_y.unsqueeze(-1) & in_x.unsqueeze(-2)  # (B, M, H, W)
+
+            if use_ellipse_mask:
+                bw_f = x2 - x1  # (B, M)
+                bh_f = y2 - y1  # (B, M)
+                is_large = (bw_f >= ellipse_min_side) & (bh_f >= ellipse_min_side)  # (B, M)
+                if is_large.any():
+                    cx_f = 0.5 * (x1 + x2)
+                    cy_f = 0.5 * (y1 + y2)
+                    rx_f = (0.5 * bw_f).clamp(min=0.5)
+                    ry_f = (0.5 * bh_f).clamp(min=0.5)
+                    dx = ((xs.view(1, 1, w) + 0.5) - cx_f.unsqueeze(-1)) / rx_f.unsqueeze(-1)
+                    dy = ((ys.view(1, 1, h) + 0.5) - cy_f.unsqueeze(-1)) / ry_f.unsqueeze(-1)
+                    in_ell = (dy.unsqueeze(-1).pow(2) + dx.unsqueeze(-2).pow(2)) <= 1.0
+                    in_box = torch.where(is_large[:, :, None, None], in_rect & in_ell, in_rect)
+                else:
+                    in_box = in_rect
+            else:
+                in_box = in_rect
 
             # (B, M, H*W) float mask of pixels inside each valid box
-            box_hw = (in_y.unsqueeze(-1) & in_x.unsqueeze(-2)).view(bs, max_m, h * w).float() * valid_f
+            box_hw = in_box.view(bs, max_m, h * w).float() * valid_f
 
             # Background mask: 1.0 where no valid box covers the pixel
             bg_flat = (box_hw.sum(dim=1) == 0.0).float()  # (B, H*W)
@@ -527,6 +637,8 @@ class SlotAuxiliaryLoss(nn.Module):
                 resolutions=resolutions,
                 img_size=img_size,
                 num_classes=self.num_classes,
+                use_ellipse_mask=self.use_ellipse_mask,
+                ellipse_min_side=self.ellipse_min_side,
             )
 
             # Exact logit for P(bg) = sigmoid(d_bg - logsumexp(d_fg)): bounded gradient in [-1, 1], zero 1/p explosion
@@ -567,27 +679,52 @@ class SlotAuxiliaryLoss(nn.Module):
             else:
                 loss_suppress = torch.tensor(0.0, device=device)
 
-            # 4. Per-class attention Dice + Positive CE (using log_softmax when dots is available -> bounded grad)
+            # 4. Per-class attention Dice + Positive CE
+            #    - Optional Soft Target normalization on overlapping GT pixels (e.g. motorcycle <-> people)
+            #    - Optional gentle Class-Frequency Weighting in [1.0, class_freq_max_weight]
             active = gt_counts > 0
-            if self.cls_attn_weight > 0 and active.any():
-                p_cls = attn_ori[:, : self.num_classes, :].clamp(1e-4, 1.0 - 1e-4)
-                inter = (p_cls * cls_mask).sum(dim=-1)
-                card = p_cls.sum(dim=-1) + cls_mask.sum(dim=-1)
-                dice = 1.0 - (2.0 * inter + 1.0) / (card + 1.0)
-                loss_dice = dice[active].mean()
+            if self.use_class_freq_weight:
+                if self.training:
+                    with torch.no_grad():
+                        batch_freq = active.float().mean(dim=0)
+                        m = self.class_freq_momentum
+                        self.cls_img_freq_ema.mul_(m).add_(batch_freq, alpha=1.0 - m)
+                raw_w = self.cls_img_freq_ema.clamp(min=0.05).rsqrt()
+                cls_w = (raw_w / raw_w.min().clamp(min=1e-6)).clamp(1.0, self.class_freq_max_weight)  # (K,)
+            else:
+                cls_w = None
 
-                # Class-balanced Positive CE: average per active class first so rare classes
-                # (bicycle, tricycle, awning-tricycle) are not drowned out by car/pedestrian pixels
-                pos_m = (cls_mask > 0.5).float()  # (B, K, N)
-                pos_cnt = pos_m.sum(dim=-1)       # (B, K)
+            if self.cls_attn_weight > 0 and active.any():
+                if self.use_overlap_soft_target:
+                    cls_target = cls_mask / cls_mask.sum(dim=1, keepdim=True).clamp(min=1.0)
+                else:
+                    cls_target = cls_mask
+
+                p_cls = attn_ori[:, : self.num_classes, :].clamp(1e-4, 1.0 - 1e-4)
+                inter = (p_cls * cls_target).sum(dim=-1)
+                card = p_cls.sum(dim=-1) + cls_target.sum(dim=-1)
+                dice = 1.0 - (2.0 * inter + 1.0) / (card + 1.0)
+                if cls_w is not None:
+                    w_active = cls_w.unsqueeze(0).expand_as(dice)[active]
+                    loss_dice = (dice[active] * w_active).sum() / w_active.sum().clamp(min=1e-6)
+                else:
+                    loss_dice = dice[active].mean()
+
+                # Class-balanced Positive CE (soft-weighted on overlapping GT pixels when enabled)
+                pos_w = cls_target if self.use_overlap_soft_target else (cls_mask > 0.5).float()  # (B, K, N)
+                pos_cnt = pos_w.sum(dim=-1)  # (B, K)
                 valid_pos_cls = active & (pos_cnt > 0)
                 if valid_pos_cls.any():
                     if dots_f is not None:
                         neg_log_p = -F.log_softmax(dots_f, dim=1)[:, : self.num_classes, :]
                     else:
                         neg_log_p = -torch.log(p_cls)
-                    per_cls_pos_ce = (neg_log_p * pos_m).sum(dim=-1) / pos_cnt.clamp(min=1.0)
-                    loss_pos = per_cls_pos_ce[valid_pos_cls].mean()
+                    per_cls_pos_ce = (neg_log_p * pos_w).sum(dim=-1) / pos_cnt.clamp(min=1.0)
+                    if cls_w is not None:
+                        w_pos = cls_w.unsqueeze(0).expand_as(per_cls_pos_ce)[valid_pos_cls]
+                        loss_pos = (per_cls_pos_ce[valid_pos_cls] * w_pos).sum() / w_pos.sum().clamp(min=1e-6)
+                    else:
+                        loss_pos = per_cls_pos_ce[valid_pos_cls].mean()
                 else:
                     loss_pos = torch.tensor(0.0, device=device)
 
@@ -595,7 +732,7 @@ class SlotAuxiliaryLoss(nn.Module):
             else:
                 loss_cls_attn = torch.tensor(0.0, device=device)
 
-            # 5. Slot orthogonality across ALL FG sub-slots (K*M) so multi-prototypes specialize on distinct modes
+            # 5. Slot orthogonality across ALL FG sub-slots (sum(M_c)) so multi-prototypes specialize on distinct modes
             slots_for_ortho = slots_sub.float() if slots_sub is not None else slots
             k_fg = slots_for_ortho.shape[1] - 1
             if self.ortho_weight > 0 and k_fg > 1:
@@ -615,9 +752,14 @@ class SlotAuxiliaryLoss(nn.Module):
             else:
                 loss_ortho = torch.tensor(0.0, device=device)
 
-            # 6. ASA Presence Gate BCE Loss
+            # 6. ASA Presence Gate BCE Loss (with Label Smoothing to prevent overfitting)
             if self.presence_loss_weight > 0 and presence_logits is not None:
-                loss_presence = F.binary_cross_entropy_with_logits(presence_logits.float(), active.float())
+                eps_ls = self.presence_label_smoothing
+                if eps_ls > 0.0:
+                    target_pres = active.float() * (1.0 - eps_ls) + 0.5 * eps_ls
+                else:
+                    target_pres = active.float()
+                loss_presence = F.binary_cross_entropy_with_logits(presence_logits.float(), target_pres)
             else:
                 loss_presence = torch.tensor(0.0, device=device)
 

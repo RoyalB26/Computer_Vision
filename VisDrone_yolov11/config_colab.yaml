@@ -29,8 +29,11 @@ model:
   nms_threshold: 0.5
   max_det: 300
   # Slot + FiLM (Method B+C) hyperparameters
-  slot_dim: 64                 # 64 dim gives 31 sub-slots plenty of orthogonal freedom
-  num_prototypes: 3            # Multi-Prototype Sub-Slots (3 sub-slots per FG class for multi-modal classes)
+  slot_dim: 64                 # 64 dim gives sub-slots plenty of orthogonal freedom
+  # Per-class prototypes: [ped, people, bicycle, car, van, truck, tricycle, awning-tri, bus, moto] -> 22 FG + 1 BG = 23 slots
+  num_prototypes: [2, 2, 2, 1, 2, 3, 3, 3, 2, 2]
+  num_iters: 2                 # MUFASA Coarse-to-Fine T=2 (Iter 1: P4+P5 -> detach -> Iter 2: P3+P4+P5)
+  use_implicit_diff: true      # 1-Step Implicit Diff (detach coarse slots to save VRAM & stabilize grad)
   use_cosine_attn: true        # Cosine Attention (locks ||q_bg||==||q_fg||==1, prevents logit explosion & BG dominance)
   fusion_mode: "film"          # "film" (Method C) or "residual"
   use_bg_slot_write: false     # false = FG slots only (natural bg gating), true = all slots
@@ -44,11 +47,22 @@ model:
   cls_attn_weight: 0.8
   ortho_weight: 0.1
   slot_dropout: 0.1
-  use_asa_gate: true           # ASA Presence Gate (GAP+GMP over P3+P4+P5)
+  # Compact Anti-Overfit ASA Presence Gate (proj_in GAP + Top-K Mean, ~13K params)
+  use_asa_gate: true
   asa_gate_floor: 0.05         # soft floor so tiny small objects are never hard-killed
   asa_logit_weight: 0.25       # gentle logit bias in dots_sub (full gating in slot_broadcast)
-  presence_loss_weight: 0.5
+  asa_topk: 16                 # Top-K Mean Pooling (resists single-pixel outlier spikes vs GMP)
+  presence_hidden_dim: 32      # compact bottleneck (~13.4K params vs 116K)
+  presence_dropout: 0.3
+  presence_loss_weight: 0.25
+  presence_label_smoothing: 0.05
   sparse_thresh: 0.05          # prune tiny background tails in attn_norm
+  # cls_attn target & imbalance refinements
+  use_overlap_soft_target: true   # soft target normalization on overlapping pixels (motorcycle <-> people)
+  use_ellipse_mask: true          # inscribed ellipse mask for large boxes (>= 3x3 cells) to cut truck BG leak
+  ellipse_min_side: 3.0
+  use_class_freq_weight: true     # gentle EMA inverse-sqrt class-frequency weighting in [1.0, 2.0]
+  class_freq_max_weight: 2.0
 # 2. Dataset Configuration (Stratified Split synced with Visdrone/dataset.py)
 data:
   train:
@@ -60,6 +74,7 @@ data:
       num_classes: 10
       include_boxes: true
       augment: true
+      mosaic_prob: 0.5             # 4-image Mosaic augmentation (disabled in final 15 epochs via CloseMosaicHook)
       pipeline:
         - type: "Resize"
           size: [960, 960]
@@ -114,6 +129,8 @@ train_cfg:
   log_interval: 50000
 # 7. Lifecycle Hooks
 hooks:
+  - type: "CloseMosaicHook"
+    close_epochs: 15                        # Tắt Mosaic 15 epoch cuối để hội tụ về phân phối ảnh thật
   - type: "CheckpointHook"
     interval: 1
     save_best: "mAP_50"

@@ -22,6 +22,7 @@ from PIL import Image, ImageDraw, ImageFont
 import torch
 import torch.nn.functional as F
 import torchvision.transforms.functional as TF
+import yaml
 
 # Add project root to sys.path
 root_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
@@ -315,20 +316,48 @@ def predict_image(
 
 def main():
     parser = argparse.ArgumentParser(description="Run YOLOv11 / VisDroneYOLO11Slot prediction & slot attention visualization.")
+    parser.add_argument("--config", type=str, default=None, help="Optional YAML config path (e.g. VisDrone_yolov11/config_colab.yaml)")
     parser.add_argument("--image", type=str, required=True, help="Path to input image or directory")
     parser.add_argument("--weights", type=str, default="yolo11n.pt", help="Path to checkpoint weights (.pt or .pth)")
     parser.add_argument("--out-dir", type=str, default="./outputs", help="Output directory to save predictions")
     parser.add_argument("--conf-th", type=float, default=0.25, help="Confidence threshold")
-    parser.add_argument("--nms-th", type=float, default=0.5, help="NMS threshold")
-    parser.add_argument("--img-size", type=int, default=960, help="Inference image resolution")
+    parser.add_argument("--nms-th", type=float, default=None, help="NMS threshold (defaults to config nms_threshold or 0.5)")
+    parser.add_argument("--img-size", type=int, default=None, help="Inference image resolution (defaults to config Resize or 960)")
     parser.add_argument("--attn-threshold", type=float, default=0.25, help="Threshold for all_attn.png slot overlay")
     parser.add_argument("--no-overlay", action="store_true", help="Disable grayscale background overlay on attn_map_result.png")
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
     args = parser.parse_args()
 
+    cfg: Optional[Dict[str, Any]] = None
+    model_cfg: Optional[Dict[str, Any]] = None
+    if args.config:
+        if not os.path.exists(args.config):
+            raise FileNotFoundError(f"Config not found: {args.config}")
+        with open(args.config, "r", encoding="utf-8") as f:
+            cfg = yaml.safe_load(f) or {}
+        model_cfg = cfg.get("model")
+        print(f"[Config] Loaded {args.config}")
+
+    # Resolve img_size & nms_th (CLI overrides YAML; YAML overrides defaults)
+    if args.img_size is None:
+        pipe_sz = None
+        if cfg:
+            for split_k in ("val", "train"):
+                pipe = cfg.get("data", {}).get(split_k, {}).get("dataset", {}).get("pipeline", []) or []
+                for step in pipe:
+                    if isinstance(step, dict) and step.get("type") == "Resize" and "size" in step:
+                        sz = step["size"]
+                        pipe_sz = int(sz[0]) if isinstance(sz, (list, tuple)) else int(sz)
+                        break
+                if pipe_sz is not None:
+                    break
+        args.img_size = pipe_sz if pipe_sz is not None else 960
+    if args.nms_th is None:
+        args.nms_th = float((model_cfg or {}).get("nms_threshold", 0.5))
+
     os.makedirs(args.out_dir, exist_ok=True)
 
-    print(f"Initializing VisDrone YOLOv11 on device: {args.device}...")
+    print(f"Initializing VisDrone YOLOv11 on device: {args.device} (img_size={args.img_size})...")
     if os.path.exists(args.weights) and args.weights.endswith(".pth"):
         ckpt = torch.load(args.weights, map_location="cpu", weights_only=False)
         if isinstance(ckpt, dict):
@@ -338,9 +367,36 @@ def main():
         if hasattr(sd, "state_dict"):
             sd = sd.state_dict()
         has_slots = any(k.startswith("slot_refiner.") for k in sd.keys())
-        if has_slots:
-            has_logit_prior = "slot_refiner.logit_prior_scale" in sd
-            model = VisDroneYOLO11Slot(num_classes=10, use_logit_prior=has_logit_prior, assigner_prior_weight=0.0)
+        if model_cfg is not None:
+            cfg_kwargs = {k: v for k, v in model_cfg.items() if k not in ("type", "pretrained")}
+            cfg_kwargs["pretrained"] = None
+            if has_slots:
+                model = VisDroneYOLO11Slot(**cfg_kwargs)
+            else:
+                base_keys = {
+                    "num_classes", "pretrained", "box_weight", "cls_weight", "dfl_weight",
+                    "focal_alpha", "focal_gamma", "conf_threshold", "nms_threshold", "max_det",
+                }
+                model = VisDroneYOLO11(**{k: v for k, v in cfg_kwargs.items() if k in base_keys})
+        elif has_slots:
+            q_tensor = sd.get("slot_refiner.slot_attention.obj_queries")
+            slot_dim = int(q_tensor.shape[-1]) if q_tensor is not None else 32
+            num_slots = int(q_tensor.shape[1]) if q_tensor is not None else 11
+            if (num_slots - 1) % 10 != 0:
+                raise ValueError(
+                    f"Checkpoint has non-uniform per-class prototypes ({num_slots - 1} FG slots). "
+                    f"Please pass --config <path_to_config.yaml> so per-class `num_prototypes` is loaded accurately."
+                )
+            num_prototypes = max(1, (num_slots - 1) // 10)
+            model = VisDroneYOLO11Slot(
+                num_classes=10,
+                slot_dim=slot_dim,
+                num_prototypes=num_prototypes,
+                use_logit_prior=("slot_refiner.logit_prior_scale" in sd),
+                use_asa_gate=any(k.startswith("slot_refiner.presence_head.") for k in sd.keys()),
+                use_cosine_attn=("slot_refiner.slot_attention.logit_scale" in sd),
+                assigner_prior_weight=0.0,
+            )
         else:
             model = VisDroneYOLO11(num_classes=10)
         missing, unexpected = model.load_state_dict(sd, strict=False)

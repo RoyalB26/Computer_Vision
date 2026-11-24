@@ -17,7 +17,8 @@ custom_imports:
 model:
   type: "VisDroneYOLO11Slot"
   num_classes: 10
-  pretrained: "/content/yolo11n.pt"
+  pretrained: "yolo11n.pt"
+  # Core YOLOv11 detection loss weights
   # Core YOLOv11 detection loss weights
   box_weight: 7.5
   cls_weight: 1.0
@@ -29,12 +30,16 @@ model:
   nms_threshold: 0.5
   max_det: 300
   # Slot + FiLM (Method B+C) hyperparameters
-  slot_dim: 32
-  num_prototypes: 3            # Multi-Prototype Sub-Slots (3 sub-slots per FG class for multi-modal classes)
+  slot_dim: 64                 # 64 dim gives sub-slots plenty of orthogonal freedom
+  # Per-class prototypes: [ped, people, bicycle, car, van, truck, tricycle, awning-tri, bus, moto] -> 22 FG + 1 BG = 23 slots
+  num_prototypes: [2, 2, 2, 1, 2, 3, 3, 3, 2, 2]
+  num_iters: 2                 # MUFASA Coarse-to-Fine T=2 (Iter 1: P4+P5 -> detach -> Iter 2: P3+P4+P5)
+  use_implicit_diff: true      # 1-Step Implicit Diff (detach coarse slots to save VRAM & stabilize grad)
+  use_cosine_attn: true        # Cosine Attention (locks ||q_bg||==||q_fg||==1, prevents logit explosion & BG dominance)
   fusion_mode: "film"          # "film" (Method C) or "residual"
   use_bg_slot_write: false     # false = FG slots only (natural bg gating), true = all slots
   use_logit_prior: false       # keep head.cv3 clean (no logit co-adaptation)
-  assigner_prior_weight: 0   
+  assigner_prior_weight: 0.25   
   use_slot_checkpoint: false   # set true to further cut activation VRAM on small GPUs
   slot_loss_weight: 0.3        # auxiliary slot supervision multiplier
   bg_attn_weight: 0.3
@@ -43,11 +48,22 @@ model:
   cls_attn_weight: 0.8
   ortho_weight: 0.1
   slot_dropout: 0.1
-  use_asa_gate: true           # ASA Presence Gate (GAP+GMP over P3+P4+P5)
+  # Compact Anti-Overfit ASA Presence Gate (proj_in GAP + Top-K Mean, ~13K params)
+  use_asa_gate: true
   asa_gate_floor: 0.05         # soft floor so tiny small objects are never hard-killed
-  presence_loss_weight: 0.5
+  asa_logit_weight: 0.25       # gentle logit bias in dots_sub (full gating in slot_broadcast)
+  asa_topk: 16                 # Top-K Mean Pooling (resists single-pixel outlier spikes vs GMP)
+  presence_hidden_dim: 32      # compact bottleneck (~13.4K params vs 116K)
+  presence_dropout: 0.3
+  presence_loss_weight: 0.25
+  presence_label_smoothing: 0.05
   sparse_thresh: 0.05          # prune tiny background tails in attn_norm
-
+  # cls_attn target & imbalance refinements
+  use_overlap_soft_target: true   # soft target normalization on overlapping pixels (motorcycle <-> people)
+  use_ellipse_mask: true          # inscribed ellipse mask for large boxes (>= 3x3 cells) to cut truck BG leak
+  ellipse_min_side: 3.0
+  use_class_freq_weight: true     # gentle EMA inverse-sqrt class-frequency weighting in [1.0, 2.0]
+  class_freq_max_weight: 2.0
 # 2. Dataset Configuration (Stratified Split synced with Visdrone/dataset.py)
 data:
   train:

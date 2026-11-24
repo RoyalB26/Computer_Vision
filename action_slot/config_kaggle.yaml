@@ -1,11 +1,10 @@
 # Configuration for Hand Digit Object Detection (Boxes + Labels) with Full Metrics & Gradient Tracking
 
 work_dir: "./work_dirs/action_slot"
-project_name: "action_slot"
 device: "cuda"  
 seed: 42
 tqdm: true
-
+accumulate: 2
 
 custom_imports:
   - "action_slot.model"
@@ -20,26 +19,13 @@ model:
   type: "ActionSlotModel"
   num_ego_class: 4
   num_actor_class: 64
-  num_slots: 3
-  mamba_layers: 2
+  num_slots: 32
   slot_dim: 256
   ego_c: 128
   bg_slot: true
-  use_feat_recon: true
-  feat_recon_weight: 0.15
-  action_attn_weight: 1.0
-  bg_attn_weight: 0.5
   dropout: 0.5
-  bce_pos_weight: 5.0
-  use_class_pos_weight: true
-  resolution3d: [16, 8, 24]
-  mamba_grad_scale: 5.0
-  backbone_grad_scale: 1.0
-  ego_loss_weight: 0.2
-  ego_backbone_grad_scale: 0.05
-  backbone_grad_scale: 0.5
-  pretrained_backbone: true
-  finetune_last_n_stages: 1
+  finetune_last_n_stages: 2  # Chỉ fine-tune 2 stage cuối của backbone (đặt unfreeze_all: true nếu muốn mở toàn bộ như v7)
+
 # 2. Dataset Configuration
 # Hỗ trợ cấu hình nhiều data_root dưới dạng danh sách (list) hoặc đường dẫn đơn (str)
 data:
@@ -54,7 +40,6 @@ data:
       seed: 42
       pipeline:
         - type: "Action_Slot_Transform"
-          photometric_aug: true
     batch_size: 8
     shuffle: true
     num_workers: 2          # Kaggle có 4 vCPU; accelerate chạy 2 rank -> 2 worker/rank = 4 worker tổng (tránh tranh chấp CPU)
@@ -72,9 +57,9 @@ data:
       seed: 42
       pipeline:
         - type: "Action_Slot_Transform"
-    batch_size: 8
+    batch_size: 1
     shuffle: true
-    num_workers: 2
+    num_workers: 0
     prefetch_factor: 2
     persistent_workers: True
 
@@ -83,12 +68,6 @@ optimizer:
   type: "AdamW"
   lr: 0.0005
   weight_decay: 0.07
-
-# 4. Learning Rate Scheduler Configuration
-# lr_scheduler:
-#   type: "CosineAnnealingLR"
-#   T_max: 100
-#   eta_min: 0.00001
 
 
 # 5. Evaluation Metrics Configuration
@@ -127,8 +106,8 @@ hooks:
 # 7. Training Engine Configuration
 train_cfg:
   max_epochs: 100
-  val_interval: 5                           # Đánh giá validation và tính mAP mỗi 10 epochs
+  val_interval: 10                           # Đánh giá validation và tính mAP mỗi 10 epochs
   log_interval: 2500                        # In log tiến trình mỗi 2500 batches
-  grad_clip: 1.0
-  accumulate: 2
+  grad_clip: null                           # Không clip gradient (đồng bộ với D:\v7\Action-slot)
   use_amp: false                            # Chạy FP32 chính xác cao
+  accumulate: 3                             # Tích lũy gradient (8 * 3 = 24 samples tương đương batch_size=24 của v7)

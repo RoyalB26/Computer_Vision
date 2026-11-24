@@ -7,52 +7,16 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torchvision.ops
 from torch import Tensor
-try:
-    from .model_parts.backbones import X3DBackbone, YoloV11Backbone
-    from .model_parts.heads import (
-        Allocated_Head,
-        DualStreamActionHead,
-        ReduceAllocatedHead,
-        VideoObjectClassHead,
-        ObjectActionHead,
-        SpatialBroadcastFeatureDecoder,
-    )
-    from .model_parts.slot_attention import SlotAttention
-    from .model_parts.Mamba.model import Mamba, MambaConfig
-    from .loss import ActionSlotLoss
-except ImportError:
-    from model_parts.backbones import X3DBackbone, YoloV11Backbone
-    from model_parts.heads import (
-        Allocated_Head,
-        DualStreamActionHead,
-        ReduceAllocatedHead,
-        VideoObjectClassHead,
-        ObjectActionHead,
-        SpatialBroadcastFeatureDecoder,
-    )
-    from model_parts.slot_attention import SlotAttention
-    from model_parts.Mamba.model import Mamba, MambaConfig
-    from loss import ActionSlotLoss
-try:
-    from .transform import GPUBatchPhotometricAug
-except ImportError:
-    from transform import GPUBatchPhotometricAug
+from model_parts.backbones import X3DBackbone
+from model_parts.heads import Allocated_Head, ReduceAllocatedHead
+from model_parts.slot_attention import SlotAttention
+from model_parts.x3d_baseline import X3D_Baseline
+from model_parts.Mamba.model import Mamba, MambaConfig
+from loss import ActionSlotLoss
 from typing import Dict, List, Optional, Union
 
 from BaseModel.core import MODELS
 from BaseModel.model import BaseModel
-
-class _ScaleGrad(torch.autograd.Function):
-    """Identity in forward pass; scales backward gradients by `scale`."""
-
-    @staticmethod
-    def forward(ctx, x: Tensor, scale: float) -> Tensor:
-        ctx.scale = float(scale)
-        return x.view_as(x)
-
-    @staticmethod
-    def backward(ctx, grad_output: Tensor):
-        return grad_output * ctx.scale, None
 
 
 def build_2d_sincos_position_embedding(H: int, W: int, embed_dim: int, device=None, dtype=torch.float32) -> Tensor:
@@ -85,727 +49,6 @@ def build_2d_sincos_position_embedding(H: int, W: int, embed_dim: int, device=No
     pos_emb = pos_emb.view(H, W, embed_dim).permute(2, 0, 1).unsqueeze(0)
     return pos_emb
 
-
-def build_ground_depth_maps(
-    H: int,
-    W: int,
-    horizon_ratio: float = 0.45,
-    device=None,
-    dtype: torch.dtype = torch.float32,
-) -> Tensor:
-    """Build flat-ground perspective depth proxies `[ground_inv_depth, ground_log_depth]` of shape `(1, 2, H, W)`."""
-    v_01 = (torch.arange(H, device=device, dtype=dtype) + 0.5) / float(H)
-    v_grid = v_01.view(H, 1).expand(H, W)
-    dy_below = F.relu(v_grid - float(horizon_ratio))
-    ground_inv_depth = dy_below / max(1.0 - float(horizon_ratio), 1e-4)
-    ground_log_depth = torch.log1p(1.0 / (dy_below + 0.05)) / math.log1p(20.0)
-    return torch.stack([ground_inv_depth, ground_log_depth], dim=0).unsqueeze(0)
-
-
-class PanoramicRayPositionEncoding(nn.Module):
-    """Camera-ray & panoramic spherical positional encoding with ground-plane depth proxy.
-
-    Combines:
-      1. Multi-frequency spherical sin-cos bands over azimuth `theta` and elevation `phi`.
-      2. A learnable projection of 7D camera-ray & road-horizon geometry:
-         `[ray_x, ray_y, ray_z, theta_norm, phi_norm, ground_inv_depth, ground_log_depth]`.
-    Output shape: `(1, embed_dim, H, W)`.
-    """
-
-    def __init__(
-        self,
-        embed_dim: int,
-        hfov_deg: float = 180.0,
-        vfov_deg: float = 60.0,
-        horizon_ratio: float = 0.45,
-        default_hw: Optional[Tuple[int, int]] = None,
-    ):
-        super().__init__()
-        assert embed_dim % 4 == 0, f"embed_dim ({embed_dim}) phải chia hết cho 4."
-        self.embed_dim = embed_dim
-        self.hfov_rad = math.radians(float(hfov_deg))
-        self.vfov_rad = math.radians(float(vfov_deg))
-        self.horizon_ratio = float(horizon_ratio)
-
-        hidden_dim = max(64, embed_dim // 2)
-        num_groups = math.gcd(embed_dim, 16)
-        self.ray_mlp = nn.Sequential(
-            nn.Conv2d(7, hidden_dim, kernel_size=1, bias=True),
-            nn.SiLU(inplace=True),
-            nn.Conv2d(hidden_dim, embed_dim, kernel_size=1, bias=False),
-            nn.GroupNorm(num_groups=num_groups, num_channels=embed_dim),
-        )
-        self.ray_scale = nn.Parameter(torch.full((1, embed_dim, 1, 1), 0.25))
-
-        if default_hw is not None:
-            sincos, geom = self._build_spherical_grid(default_hw[0], default_hw[1], device=None, dtype=torch.float32)
-            self.register_buffer("_cached_sincos", sincos, persistent=False)
-            self.register_buffer("_cached_geom", geom, persistent=False)
-        else:
-            self._cached_sincos = None
-            self._cached_geom = None
-
-    def _build_spherical_grid(
-        self, H: int, W: int, device=None, dtype: torch.dtype = torch.float32
-    ) -> Tuple[Tensor, Tensor]:
-        """Construct spherical sin-cos embedding `(1, D, H, W)` and 7D ray geometry `(1, 7, H, W)`."""
-        u = ((torch.arange(W, device=device, dtype=dtype) + 0.5) / float(W)) * 2.0 - 1.0  # [-1, 1]
-        v = ((torch.arange(H, device=device, dtype=dtype) + 0.5) / float(H)) * 2.0 - 1.0  # [-1, 1]
-
-        theta_1d = u * (0.5 * self.hfov_rad)
-        phi_1d = v * (0.5 * self.vfov_rad)
-        phi, theta = torch.meshgrid(phi_1d, theta_1d, indexing="ij")
-        v_signed, u_grid = torch.meshgrid(v, u, indexing="ij")
-
-        # Multi-frequency spherical sin-cos encoding
-        dim_per_axis = self.embed_dim // 2
-        num_bands = dim_per_axis // 2
-        freq_theta = torch.logspace(
-            0.0, math.log2(max(float(W), 16.0)), steps=num_bands, base=2.0, device=device, dtype=dtype
-        )
-        freq_phi = torch.logspace(
-            0.0, math.log2(max(float(H), 16.0)), steps=num_bands, base=2.0, device=device, dtype=dtype
-        )
-        ang_theta = theta.reshape(-1, 1) * freq_theta.unsqueeze(0)
-        ang_phi = phi.reshape(-1, 1) * freq_phi.unsqueeze(0)
-        emb_theta = torch.cat([torch.sin(ang_theta), torch.cos(ang_theta)], dim=-1)
-        emb_phi = torch.cat([torch.sin(ang_phi), torch.cos(ang_phi)], dim=-1)
-        sincos = torch.cat([emb_theta, emb_phi], dim=-1).view(H, W, self.embed_dim).permute(2, 0, 1).unsqueeze(0)
-
-        # 3D camera unit ray + flat-ground perspective depth proxies relative to horizon
-        cos_phi = torch.cos(phi)
-        ray_x = torch.sin(theta) * cos_phi
-        ray_y = torch.sin(phi)
-        ray_z = torch.cos(theta) * cos_phi
-
-        depth_maps = build_ground_depth_maps(H, W, horizon_ratio=self.horizon_ratio, device=device, dtype=dtype)[0]
-        ground_inv_depth, ground_log_depth = depth_maps[0], depth_maps[1]
-
-        geom = torch.stack(
-            [ray_x, ray_y, ray_z, u_grid, v_signed, ground_inv_depth, ground_log_depth],
-            dim=0,
-        ).unsqueeze(0)
-        return sincos, geom
-
-    def get_geom_maps(self, H: int, W: int, device=None, dtype: torch.dtype = torch.float32) -> Tensor:
-        """Return cached or generated 7D camera-ray & horizon depth geometry maps `(1, 7, H, W)`."""
-        if self._cached_geom is not None and self._cached_geom.shape[2:] == (H, W):
-            return self._cached_geom.to(device=device, dtype=dtype)
-        _, geom = self._build_spherical_grid(H, W, device=device, dtype=dtype)
-        return geom
-
-    def forward(self, H: int, W: int, device=None, dtype: torch.dtype = torch.float32) -> Tensor:
-        if (
-            self._cached_sincos is not None
-            and self._cached_geom is not None
-            and self._cached_sincos.shape[2:] == (H, W)
-        ):
-            sincos = self._cached_sincos.to(device=device, dtype=dtype)
-            geom = self._cached_geom.to(device=device, dtype=self.ray_mlp[0].weight.dtype)
-        else:
-            sincos, geom = self._build_spherical_grid(H, W, device=device, dtype=torch.float32)
-            sincos = sincos.to(dtype=dtype)
-            geom = geom.to(dtype=self.ray_mlp[0].weight.dtype)
-
-        ray_emb = self.ray_mlp(geom).to(dtype=dtype)
-        return sincos + self.ray_scale.to(dtype=dtype) * ray_emb
-
-
-class TemporalDifferenceBlock(nn.Module):
-    """Bidirectional temporal-difference motion encoder for 5D volumes `(B, C, T, H, W)`.
-
-    Computes backward (`x_t - x_{t-1}`) and forward (`x_{t+1} - x_t`) feature differences,
-    mixes local spatial displacements and short-range temporal consistency via separable
-    (2+1)D depthwise-pointwise convolutions, and fuses back via a scaled residual branch.
-    """
-
-    def __init__(self, channels: int, spatial_kernel: int = 3, temporal_kernel: int = 3):
-        super().__init__()
-        self.channels = channels
-        sp_pad = spatial_kernel // 2
-        t_pad = temporal_kernel // 2
-        num_groups = math.gcd(channels, 16)
-
-        self.diff_proj = nn.Conv3d(channels * 2, channels, kernel_size=1, bias=False)
-        self.spatial_dw = nn.Conv3d(
-            channels,
-            channels,
-            kernel_size=(1, spatial_kernel, spatial_kernel),
-            padding=(0, sp_pad, sp_pad),
-            groups=channels,
-            bias=False,
-        )
-        self.temporal_dw = nn.Conv3d(
-            channels,
-            channels,
-            kernel_size=(temporal_kernel, 1, 1),
-            padding=(t_pad, 0, 0),
-            groups=channels,
-            bias=False,
-        )
-        self.pw_fuse = nn.Sequential(
-            nn.GroupNorm(num_groups=num_groups, num_channels=channels),
-            nn.SiLU(inplace=True),
-            nn.Conv3d(channels, channels, kernel_size=1, bias=False),
-            nn.GroupNorm(num_groups=num_groups, num_channels=channels),
-        )
-        self.gamma = nn.Parameter(torch.full((1, channels, 1, 1, 1), 0.25))
-
-    @staticmethod
-    def _compute_bidirectional_diff(x: Tensor) -> Tensor:
-        """Compute `[x_t - x_{t-1}, x_{t+1} - x_t]` with zero-padded temporal boundaries."""
-        if x.shape[2] <= 1:
-            zeros = torch.zeros_like(x)
-            return torch.cat([zeros, zeros], dim=1)
-
-        delta = x[:, :, 1:] - x[:, :, :-1]
-        bwd = F.pad(delta, (0, 0, 0, 0, 1, 0))
-        fwd = F.pad(delta, (0, 0, 0, 0, 0, 1))
-        return torch.cat([bwd, fwd], dim=1)
-
-    def forward(self, x: Tensor) -> Tensor:
-        diffs = self._compute_bidirectional_diff(x)
-        motion = self.diff_proj(diffs)
-        motion = self.spatial_dw(motion)
-        motion = self.temporal_dw(motion)
-        motion = self.pw_fuse(motion)
-        return x + self.gamma * motion
-
-
-class SlotTrajectoryEncoder(nn.Module):
-    """Extract motion-weighted 2D spatial trajectory + 3D depth proxy (`-log(scale) + offset`).
-
-    Uses local temporal feature-difference energy from `vis_feats_5d` to downweight
-    stationary background/parked vehicles before computing slot centroids, spreads,
-    and depth, preventing parked objects in shared TACO slots from anchoring moving ones.
-    """
-
-    FRAME_FEAT_DIM = 21
-    VIDEO_FEAT_DIM = 20
-    GEOM_CTX_DIM = 7
-
-    def __init__(
-        self,
-        slot_dim: int = 256,
-        hidden_dim: int = 128,
-        offset_vis_dim: int = 32,
-        depth_offset_scale: float = 1.0,
-        use_motion_weighting: bool = True,
-    ):
-        super().__init__()
-        self.depth_offset_scale = float(depth_offset_scale)
-        self.use_motion_weighting = bool(use_motion_weighting)
-
-        # Learnable soft motion gate (floor ~0.25 at init so static scenes never collapse)
-        self.motion_floor_logit = nn.Parameter(torch.tensor(-1.1))
-        self.motion_gate_temp = nn.Parameter(torch.tensor(2.0))
-        self.motion_gate_bias = nn.Parameter(torch.tensor(1.0))
-
-        # Compact bottleneck from visual slot features to predict residual depth offset
-        self.offset_vis_norm = nn.LayerNorm(slot_dim)
-        self.offset_vis_proj = nn.Linear(slot_dim, offset_vis_dim)
-        offset_in_dim = offset_vis_dim + self.GEOM_CTX_DIM
-        self.depth_offset_net = nn.Sequential(
-            nn.LayerNorm(offset_in_dim),
-            nn.Linear(offset_in_dim, 64),
-            nn.GELU(),
-            nn.Linear(64, 1),
-        )
-        # Zero-init final offset layer so training starts from clean -log(scale) physics prior
-        nn.init.zeros_(self.depth_offset_net[-1].weight)
-        nn.init.zeros_(self.depth_offset_net[-1].bias)
-
-        self.frame_proj = nn.Sequential(
-            nn.LayerNorm(self.FRAME_FEAT_DIM),
-            nn.Linear(self.FRAME_FEAT_DIM, hidden_dim),
-            nn.GELU(),
-            nn.Linear(hidden_dim, slot_dim),
-        )
-        self.video_proj = nn.Sequential(
-            nn.LayerNorm(self.VIDEO_FEAT_DIM),
-            nn.Linear(self.VIDEO_FEAT_DIM, hidden_dim),
-            nn.GELU(),
-            nn.Linear(hidden_dim, slot_dim),
-        )
-
-    def _compute_motion_weight(
-        self, vis_feats_5d: Optional[Tensor]
-    ) -> Tuple[Optional[Tensor], Optional[Tensor]]:
-        """Compute per-pixel motion score `(B, T, 1, H, W)` and soft gate weight from feature diffs."""
-        if not self.use_motion_weighting or vis_feats_5d is None or vis_feats_5d.shape[1] <= 1:
-            return None, None
-
-        vf = vis_feats_5d.detach().float()
-        diff = (vf[:, 1:] - vf[:, :-1]).pow(2).mean(dim=-1).sqrt()  # (B, T-1, H, W)
-        bwd = torch.cat([diff[:, :1], diff], dim=1)
-        fwd = torch.cat([diff, diff[:, -1:]], dim=1)
-        energy = 0.5 * (bwd + fwd)
-
-        rel_energy = energy / (energy.mean(dim=(-2, -1), keepdim=True) + 1e-6)
-        motion_score = torch.sigmoid(self.motion_gate_temp * (rel_energy - self.motion_gate_bias))
-        floor = torch.sigmoid(self.motion_floor_logit)
-        motion_weight = floor + (1.0 - floor) * motion_score
-        return motion_weight.unsqueeze(2), motion_score.unsqueeze(2)
-
-    def _compute_base_geometry(
-        self,
-        obj_attn: Tensor,
-        motion_weight: Optional[Tensor] = None,
-        motion_score: Optional[Tensor] = None,
-    ) -> Tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor]:
-        """Compute motion-weighted centroids, spreads, scale, base depth, peak, mass, and dyn_ratio."""
-        b, t, s, h, w = obj_attn.shape
-        device = obj_attn.device
-        attn = obj_attn.float()
-
-        static_w = attn.pow(2)
-        prob_static = static_w / static_w.sum(dim=(-2, -1), keepdim=True).clamp(min=1e-6)
-
-        if motion_weight is not None:
-            dyn_w = static_w * motion_weight
-            prob = dyn_w / dyn_w.sum(dim=(-2, -1), keepdim=True).clamp(min=1e-6)
-            dyn_ratio = (prob_static * motion_score).sum(dim=(-2, -1))  # (B, T, S)
-        else:
-            prob = prob_static
-            dyn_ratio = torch.ones((b, t, s), device=device, dtype=torch.float32)
-
-        ys = torch.linspace(-1.0, 1.0, steps=h, device=device, dtype=torch.float32)
-        xs = torch.linspace(-1.0, 1.0, steps=w, device=device, dtype=torch.float32)
-        grid_y, grid_x = torch.meshgrid(ys, xs, indexing="ij")
-        grid_x = grid_x.view(1, 1, 1, h, w)
-        grid_y = grid_y.view(1, 1, 1, h, w)
-
-        cx = (prob * grid_x).sum(dim=(-2, -1))  # (B, T, S)
-        cy = (prob * grid_y).sum(dim=(-2, -1))  # (B, T, S)
-        std_x = torch.sqrt((prob * (grid_x - cx[..., None, None]).pow(2)).sum(dim=(-2, -1)) + 1e-6)
-        std_y = torch.sqrt((prob * (grid_y - cy[..., None, None]).pow(2)).sum(dim=(-2, -1)) + 1e-6)
-
-        peak = attn.amax(dim=(-2, -1))  # (B, T, S)
-        mass = attn.mean(dim=(-2, -1))  # (B, T, S)
-        scale = torch.sqrt(std_x.pow(2) + std_y.pow(2) + 1e-4)
-        depth_base = -torch.log(scale + 1e-3)
-        return cx, cy, std_x, std_y, scale, depth_base, peak, mass, dyn_ratio
-
-    def forward(
-        self,
-        obj_attn: Tensor,
-        obj_slots: Optional[Tensor] = None,
-        vis_feats_5d: Optional[Tensor] = None,
-        ego_shift_norm: Optional[Tensor] = None,
-    ) -> Tuple[Tensor, Tensor, Tensor]:
-        b, t, s, _, _ = obj_attn.shape
-        device = obj_attn.device
-        out_dtype = obj_slots.dtype if obj_slots is not None else obj_attn.dtype
-
-        motion_weight, motion_score = self._compute_motion_weight(vis_feats_5d)
-        cx, cy, std_x, std_y, scale, depth_base, peak, mass, dyn_ratio = self._compute_base_geometry(
-            obj_attn, motion_weight=motion_weight, motion_score=motion_score
-        )
-
-        geom_ctx = torch.stack(
-            [
-                cx * peak,
-                cy * peak,
-                std_x * peak,
-                std_y * peak,
-                depth_base * peak,
-                peak,
-                mass,
-            ],
-            dim=-1,
-        )  # (B, T, S, 7)
-
-        if obj_slots is not None:
-            vis_ctx = self.offset_vis_proj(self.offset_vis_norm(obj_slots)).float()
-        else:
-            vis_ctx = torch.zeros(
-                b, t, s, self.offset_vis_proj.out_features, device=device, dtype=torch.float32
-            )
-
-        offset_in = torch.cat([vis_ctx, geom_ctx], dim=-1).to(dtype=self.depth_offset_net[1].weight.dtype)
-        raw_offset = self.depth_offset_net(offset_in).squeeze(-1).float()
-        depth_offset = self.depth_offset_scale * torch.tanh(raw_offset)
-        depth = depth_base + depth_offset
-
-        if ego_shift_norm is not None:
-            ego_dx = ego_shift_norm[:, :, 0:1].float().expand(b, t, s)
-            ego_dy = ego_shift_norm[:, :, 1:2].float().expand(b, t, s)
-        else:
-            ego_dx = torch.zeros_like(cx)
-            ego_dy = torch.zeros_like(cy)
-
-        # Gated 1-step & 2-step 3D velocities (raw + camera-compensated relative to background)
-        dx = torch.zeros_like(cx)
-        dy = torch.zeros_like(cy)
-        dz = torch.zeros_like(depth)
-        dx_rel = torch.zeros_like(cx)
-        dy_rel = torch.zeros_like(cy)
-        pair_gate = torch.zeros_like(peak)
-        if t > 1:
-            pair_gate[:, 1:] = peak[:, 1:] * peak[:, :-1]
-            dx[:, 1:] = (cx[:, 1:] - cx[:, :-1]) * pair_gate[:, 1:]
-            dy[:, 1:] = (cy[:, 1:] - cy[:, :-1]) * pair_gate[:, 1:]
-            dz[:, 1:] = (depth[:, 1:] - depth[:, :-1]) * pair_gate[:, 1:]
-            dx_rel[:, 1:] = (cx[:, 1:] - cx[:, :-1] - ego_dx[:, 1:]) * pair_gate[:, 1:]
-            dy_rel[:, 1:] = (cy[:, 1:] - cy[:, :-1] - ego_dy[:, 1:]) * pair_gate[:, 1:]
-
-        dx2 = torch.zeros_like(cx)
-        dy2 = torch.zeros_like(cy)
-        dz2 = torch.zeros_like(depth)
-        if t > 2:
-            gate2 = peak[:, 2:] * peak[:, :-2]
-            dx2[:, 2:] = 0.5 * (cx[:, 2:] - cx[:, :-2]) * gate2
-            dy2[:, 2:] = 0.5 * (cy[:, 2:] - cy[:, :-2]) * gate2
-            dz2[:, 2:] = 0.5 * (depth[:, 2:] - depth[:, :-2]) * gate2
-
-        # Perspective scale-normalized 2D velocities
-        inv_scale = 1.0 / (scale + 0.05)
-        dx_norm = dx * inv_scale
-        dy_norm = dy * inv_scale
-
-        frame_feats = torch.stack(
-            [
-                cx * peak,
-                cy * peak,
-                depth * peak,
-                dx,
-                dy,
-                dz,
-                dx_rel,
-                dy_rel,
-                ego_dx,
-                ego_dy,
-                dx2,
-                dy2,
-                dz2,
-                dx_norm,
-                dy_norm,
-                std_x * peak,
-                std_y * peak,
-                peak,
-                mass,
-                depth_offset * peak,
-                dyn_ratio * peak,
-            ],
-            dim=-1,
-        )  # (B, T, S, 21)
-
-        # Video-level 3D trajectory summary
-        max_peak = peak.amax(dim=1)
-        mean_peak = peak.mean(dim=1)
-        max_mass = mass.amax(dim=1)
-        mean_mass = mass.mean(dim=1)
-
-        w_t = peak.pow(2) + 1e-4
-        w_norm = w_t / w_t.sum(dim=1, keepdim=True)
-        mean_depth = (w_norm * depth).sum(dim=1) * max_peak
-        mean_std_x = (w_norm * std_x).sum(dim=1) * max_peak
-        mean_std_y = (w_norm * std_y).sum(dim=1) * max_peak
-        mean_dyn_ratio = (w_norm * dyn_ratio).sum(dim=1) * max_peak
-
-        if t > 1:
-            t_grid = torch.linspace(-1.0, 1.0, steps=t, device=device, dtype=torch.float32).view(1, t, 1)
-            t_mean = (w_norm * t_grid).sum(dim=1, keepdim=True)
-            dt = t_grid - t_mean
-            t_var = (w_norm * dt.pow(2)).sum(dim=1).clamp(min=1e-4)
-
-            cx_mean = (w_norm * cx).sum(dim=1, keepdim=True)
-            cy_mean = (w_norm * cy).sum(dim=1, keepdim=True)
-            z_mean = (w_norm * depth).sum(dim=1, keepdim=True)
-
-            slope_x = ((w_norm * dt * (cx - cx_mean)).sum(dim=1) / t_var) * max_peak
-            slope_y = ((w_norm * dt * (cy - cy_mean)).sum(dim=1) / t_var) * max_peak
-            slope_z = ((w_norm * dt * (depth - z_mean)).sum(dim=1) / t_var) * max_peak
-
-            gate_sum = pair_gate[:, 1:].sum(dim=1) + 0.1
-            vel_x = dx[:, 1:].sum(dim=1) / gate_sum
-            vel_y = dy[:, 1:].sum(dim=1) / gate_sum
-            vel_z = dz[:, 1:].sum(dim=1) / gate_sum
-            vel_x_rel = dx_rel[:, 1:].sum(dim=1) / gate_sum
-            vel_y_rel = dy_rel[:, 1:].sum(dim=1) / gate_sum
-        else:
-            slope_x = torch.zeros_like(max_peak)
-            slope_y = torch.zeros_like(max_peak)
-            slope_z = torch.zeros_like(max_peak)
-            vel_x = torch.zeros_like(max_peak)
-            vel_y = torch.zeros_like(max_peak)
-            vel_z = torch.zeros_like(max_peak)
-            vel_x_rel = torch.zeros_like(max_peak)
-            vel_y_rel = torch.zeros_like(max_peak)
-
-        slope_mag = torch.sqrt(slope_x.pow(2) + slope_y.pow(2) + slope_z.pow(2) + 1e-6) * max_peak
-        speed_2d = torch.sqrt(vel_x.pow(2) + vel_y.pow(2) + 1e-6) * max_peak
-        speed_2d_rel = torch.sqrt(vel_x_rel.pow(2) + vel_y_rel.pow(2) + 1e-6) * max_peak
-        speed_3d = torch.sqrt(vel_x.pow(2) + vel_y.pow(2) + vel_z.pow(2) + 1e-6) * max_peak
-
-        video_feats = torch.stack(
-            [
-                slope_x,
-                slope_y,
-                slope_z,
-                vel_x,
-                vel_y,
-                vel_z,
-                vel_x_rel,
-                vel_y_rel,
-                speed_2d_rel,
-                slope_mag,
-                speed_2d,
-                speed_3d,
-                mean_depth,
-                mean_std_x,
-                mean_std_y,
-                max_peak,
-                mean_peak,
-                max_mass,
-                mean_mass,
-                mean_dyn_ratio,
-            ],
-            dim=-1,
-        )  # (B, S, 20)
-
-        proj_dtype = self.frame_proj[1].weight.dtype
-        frame_emb = self.frame_proj(frame_feats.to(dtype=proj_dtype)).to(dtype=out_dtype)
-        video_emb = self.video_proj(video_feats.to(dtype=proj_dtype)).to(dtype=out_dtype)
-        return frame_emb, video_emb, depth.to(dtype=out_dtype)
-
-
-class SlotAttentionTubeEncoder(nn.Module):
-    """Masked 3D Feature & Attention Color Tube encoder adapted for TACO scenes.
-
-    Combines:
-      1. Optional `vis_dim` masked visual channels (`soft_attn * vis_proj(x_vis)`).
-      2. Motion/geometry channels: `[clean_attn, attn_diff_raw, (attn_diff_ego_comp), 3x3_corr]`.
-         When `use_ego_comp=True`, `prev_f` is warped by background-estimated camera shift
-         `ego_shift_norm` before computing compensated differences and 3x3 local correlations.
-      3. Optional 2 CoordConv channels `(grid_x, grid_y)` so 3D Convs preserve
-         spatial zone awareness (e.g. `z1..z4`, `c1..c4` in panoramic road views).
-      4. Optional 2 ground-plane perspective depth channels `[ground_inv_depth, ground_log_depth]`.
-      5. Optional zero-init FiLM modulation from `ego_x` before spatial-temporal pooling.
-    Uses global avg/max pooling plus coarse `(1, 2, 3)` spatial zone pooling.
-    """
-
-    def __init__(
-        self,
-        slot_dim: int = 256,
-        hidden_dim: int = 128,
-        bg_floor: float = 0.08,
-        dropout: float = 0.2,
-        use_tube_vis: bool = True,
-        vis_dim: int = 32,
-        use_coord_conv: bool = True,
-        use_ego_comp: bool = True,
-        use_tube_depth: bool = True,
-        ego_dim: int = 0,
-        horizon_ratio: float = 0.45,
-    ):
-        super().__init__()
-        self.bg_floor = float(bg_floor)
-        self.use_tube_vis = bool(use_tube_vis)
-        self.vis_dim = int(vis_dim) if self.use_tube_vis else 0
-        self.use_coord_conv = bool(use_coord_conv)
-        self.use_ego_comp = bool(use_ego_comp)
-        self.use_tube_depth = bool(use_tube_depth)
-        self.ego_dim = int(ego_dim)
-        self.horizon_ratio = float(horizon_ratio)
-
-        if self.use_tube_vis and self.vis_dim > 0:
-            self.vis_proj = nn.Sequential(
-                nn.Conv3d(slot_dim, self.vis_dim, kernel_size=1, bias=False),
-                nn.GroupNorm(math.gcd(self.vis_dim, 16), self.vis_dim),
-                nn.GELU(),
-            )
-        else:
-            self.vis_proj = None
-
-        motion_ch = 12 if self.use_ego_comp else 11
-        coord_ch = 2 if self.use_coord_conv else 0
-        depth_ch = 2 if self.use_tube_depth else 0
-        in_channels = motion_ch + self.vis_dim + coord_ch + depth_ch
-        gn_hidden = math.gcd(hidden_dim, 16)
-        c1 = 48 if self.use_tube_vis else 32
-
-        self.conv_net = nn.Sequential(
-            nn.Conv3d(in_channels, c1, kernel_size=3, padding=1, bias=False),
-            nn.GroupNorm(8, c1),
-            nn.GELU(),
-            nn.Conv3d(c1, 64, kernel_size=3, stride=(1, 2, 2), padding=1, bias=False),
-            nn.GroupNorm(8, 64),
-            nn.GELU(),
-            nn.Conv3d(64, 128, kernel_size=3, stride=(2, 2, 2), padding=1, bias=False),
-            nn.GroupNorm(16, 128),
-            nn.GELU(),
-            nn.Conv3d(128, hidden_dim, kernel_size=3, padding=1, bias=False),
-            nn.GroupNorm(gn_hidden, hidden_dim),
-            nn.GELU(),
-        )
-        if self.ego_dim > 0:
-            self.ego_film = nn.Sequential(
-                nn.LayerNorm(self.ego_dim),
-                nn.Linear(self.ego_dim, hidden_dim * 2),
-            )
-            nn.init.zeros_(self.ego_film[1].weight)
-            nn.init.zeros_(self.ego_film[1].bias)
-        else:
-            self.ego_film = None
-
-        # Global (avg + max = 2) + coarse 2x3 spatial zone grid (6) -> 8 * hidden_dim
-        pooled_dim = hidden_dim * (8 if self.use_coord_conv else 2)
-        self.out_proj = nn.Sequential(
-            nn.LayerNorm(pooled_dim),
-            nn.Dropout(p=dropout),
-            nn.Linear(pooled_dim, hidden_dim),
-            nn.GELU(),
-            nn.Linear(hidden_dim, slot_dim),
-        )
-
-    @staticmethod
-    def _warp_prev_frames(
-        prev_bs: Tensor,
-        b: int,
-        s: int,
-        ego_shift_norm: Optional[Tensor],
-    ) -> Tensor:
-        """Align previous attention frames `(B*S, T-1, H, W)` onto current frames via ego camera shift."""
-        if ego_shift_norm is None:
-            return prev_bs
-        _, t1, h, w = prev_bs.shape
-        device = prev_bs.device
-        prev_bt = prev_bs.view(b, s, t1, h, w).permute(0, 2, 1, 3, 4).reshape(b * t1, s, h, w)
-
-        xs = ((torch.arange(w, device=device, dtype=torch.float32) + 0.5) / float(w)) * 2.0 - 1.0
-        ys = ((torch.arange(h, device=device, dtype=torch.float32) + 0.5) / float(h)) * 2.0 - 1.0
-        gy, gx = torch.meshgrid(ys, xs, indexing="ij")
-        base_grid = torch.stack([gx, gy], dim=-1).unsqueeze(0)  # (1, H, W, 2)
-
-        shift = ego_shift_norm[:, 1:].float().reshape(b * t1, 1, 1, 2)
-        warp_grid = (base_grid - shift).to(dtype=prev_bt.dtype)
-        warped_bt = F.grid_sample(
-            prev_bt, warp_grid, mode="bilinear", padding_mode="border", align_corners=False
-        )
-        return warped_bt.view(b, t1, s, h, w).permute(0, 2, 1, 3, 4).reshape(b * s, t1, h, w)
-
-    def _build_color_tube(
-        self,
-        obj_attn: Tensor,
-        bg_attn: Optional[Tensor] = None,
-        x_vis: Optional[Tensor] = None,
-        ego_shift_norm: Optional[Tensor] = None,
-        depth_maps: Optional[Tensor] = None,
-    ) -> Tensor:
-        b, t, s, h, w = obj_attn.shape
-        device = obj_attn.device
-        attn = obj_attn.float()
-
-        clean = F.relu(attn - self.bg_floor) / max(1.0 - self.bg_floor, 1e-4)
-        if bg_attn is not None:
-            fg_weight = (1.0 - bg_attn.float()).clamp(0.0, 1.0)
-            clean = clean * fg_weight
-
-        clean_bs = clean.permute(0, 2, 1, 3, 4).reshape(b * s, t, h, w)
-
-        attn_diff_raw = torch.zeros_like(clean_bs)
-        attn_diff_comp = torch.zeros_like(clean_bs) if self.use_ego_comp else None
-        local_corr = torch.zeros((b * s, 9, t, h, w), device=device, dtype=clean.dtype)
-        if t > 1:
-            prev_f = clean_bs[:, :-1]
-            curr_f = clean_bs[:, 1:]
-            attn_diff_raw[:, 1:] = curr_f - prev_f
-
-            if self.use_ego_comp:
-                prev_ref = self._warp_prev_frames(prev_f, b=b, s=s, ego_shift_norm=ego_shift_norm)
-                attn_diff_comp[:, 1:] = curr_f - prev_ref
-            else:
-                prev_ref = prev_f
-
-            patches = F.unfold(
-                curr_f.reshape(b * s * (t - 1), 1, h, w),
-                kernel_size=3,
-                padding=1,
-            )
-            patches = patches.view(b * s, t - 1, 9, h, w).permute(0, 2, 1, 3, 4)
-            local_corr[:, :, 1:] = patches * prev_ref.unsqueeze(1)
-
-        if self.use_ego_comp and attn_diff_comp is not None:
-            parts = [clean_bs.unsqueeze(1), attn_diff_raw.unsqueeze(1), attn_diff_comp.unsqueeze(1), local_corr]
-        else:
-            parts = [clean_bs.unsqueeze(1), attn_diff_raw.unsqueeze(1), local_corr]
-
-        if self.vis_proj is not None:
-            if x_vis is not None:
-                vis_low = self.vis_proj(x_vis)
-                vis_exp = vis_low.unsqueeze(1).expand(-1, s, -1, -1, -1, -1).reshape(b * s, self.vis_dim, t, h, w)
-                soft_fg_attn = 0.5 * attn + 0.5 * clean
-                if bg_attn is not None:
-                    soft_fg = 0.5 + 0.5 * (1.0 - bg_attn.float()).clamp(0.0, 1.0)
-                    soft_fg_attn = soft_fg_attn * soft_fg
-                soft_attn = soft_fg_attn.permute(0, 2, 1, 3, 4).reshape(b * s, 1, t, h, w)
-                masked_vis = soft_attn.to(dtype=vis_exp.dtype) * vis_exp
-            else:
-                masked_vis = torch.zeros(
-                    (b * s, self.vis_dim, t, h, w),
-                    device=device,
-                    dtype=self.conv_net[0].weight.dtype,
-                )
-            parts.insert(0, masked_vis.float())
-
-        if self.use_coord_conv:
-            ys = torch.linspace(-1.0, 1.0, steps=h, device=device, dtype=torch.float32)
-            xs = torch.linspace(-1.0, 1.0, steps=w, device=device, dtype=torch.float32)
-            gy, gx = torch.meshgrid(ys, xs, indexing="ij")
-            coords = torch.stack([gx, gy], dim=0).view(1, 2, 1, h, w).expand(b * s, -1, t, -1, -1)
-            parts.append(coords)
-
-        if self.use_tube_depth:
-            if depth_maps is None:
-                d_maps = build_ground_depth_maps(
-                    h, w, horizon_ratio=self.horizon_ratio, device=device, dtype=torch.float32
-                )
-            else:
-                d_maps = depth_maps.to(device=device, dtype=torch.float32)
-                if d_maps.shape[-2:] != (h, w):
-                    d_maps = F.interpolate(d_maps, size=(h, w), mode="bilinear", align_corners=False)
-            parts.append(d_maps.view(1, 2, 1, h, w).expand(b * s, -1, t, -1, -1))
-
-        return torch.cat(parts, dim=1)
-
-    def forward(
-        self,
-        obj_attn: Tensor,
-        bg_attn: Optional[Tensor] = None,
-        x_vis: Optional[Tensor] = None,
-        ego_x: Optional[Tensor] = None,
-        ego_shift_norm: Optional[Tensor] = None,
-        depth_maps: Optional[Tensor] = None,
-    ) -> Tensor:
-        b, _, s, _, _ = obj_attn.shape
-        tube = self._build_color_tube(
-            obj_attn,
-            bg_attn=bg_attn,
-            x_vis=x_vis,
-            ego_shift_norm=ego_shift_norm,
-            depth_maps=depth_maps,
-        )
-        proj_dtype = self.conv_net[0].weight.dtype
-        feat_3d = self.conv_net(tube.to(dtype=proj_dtype))
-        if self.ego_film is not None and ego_x is not None:
-            film_in = ego_x.to(dtype=self.ego_film[1].weight.dtype)
-            gamma_beta = self.ego_film(film_in)
-            gamma, beta = gamma_beta.chunk(2, dim=-1)
-            gamma = gamma.unsqueeze(1).expand(-1, s, -1).reshape(b * s, -1, 1, 1, 1).to(dtype=feat_3d.dtype)
-            beta = beta.unsqueeze(1).expand(-1, s, -1).reshape(b * s, -1, 1, 1, 1).to(dtype=feat_3d.dtype)
-            feat_3d = feat_3d * (1.0 + gamma) + beta
-
-        avg_pool = F.adaptive_avg_pool3d(feat_3d, 1).flatten(1)
-        max_pool = F.adaptive_max_pool3d(feat_3d, 1).flatten(1)
-        if self.use_coord_conv:
-            zone_pool = F.adaptive_avg_pool3d(feat_3d, (1, 2, 3)).flatten(1)
-            pooled = torch.cat([avg_pool, max_pool, zone_pool], dim=-1)
-        else:
-            pooled = torch.cat([avg_pool, max_pool], dim=-1)
-        return self.out_proj(pooled).view(b, s, -1).to(dtype=obj_attn.dtype)
-
-
 @MODELS.register_module(name="ActionSlotModel")
 class ActionSlotModel(BaseModel):
     """Spatiotemporal Action-Slot model.
@@ -835,7 +78,6 @@ class ActionSlotModel(BaseModel):
         self.num_slots = num_slots
         self.slot_dim = slot_dim
         self.ego_c = ego_c
-        self.bg_slot = bool(bg_slot)
 
         finetune_last_n_stages = kwargs.get('finetune_last_n_stages', 2)
         freeze_stages = kwargs.get('freeze_stages', None)
@@ -856,10 +98,6 @@ class ActionSlotModel(BaseModel):
         )
         in_c = self.backbone.out_channels
 
-        self.use_temporal_diff = bool(kwargs.get("use_temporal_diff", True))
-        td_spatial_kernel = int(kwargs.get("td_spatial_kernel", 3))
-        td_temporal_kernel = int(kwargs.get("td_temporal_kernel", 3))
-
         # 2. Ego Feature Branch
         if self.num_ego_class > 0:
             self.conv3d_ego = nn.Sequential(
@@ -867,19 +105,9 @@ class ActionSlotModel(BaseModel):
                 nn.BatchNorm3d(in_c),
                 nn.Conv3d(in_c, self.ego_c, (1, 1, 1), stride=1),
             )
-            self.ego_temporal_diff = (
-                TemporalDifferenceBlock(
-                    channels=self.ego_c,
-                    spatial_kernel=td_spatial_kernel,
-                    temporal_kernel=td_temporal_kernel,
-                )
-                if self.use_temporal_diff
-                else None
-            )
             self.pool_ego = nn.AdaptiveAvgPool3d(output_size=1)
         else:
             self.conv3d_ego = None
-            self.ego_temporal_diff = None
             self.pool_ego = None
 
         # 3. Spatiotemporal Feature Projection
@@ -889,30 +117,9 @@ class ActionSlotModel(BaseModel):
             nn.Conv3d(in_c, self.slot_dim, (1, 1, 1), stride=1),
             nn.ReLU(),
         )
-        self.temporal_diff = (
-            TemporalDifferenceBlock(
-                channels=self.slot_dim,
-                spatial_kernel=td_spatial_kernel,
-                temporal_kernel=td_temporal_kernel,
-            )
-            if self.use_temporal_diff
-            else None
-        )
-        self.use_ray_pe = bool(kwargs.get("use_ray_pe", True))
-        self.ray_pos_enc = (
-            PanoramicRayPositionEncoding(
-                embed_dim=self.slot_dim,
-                hfov_deg=float(kwargs.get("ray_hfov_deg", 180.0)),
-                vfov_deg=float(kwargs.get("ray_vfov_deg", 60.0)),
-                horizon_ratio=float(kwargs.get("ray_horizon_ratio", 0.45)),
-                default_hw=(int(resolution3d[1]), int(resolution3d[2])),
-            )
-            if self.use_ray_pe
-            else None
-        )
 
         # 4. Slot Attention
-        actual_slots = self.num_slots + 2 if bg_slot else self.num_slots
+        actual_slots = self.num_slots + 1 if bg_slot else self.num_slots
         self.slot_attention = SlotAttention(
             num_slots=actual_slots,
             dim=self.slot_dim,
@@ -924,217 +131,36 @@ class ActionSlotModel(BaseModel):
             slot_dropout=kwargs.get('slot_dropout', 0.0),
         )
 
-        # self.obj_cls_head = VideoObjectClassHead(
-        #     in_channel=slot_dim,
-        #     num_slots=actual_slots,
-        #     num_obj_classes=num_actor_class,
-        #     hidden_dim=int(kwargs.get("obj_cls_hidden_dim", 256)),
-        #     dropout=float(kwargs.get("obj_cls_dropout", 0.2)),
-        # )
-
         # 5. Modular Classification Head
-        self.actions_per_slot = list(kwargs.get("actions_per_slot", [24, 24, 16]))
-        if sum(self.actions_per_slot) != num_actor_class and self.num_slots > 0 and num_actor_class % self.num_slots == 0:
-            self.actions_per_slot = [num_actor_class // self.num_slots] * self.num_slots
+        self.head = ReduceAllocatedHead(
+        in_channel= slot_dim, 
+        num_ego_classes= num_ego_class,
+        num_actor_classes=num_actor_class,
+        ego_channel= ego_c,
+        num_slots= self.num_slots
+        )
 
-        self.head_type = str(kwargs.get("head_type", "dual_stream")).lower()
-        if self.head_type in ("dual", "dual_stream", "decoupled"):
-            self.head = DualStreamActionHead(
-                in_channel=slot_dim,
-                num_ego_classes=num_ego_class,
-                num_actor_classes=num_actor_class,
-                ego_channel=ego_c,
-                num_slots=self.num_slots,
-                actions_per_slot=self.actions_per_slot,
-                hidden_dim=int(kwargs.get("head_hidden_dim", 128)),
-                dropout=float(kwargs.get("head_dropout", 0.35)),
-            )
-        else:
-            self.head = ObjectActionHead(
-                in_channel=slot_dim,
-                num_ego_classes=num_ego_class,
-                num_actor_classes=num_actor_class,
-                ego_channel=ego_c,
-                num_slots=self.num_slots,
-                actions_per_slot=self.actions_per_slot,
-            )
+
+
         self.drop = nn.Dropout(p=dropout)
-        self.slot_drop = nn.Dropout(p=float(kwargs.get("slot_head_dropout", 0.2)))
 
-        # DINOSAUR-style Spatial Broadcast Feature Decoder
-        self.use_feat_recon = bool(kwargs.get("use_feat_recon", True))
-        feat_recon_weight = float(kwargs.get("feat_recon_weight", 0.15))
-        if self.use_feat_recon:
-            self.feat_decoder = SpatialBroadcastFeatureDecoder(
-                slot_dim=self.slot_dim,
-                hidden_dim=int(kwargs.get("feat_recon_hidden_dim", 128)),
-                out_dim=self.slot_dim,
-            )
-        else:
-            self.feat_decoder = None
+        self.loss_fn = ActionSlotLoss(num_actor_class = num_actor_class, attention_res=(resolution3d[1],resolution3d[2]), bce_pos_weight = 10, num_slots= self.num_slots)
 
-        bce_pos_weight = kwargs.get('bce_pos_weight', 5.0)
-
-        self.loss_fn = ActionSlotLoss(
-            num_actor_class=num_actor_class,
-            attention_res=(resolution3d[1], resolution3d[2]),
-            bce_pos_weight=bce_pos_weight,
-            num_slots=self.num_slots,
-            actions_per_slot=self.actions_per_slot,
-            feat_recon_weight=feat_recon_weight if self.use_feat_recon else 0.0,
-            action_attn_weight=float(kwargs.get("action_attn_weight", 1.0)),
-            bg_attn_weight=float(kwargs.get("bg_attn_weight", 0.5)),
-            ego_loss_weight=float(kwargs.get("ego_loss_weight", 0.2)),
-            dual_stream_aux_weight=float(kwargs.get("dual_stream_aux_weight", 0.2)),
-            use_class_pos_weight=bool(kwargs.get("use_class_pos_weight", True)),
-        )
-
-        # Mamba operates strictly over the S object slots (excluding bg_slot)
-        self.use_mamba = bool(kwargs.get("use_mamba", True))
-        if self.use_mamba:
-            mambaCfg = MambaConfig(
-                d_model=self.slot_dim,
-                n_layer=int(kwargs.get("mamba_layers", 1)),
-                d_state=int(kwargs.get("mamba_d_state", 16)),
-                num_slot=self.num_slots,
-            )
-            self.mamba = Mamba(mambaCfg)
-        else:
-            self.mamba = None
-
-        self.use_slot_trajectory = bool(kwargs.get("use_slot_trajectory", True))
-        if self.use_slot_trajectory:
-            self.traj_encoder = SlotTrajectoryEncoder(
-                slot_dim=self.slot_dim,
-                hidden_dim=int(kwargs.get("traj_hidden_dim", 128)),
-                offset_vis_dim=int(kwargs.get("depth_offset_vis_dim", 32)),
-                depth_offset_scale=float(kwargs.get("depth_offset_scale", 1.0)),
-                use_motion_weighting=bool(kwargs.get("use_motion_weighted_traj", True)),
-            )
-        else:
-            self.traj_encoder = None
-
-        self.use_attn_tube = bool(kwargs.get("use_attn_tube", True))
-        self.use_tube_vis = bool(kwargs.get("use_tube_vis", True))
-        self.use_ego_comp = bool(kwargs.get("use_ego_comp", True))
-        self.use_tube_depth = bool(kwargs.get("use_tube_depth", True))
-        self.use_ego_film = bool(kwargs.get("use_ego_film", True))
-        self.ego_flow_temp = float(kwargs.get("ego_flow_temp", 12.0))
-        self.ego_flow_max_du = int(kwargs.get("ego_flow_max_du", 2))
-        self.ego_flow_max_dv = int(kwargs.get("ego_flow_max_dv", 1))
-        self.tube_only_head = bool(kwargs.get("tube_only_head", False))
-        horizon_ratio = float(kwargs.get("ray_horizon_ratio", 0.45))
-        if self.use_attn_tube:
-            self.tube_encoder = SlotAttentionTubeEncoder(
-                slot_dim=self.slot_dim,
-                hidden_dim=int(kwargs.get("tube_hidden_dim", 128)),
-                bg_floor=float(kwargs.get("tube_bg_floor", 0.08)),
-                dropout=float(kwargs.get("tube_dropout", 0.2)),
-                use_tube_vis=self.use_tube_vis,
-                vis_dim=int(kwargs.get("tube_vis_dim", 32)),
-                use_coord_conv=bool(kwargs.get("use_tube_coord_conv", True)),
-                use_ego_comp=self.use_ego_comp,
-                use_tube_depth=self.use_tube_depth,
-                ego_dim=(self.ego_c if (self.num_ego_class > 0 and self.use_ego_film) else 0),
-                horizon_ratio=horizon_ratio,
-            )
-        else:
-            self.tube_encoder = None
-        self.temporal_pool = str(kwargs.get("temporal_pool", "last_mean")).lower()
-        self.mamba_grad_scale = float(kwargs.get("mamba_grad_scale", 1.0))
+        mambaCfg = MambaConfig(d_model= self.slot_dim, n_layer= 1, d_state= 8, num_slot= 192)
+        self.mamba = Mamba(mambaCfg)
+        self.mamba_grad_scale = float(kwargs.get("mamba_grad_scale", 10.0))
         self.backbone_grad_scale = float(kwargs.get("backbone_grad_scale", 1.0))
-        self.ego_backbone_grad_scale = float(kwargs.get("ego_backbone_grad_scale", 0.1))
-
-        self.use_gpu_photometric_aug = bool(kwargs.get("gpu_photometric_aug", True))
-        self.gpu_photometric_aug = (
-            GPUBatchPhotometricAug(
-                aug_prob=float(kwargs.get("aug_prob", 0.8)),
-                brightness=float(kwargs.get("aug_brightness", 0.25)),
-                contrast=float(kwargs.get("aug_contrast", 0.25)),
-                saturation=float(kwargs.get("aug_saturation", 0.25)),
-                gamma=float(kwargs.get("aug_gamma", 0.15)),
-                channel_jitter=float(kwargs.get("aug_channel_jitter", 0.08)),
-                grayscale_prob=float(kwargs.get("aug_grayscale_prob", 0.1)),
-                blur_prob=float(kwargs.get("aug_blur_prob", 0.15)),
-            )
-            if self.use_gpu_photometric_aug
-            else None
-        )
-
-    def init_weights(self) -> None:
-        """Preserve pretrained backbone weights and submodule-specific initializations.
-
-        BaseModel.scripts.train invokes `model.init_weights()` after `build_model()`,
-        whose default implementation in `BaseModel` overwrites Conv2d/BatchNorm2d/Linear
-        parameters (wiping pretrained backbones while leaving pretrained BN running stats
-        intact, causing activation explosion in frozen BN layers). Each submodule already
-        initializes itself during `__init__`.
-        """
-        return None
 
 
-    @staticmethod
-    def _estimate_bg_ego_shift(
-        vis_feats_5d: Tensor,
-        bg_weight: Optional[Tensor] = None,
-        max_du: int = 2,
-        max_dv: int = 1,
-        temp: float = 12.0,
-    ) -> Tensor:
-        """Estimate inter-frame camera ego shift `(du, dv)` in `[-1, 1]` grid units from background correlation."""
-        b, t, h, w, c = vis_feats_5d.shape
-        device = vis_feats_5d.device
-        if t <= 1 or h <= 1 or w <= 1:
-            return torch.zeros((b, t, 2), device=device, dtype=torch.float32)
-
-        feat = F.normalize(vis_feats_5d.detach().float(), p=2, dim=-1, eps=1e-6)
-        feat_bt = feat.permute(0, 1, 4, 2, 3)  # (B, T, C, H, W)
-        f_prev = feat_bt[:, :-1].reshape(b * (t - 1), c, h, w)
-        f_curr = feat_bt[:, 1:].reshape(b * (t - 1), c, h, w)
-
-        if bg_weight is not None:
-            w_curr = bg_weight[:, 1:].detach().float().reshape(b * (t - 1), 1, h, w)
-        else:
-            w_curr = torch.ones((b * (t - 1), 1, h, w), device=device, dtype=torch.float32)
-        w_sum = w_curr.sum(dim=(-2, -1)).clamp(min=1e-4)
-
-        f_prev_pad = F.pad(f_prev, (max_du, max_du, max_dv, max_dv), mode="replicate")
-        scores = []
-        offsets = []
-        for dv in range(-max_dv, max_dv + 1):
-            y0 = max_dv - dv
-            for du in range(-max_du, max_du + 1):
-                x0 = max_du - du
-                prev_slice = f_prev_pad[:, :, y0 : y0 + h, x0 : x0 + w]
-                sim_map = (f_curr * prev_slice).sum(dim=1, keepdim=True)
-                score = (sim_map * w_curr).sum(dim=(-2, -1)) / w_sum
-                scores.append(score.squeeze(-1))
-                offsets.append((float(du), float(dv)))
-
-        probs = F.softmax(torch.stack(scores, dim=-1) * float(temp), dim=-1)
-        offset_tensor = torch.tensor(offsets, device=device, dtype=torch.float32)
-        exp_px = probs @ offset_tensor  # (B*(T-1), 2)
-
-        shift_norm = torch.stack(
-            [exp_px[:, 0] * (2.0 / float(w)), exp_px[:, 1] * (2.0 / float(h))],
-            dim=-1,
-        ).view(b, t - 1, 2)
-        return F.pad(shift_norm, (0, 0, 1, 0), value=0.0)
-
-    def _extract_features_with_aux(
+    def extract_features(
         self,
         videos: Union[List[torch.Tensor], torch.Tensor],
-        compute_recon: bool = False,
-    ) -> Tuple[torch.Tensor, Optional[torch.Tensor], torch.Tensor, Dict[str, Optional[torch.Tensor]]]:
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         if isinstance(videos, list):
             videos = torch.stack(videos, dim=0)
         if videos.dtype == torch.uint8:
             # Chuyển uint8 [0, 255] -> float32 chuẩn hóa (mean=0.45, std=0.225) trên GPU để giảm 4x băng thông CPU->GPU
-            if self.training and self.gpu_photometric_aug is not None:
-                videos = self.gpu_photometric_aug(videos.float().mul_(1.0 / 255.0))
-                videos = videos.sub_(0.45).mul_(1.0 / 0.225)
-            else:
-                videos = videos.float().mul_(1.0 / (255.0 * 0.225)).add_(-0.45 / 0.225)
+            videos = videos.float().mul_(1.0 / (255.0 * 0.225)).add_(-0.45 / 0.225)
         videos = videos.permute(0, 2, 1, 3, 4)
         seq_len = videos.shape[2]
         batch_size = videos.shape[0]
@@ -1142,164 +168,56 @@ class ActionSlotModel(BaseModel):
         # 1. Backbone feature extraction: (B, C, T_feat, H_feat, W_feat)
         feats = self.backbone(videos)
 
-        # 2. Ego feature branch (attenuates gradient pull back into backbone)
+
+        # 2. Ego feature branch
         ego_x = None
         if self.conv3d_ego is not None:
-            ego_in = feats
-            if self.training and feats.requires_grad:
-                if self.ego_backbone_grad_scale == 0.0:
-                    ego_in = feats.detach()
-                elif self.ego_backbone_grad_scale != 1.0:
-                    ego_in = _ScaleGrad.apply(feats, self.ego_backbone_grad_scale)
-            ego_feat = self.conv3d_ego(ego_in)
-            if self.ego_temporal_diff is not None:
-                ego_feat = self.ego_temporal_diff(ego_feat)
+            ego_feat = self.conv3d_ego(feats)
             ego_feat = self.pool_ego(ego_feat)
             ego_x = torch.reshape(ego_feat, (batch_size, self.ego_c))
 
         new_seq_len = feats.shape[2]
         new_h, new_w = feats.shape[3], feats.shape[4]
 
-        # 3. Project to slot dimension (decouple slot->backbone gradient scale from ego branch)
-        slot_in = feats
-        if self.training and feats.requires_grad:
-            if self.backbone_grad_scale == 0.0:
-                slot_in = feats.detach()
-            elif self.backbone_grad_scale != 1.0:
-                slot_in = _ScaleGrad.apply(feats, self.backbone_grad_scale)
-        x_vis = self.conv3d(slot_in)
-        x_vis_raw_5d = x_vis.permute(0, 2, 3, 4, 1).contiguous()
-        if self.temporal_diff is not None:
-            x_vis = self.temporal_diff(x_vis)
-        x_vis_5d = x_vis.permute(0, 2, 3, 4, 1).contiguous()
-        if self.ray_pos_enc is not None:
-            pos_emb = self.ray_pos_enc(new_h, new_w, device=x_vis.device, dtype=x_vis.dtype)
-        else:
-            pos_emb = build_2d_sincos_position_embedding(
-                new_h, new_w, self.slot_dim, device=x_vis.device, dtype=x_vis.dtype
-            )
-        x = x_vis + pos_emb.unsqueeze(2)
-        x = x.permute(0, 2, 3, 4, 1).contiguous()  # (B, T, H, W, slot_dim)
+        # 3. Project to slot dimension: (B, T_feat, H_feat, W_feat, slot_dim)
+        x = self.conv3d(feats)
+        
+        x = x + build_2d_sincos_position_embedding(new_h, new_w, self.slot_dim, device= x.device, dtype= x.dtype).unsqueeze(2)
+        x = x.permute(0, 2, 3, 4, 1)
+        x = torch.reshape(x, (batch_size, new_seq_len, new_h, new_w, -1))
+        B,T,H,W,dim = x.shape
+        x = x.view(B, T, H*W, dim)
 
-        # 4. Per-frame Slot Attention -> (B, T, actual_slots, slot_dim)
-        slots_seq_all, attn_masks = self.slot_attention(x, return_temporal_slots=True)
-        obj_slots = slots_seq_all[:, :, :self.num_slots, :]  # (B, T, S, slot_dim)
+        if self.training and x.requires_grad and self.mamba_grad_scale != 1.0:
+            scale = self.mamba_grad_scale
+            x.register_hook(lambda grad: grad / scale)
 
-        # 4b. DINOSAUR-style Spatial Broadcast feature reconstruction from all slots
-        recon_feats = None
-        target_feats = None
-        if compute_recon and self.feat_decoder is not None:
-            recon_feats, _ = self.feat_decoder(slots_seq_all, new_h, new_w)
-            target_feats = F.layer_norm(x_vis_5d.detach(), (self.slot_dim,))
+        x = x + self.mamba(x)
+        if self.training and x.requires_grad and self.mamba_grad_scale != 1.0:
+            scale = self.mamba_grad_scale
+            x.register_hook(lambda grad: grad * scale)
 
-        # 4c. Reshape attention masks and extract 3D trajectory + depth proxy/offset + 3D tube cues
-        b, actual_slots, _ = attn_masks.shape
-        attn_masks = attn_masks.view(b, actual_slots, new_seq_len, new_h, new_w)  # (B, actual_slots, T, H, W)
-        attn_masks = attn_masks.permute(0, 2, 1, 3, 4).contiguous()  # (B, T, actual_slots, H, W)
+        x = x.view(B, T, H, W, dim)
+        
 
-        obj_attn = attn_masks[:, :, :self.num_slots, :, :]  # (B, T, S, H, W)
-        bg_attn = attn_masks[:, :, -1:, :, :] if (self.bg_slot and actual_slots > self.num_slots) else None
+        # 4. Slot Attention
+        slots, attn_masks = self.slot_attention(x)
 
-        ego_shift_norm = None
-        if self.use_ego_comp:
-            bg_w = bg_attn if bg_attn is not None else (1.0 - obj_attn.amax(dim=2, keepdim=True)).clamp(0.0, 1.0)
-            ego_shift_norm = self._estimate_bg_ego_shift(
-                x_vis_raw_5d,
-                bg_weight=bg_w,
-                max_du=self.ego_flow_max_du,
-                max_dv=self.ego_flow_max_dv,
-                temp=self.ego_flow_temp,
-            )
-
-        depth_maps = (
-            self.ray_pos_enc.get_geom_maps(new_h, new_w, device=x_vis.device, dtype=torch.float32)[:, 5:7]
-            if (self.use_tube_depth and self.ray_pos_enc is not None)
-            else None
-        )
-
-        video_motion_emb = None
-        pred_depth = None
-        if self.traj_encoder is not None:
-            frame_motion_emb, video_motion_emb, pred_depth = self.traj_encoder(
-                obj_attn,
-                obj_slots=obj_slots,
-                vis_feats_5d=x_vis_raw_5d,
-                ego_shift_norm=ego_shift_norm,
-            )
-            obj_slots_in = obj_slots + frame_motion_emb
-        else:
-            obj_slots_in = obj_slots
-
-        tube_motion_emb = (
-            self.tube_encoder(
-                obj_attn,
-                bg_attn=bg_attn,
-                x_vis=x_vis,
-                ego_x=ego_x,
-                ego_shift_norm=ego_shift_norm,
-                depth_maps=depth_maps,
-            )
-            if self.tube_encoder is not None
-            else None
-        )
-
-        if self.tube_only_head and tube_motion_emb is not None and self.mamba is None and self.traj_encoder is None:
-            vis_slots = tube_motion_emb
-            motion_slots = tube_motion_emb
-            slots = tube_motion_emb
-        else:
-            # Decoupled appearance stream vs motion stream (Mamba / trajectory / 3D tube)
-            vis_slots = 0.5 * (obj_slots.mean(dim=1) + obj_slots.max(dim=1).values)
-
-            motion_slots: Optional[Tensor] = None
-            if self.mamba is not None:
-                # 5. Mamba temporal modeling over object slots: (B, T, S, slot_dim)
-                if self.training and obj_slots_in.requires_grad and self.mamba_grad_scale != 1.0:
-                    mamba_in = _ScaleGrad.apply(obj_slots_in, 1.0 / self.mamba_grad_scale)
-                    mamba_out = _ScaleGrad.apply(self.mamba(mamba_in), self.mamba_grad_scale)
-                else:
-                    mamba_out = self.mamba(obj_slots_in)
-
-                if self.temporal_pool == "last":
-                    motion_slots = mamba_out[:, -1, :, :]
-                elif self.temporal_pool == "mean":
-                    motion_slots = mamba_out.mean(dim=1)
-                else:
-                    motion_slots = 0.5 * (mamba_out[:, -1, :, :] + mamba_out.mean(dim=1))
-
-            if video_motion_emb is not None:
-                motion_slots = video_motion_emb if motion_slots is None else (motion_slots + video_motion_emb)
-            if tube_motion_emb is not None:
-                motion_slots = tube_motion_emb if motion_slots is None else (motion_slots + tube_motion_emb)
-            if motion_slots is None:
-                motion_slots = torch.zeros_like(vis_slots)
-
-            slots = vis_slots + motion_slots
-
-        # 6. Upsample attention masks along time if backbone subsampled T
+        # 5. Attention map upsampling back to input frame count
+        b, n, _ = attn_masks.shape
+        attn_masks = attn_masks.view(b * n, 1, new_seq_len, new_h, new_w)
         if seq_len > new_seq_len:
-            attn_flat = attn_masks.permute(0, 2, 1, 3, 4).reshape(b * actual_slots, 1, new_seq_len, new_h, new_w)
-            attn_up = F.interpolate(attn_flat, size=(seq_len, new_h, new_w), mode="trilinear", align_corners=False)
-            attn_masks = attn_up.view(b, actual_slots, seq_len, new_h, new_w).permute(0, 2, 1, 3, 4).clamp(0.0, 1.0)
+            attn_masks = F.interpolate(attn_masks, size=(seq_len, new_h, new_w), mode='trilinear')
+        attn_masks = torch.reshape(attn_masks, (b, n, seq_len, new_h, new_w))
+        attn_masks = attn_masks.permute((0, 2, 1, 3, 4))  # (B, T, num_slots, H, W)
 
+        # 6. Apply Dropout & Head
+        slots = self.drop(slots)
         if ego_x is not None:
             ego_x = self.drop(ego_x)
 
-        aux_preds = {
-            "recon_feats": recon_feats,
-            "target_feats": target_feats,
-            "vis_slots": vis_slots,
-            "motion_slots": motion_slots,
-            "pred_depth": pred_depth,
-            "ego_shift": ego_shift_norm,
-        }
-        return slots, ego_x, attn_masks, aux_preds
+        slots = slots[:, :self.num_actor_class]
 
-    def extract_features(
-        self,
-        videos: Union[List[torch.Tensor], torch.Tensor],
-    ) -> Tuple[torch.Tensor, Optional[torch.Tensor], torch.Tensor]:
-        slots, ego_x, attn_masks, _ = self._extract_features_with_aux(videos, compute_recon=False)
         return slots, ego_x, attn_masks
 
 
@@ -1341,19 +259,13 @@ class ActionSlotModel(BaseModel):
         label['actor'] = torch.stack(label['actor'], dim = 0)
         label['bg_seg'] = torch.stack(label['bg_seg'], dim = 0)
 
-        # Tính loss ở FP32 khi bật AMP để tránh lỗi unsafe autocast của BCELoss và giữ ổn định số học
-        pred_fp32 = {
-            k: (v.float() if isinstance(v, torch.Tensor) and v.is_floating_point() else v)
-            for k, v in pred.items()
-        }
-        device_type = "cuda" if next(self.parameters()).is_cuda else "cpu"
-        with torch.amp.autocast(device_type=device_type, enabled=False):
-            loss = self.loss_fn(pred_fp32, label, validate)
+        loss = self.loss_fn(pred, label, validate)
 
         # Attach predictions and ground truth for metric evaluation (e.g., train actor mAP)
         if isinstance(loss, dict):
             if "actor" in pred:
-                loss["pred_actor"] = pred['actor'].detach()
+                pred = self._process_output(pred['actor'])
+                loss["pred_actor"] = pred.detach()
             if "actor" in label and isinstance(label["actor"], torch.Tensor):
                 loss["target_actor"] = label["actor"].detach()
         
@@ -1362,24 +274,8 @@ class ActionSlotModel(BaseModel):
     def _post_process(self, pred: Optional[Dict[str, Any]] = None):
         if pred is None:
             return None
+        pred['actor'] = self._process_output(pred['actor'])
         return pred
-
-    def _run_head(
-        self,
-        slots: Tensor,
-        aux_preds: Dict[str, Optional[Tensor]],
-        ego_x: Optional[Tensor] = None,
-    ) -> Tuple[Optional[Tensor], Tensor, Optional[Tensor], Optional[Tensor]]:
-        """Dispatch DualStreamActionHead or legacy single-stream head."""
-        if isinstance(self.head, DualStreamActionHead):
-            head_out = self.head.forward_with_streams(
-                vis_slots=self.slot_drop(aux_preds["vis_slots"]),
-                motion_slots=self.slot_drop(aux_preds["motion_slots"]),
-                ego_x=ego_x,
-            )
-            return head_out["ego"], head_out["actor"], head_out["var_logits"], head_out["dir_logits"]
-        pred_ego, pred_actor = self.head(self.slot_drop(slots), ego_x=ego_x)
-        return pred_ego, pred_actor, None, None
 
     def forward_train(
         self,
@@ -1387,39 +283,38 @@ class ActionSlotModel(BaseModel):
         targets: Optional[List[Dict[str, Any]]] = None,
         **kwargs,
     ) -> Dict[str, torch.Tensor]:
-        """Tính toán Detection Loss trong quá trình huấn luyện."""
-        slots, ego_x, attn_masks, aux_preds = self._extract_features_with_aux(
-            inputs, compute_recon=(self.feat_decoder is not None)
-        )
+        # print(inputs[0]['videos'].shape)
+        # print(inputs["bg_seg"].shape)
+        # print(targets['ego'].shape)
+        # print(targets['actor'].shape)
+        """Tính toán Detection Loss trong quá trình huấn luyện với FPN và Deformable Sampling Loss."""
+        slots, ego_x, attn_masks = self.extract_features(inputs)
 
-        pred_ego, pred_actor, pred_var, pred_dir = self._run_head(slots, aux_preds, ego_x=ego_x)
+        pred_ego, pred_actor = self.head(slots, ego_x=ego_x)
 
         pred = {
             "actor": pred_actor,
             "ego": pred_ego,
             "attn": attn_masks,
-            "recon_feats": aux_preds.get("recon_feats"),
-            "target_feats": aux_preds.get("target_feats"),
-            "var_logits": pred_var,
-            "dir_logits": pred_dir,
         }
 
         return self._compute_losses(pred, targets)
+    
 
     def predict(
         self,
         inputs: torch.Tensor,
         **kwargs,
     ) -> List[Dict[str, torch.Tensor]]:
-        """Dự đoán class label và attention maps khi suy luận / đánh giá."""
-        slots, ego_x, attn_masks, aux_preds = self._extract_features_with_aux(inputs, compute_recon=False)
-        pred_ego, pred_actor, _, _ = self._run_head(slots, aux_preds, ego_x=ego_x)
+        """Dự đoán bounding box, class label và confidence score khi suy luận / đánh giá."""
+        
+        slots, ego_x, attn_masks = self.extract_features(inputs)
+        pred_ego, pred_actor = self.head(slots, ego_x=ego_x)
 
         pred = {
             "actor": pred_actor,
             "ego": pred_ego,
             "attn": attn_masks,
-            "pred_depth": aux_preds.get("pred_depth"),
         }
 
         return self._post_process(pred)
@@ -1431,24 +326,18 @@ class ActionSlotModel(BaseModel):
         **kwargs,
     ) -> Dict[str, Any]:
         """Validation forward pass: tính validation losses và trích xuất preds phục vụ tính mAP."""
-        slots, ego_x, attn_masks, aux_preds = self._extract_features_with_aux(
-            inputs, compute_recon=(self.feat_decoder is not None and targets is not None)
-        )
-        pred_ego, pred_actor, pred_var, pred_dir = self._run_head(slots, aux_preds, ego_x=ego_x)
+        slots, ego_x, attn_masks = self.extract_features(inputs)
+        pred_ego, pred_actor = self.head(slots, ego_x=ego_x)
 
         pred = {
             "actor": pred_actor,
             "ego": pred_ego,
             "attn": attn_masks,
-            "recon_feats": aux_preds.get("recon_feats"),
-            "target_feats": aux_preds.get("target_feats"),
-            "var_logits": pred_var,
-            "dir_logits": pred_dir,
         }
 
         output = {}
         if targets is not None:
-            loss_dict = self._compute_losses(pred, targets, validate=True)
+            loss_dict = self._compute_losses(pred, targets)
             output.update(loss_dict)
 
         preds = self._post_process(pred)
