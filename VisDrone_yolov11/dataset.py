@@ -148,8 +148,13 @@ class VisDroneLMDBDataset(BaseDataset):
                 data = pickle.loads(self.txn.get(key))
                 img_bytes = data["image"]
                 total_bytes += len(img_bytes)
-                target = self._build_target(data, key)
-                jpeg_cache.append((img_bytes, target))
+                t = self._build_target(data, key)
+                # Store targets as NumPy arrays (0 FDs) to avoid Python 3.13 forkserver `ValueError: too many fds`
+                t_np: Dict[str, Any] = {"_is_cxcywh": t.get("_is_cxcywh", True)}
+                for k in ("counts", "boxes", "labels", "bg_mask"):
+                    if k in t:
+                        t_np[k] = t[k].numpy() if isinstance(t[k], torch.Tensor) else np.asarray(t[k])
+                jpeg_cache.append((img_bytes, t_np))
             self._jpeg_cache = jpeg_cache
             print(f"[VisDroneLMDBDataset:{self.split}] JPEG RAM cache ready (~{total_bytes / (1024 ** 3):.2f} GB).")
 
@@ -416,8 +421,13 @@ class VisDroneLMDBDataset(BaseDataset):
     def get_data_info(self, idx: int) -> Dict[str, Any]:
         """Fetch a single sample from RAM cache (if enabled) or LMDB database."""
         if self._jpeg_cache is not None:
-            img_bytes, target = self._jpeg_cache[idx]
+            img_bytes, t_np = self._jpeg_cache[idx]
             image = Image.open(io.BytesIO(img_bytes)).convert("RGB")
+            target: Dict[str, Any] = {"_is_cxcywh": t_np.get("_is_cxcywh", True)}
+            for k in ("counts", "boxes", "labels", "bg_mask"):
+                if k in t_np:
+                    v = t_np[k]
+                    target[k] = torch.from_numpy(v) if isinstance(v, np.ndarray) else v
             return {"image": image, "target": target}
         return self._read_lmdb_sample(idx)
 
