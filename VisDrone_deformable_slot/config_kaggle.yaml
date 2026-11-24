@@ -38,6 +38,7 @@ model:
   class_focus_weights: [2.0, 2.0, 3.0, 0.3, 0.5, 0.5, 3.0, 3.0, 0.3, 2.0]
   spread_local_3x3: true
   patch_dropout: 0.1
+  patch_loss_weight: 0.2         # Class-weighted auxiliary loss for offset_head & scale_head
   # Slot + FiLM hyperparameters
   slot_dim: 64
   num_prototypes: [2, 2, 2, 1, 2, 3, 3, 3, 2, 2]

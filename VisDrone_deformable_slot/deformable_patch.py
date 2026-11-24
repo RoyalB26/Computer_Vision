@@ -269,5 +269,108 @@ class DeformableHighResPatchInjector(nn.Module):
             "radii_xy": radii_xy,
             "top_scores": top_scores,
             "num_patches": k_eff,
+            "grid_hw": (h3, w3),
         }
         return p3_box_out, p3_cls_out, patch_info
+
+    def compute_patch_loss(
+        self,
+        patch_info: Dict[str, Any],
+        gt_bboxes: torch.Tensor,
+        gt_labels: torch.Tensor,
+        mask_gt: torch.Tensor,
+        img_size: Tuple[int, int],
+        reach_cells: float = 2.5,
+        scale_padding: float = 1.35,
+    ) -> Dict[str, torch.Tensor]:
+        """Class-weighted deformable patch supervision (offset + adaptive scale).
+
+        For each sampled patch reference `ref_xy`, selects the best GT object within real
+        geometric reach (`<= reach_cells` P3 grid cells) by minimizing weighted effective distance:
+            d_eff = dist_cells / (sqrt(class_weight) * small_boost)
+        so rare/small objects (e.g. bicycle, tricycle) win over adjacent larger cars.
+        """
+        ref_xy = patch_info["ref_xy"].float()          # (B, K, 2) in [-1, 1]
+        centers_xy = patch_info["centers_xy"].float()  # (B, K, 2) in [-1, 1]
+        radii_xy = patch_info["radii_xy"].float()      # (B, K, 2) in [0, 1]
+        h3, w3 = patch_info["grid_hw"]
+        device = ref_xy.device
+        zero = torch.tensor(0.0, device=device, dtype=torch.float32)
+
+        bs, max_m, _ = gt_bboxes.shape
+        if max_m == 0:
+            return {"loss_patch": zero, "loss_patch_offset": zero, "loss_patch_scale": zero}
+
+        with torch.amp.autocast(device_type=device.type, enabled=False):
+            img_h, img_w = float(img_size[0]), float(img_size[1])
+            valid = mask_gt.squeeze(-1).bool()  # (B, M)
+            lbls = gt_labels.squeeze(-1).long().clamp(0, self.num_classes - 1)  # (B, M)
+
+            # GT centers in [-1, 1] and normalized sizes in [0, 1]
+            gb = gt_bboxes.float()
+            gt_cx_n = (0.5 * (gb[:, :, 0] + gb[:, :, 2]) / max(img_w, 1.0)).clamp(0.0, 1.0)
+            gt_cy_n = (0.5 * (gb[:, :, 1] + gb[:, :, 3]) / max(img_h, 1.0)).clamp(0.0, 1.0)
+            gt_w_n = ((gb[:, :, 2] - gb[:, :, 0]) / max(img_w, 1.0)).clamp(min=1e-4, max=1.0)
+            gt_h_n = ((gb[:, :, 3] - gb[:, :, 1]) / max(img_h, 1.0)).clamp(min=1e-4, max=1.0)
+
+            gt_xy = torch.stack([gt_cx_n * 2.0 - 1.0, gt_cy_n * 2.0 - 1.0], dim=-1)  # (B, M, 2) in [-1, 1]
+            gt_wh = torch.stack([gt_w_n, gt_h_n], dim=-1)                           # (B, M, 2) in [0, 1]
+
+            # Real Euclidean distance in P3 cell units: (B, K, M)
+            dx_c = (ref_xy[:, :, None, 0] - gt_xy[:, None, :, 0]) * (w3 * 0.5)
+            dy_c = (ref_xy[:, :, None, 1] - gt_xy[:, None, :, 1]) * (h3 * 0.5)
+            dist_cells = torch.sqrt(dx_c * dx_c + dy_c * dy_c + 1e-8)  # (B, K, M)
+
+            # Priority weights: sqrt(class_focus_weight) * small_boost (1.3x if < 32^2 at 1280)
+            cw_flat = self.class_weights.view(self.num_classes)
+            gt_cw = cw_flat[lbls].clamp(min=0.1)  # (B, M)
+            gt_sqrt_w = torch.sqrt(gt_cw)          # (B, M)
+            is_small_gt = (gt_w_n * gt_h_n) < ((32.0 / 1280.0) ** 2)
+            small_boost = torch.where(is_small_gt, torch.full_like(gt_sqrt_w, 1.3), torch.ones_like(gt_sqrt_w))
+            priority_denom = (gt_sqrt_w * small_boost).clamp(min=0.1)  # (B, M)
+
+            d_eff = dist_cells / priority_denom[:, None, :]  # (B, K, M)
+            in_reach = valid[:, None, :] & (dist_cells <= float(reach_cells))  # (B, K, M)
+            d_eff_masked = d_eff.masked_fill(~in_reach, 1e9)
+
+            best_d, best_m = d_eff_masked.min(dim=-1)  # (B, K)
+            matched = best_d < 1e8                     # (B, K)
+
+            if not matched.any():
+                return {"loss_patch": zero, "loss_patch_offset": zero, "loss_patch_scale": zero}
+
+            # Gather matched GT center, size, and class weight
+            m_idx2 = best_m.unsqueeze(-1).expand(-1, -1, 2)
+            tgt_xy = torch.gather(gt_xy, dim=1, index=m_idx2)      # (B, K, 2)
+            tgt_wh = torch.gather(gt_wh, dim=1, index=m_idx2)      # (B, K, 2)
+            tgt_w = torch.gather(gt_sqrt_w, dim=1, index=best_m)   # (B, K)
+
+            # Clamp target center within reachable offset range so offset_head isn't penalized for unreachable targets
+            max_dx = (2.0 * self.max_offset_cells) / float(w3)
+            max_dy = (2.0 * self.max_offset_cells) / float(h3)
+            tgt_dx = (tgt_xy[..., 0] - ref_xy[..., 0]).clamp(-max_dx, max_dx)
+            tgt_dy = (tgt_xy[..., 1] - ref_xy[..., 1]).clamp(-max_dy, max_dy)
+            pred_dx = centers_xy[..., 0] - ref_xy[..., 0]
+            pred_dy = centers_xy[..., 1] - ref_xy[..., 1]
+
+            # Express offset error in P3 cell units (well-scaled O(1))
+            err_off_x = F.smooth_l1_loss(pred_dx * (w3 * 0.5), tgt_dx * (w3 * 0.5), reduction="none", beta=0.5)
+            err_off_y = F.smooth_l1_loss(pred_dy * (h3 * 0.5), tgt_dy * (h3 * 0.5), reduction="none", beta=0.5)
+            per_pt_off = 0.5 * (err_off_x + err_off_y)  # (B, K)
+
+            # Adaptive scale target: (scale_padding * gt_wh / base_patch_radius) clamped to [0.6, 1.4]
+            pred_sc = radii_xy / max(self.base_patch_radius, 1e-6)  # (B, K, 2)
+            tgt_sc = (tgt_wh * float(scale_padding) / max(self.base_patch_radius, 1e-6)).clamp(0.6, 1.4)
+            per_pt_sc = F.smooth_l1_loss(pred_sc, tgt_sc, reduction="none", beta=0.25).mean(dim=-1)  # (B, K)
+
+            w_m = tgt_w[matched]
+            w_sum = w_m.sum().clamp(min=1e-6)
+            loss_off = (per_pt_off[matched] * w_m).sum() / w_sum
+            loss_sc = (per_pt_sc[matched] * w_m).sum() / w_sum
+            loss_patch = loss_off + 0.5 * loss_sc
+
+        return {
+            "loss_patch": loss_patch,
+            "loss_patch_offset": loss_off,
+            "loss_patch_scale": loss_sc,
+        }

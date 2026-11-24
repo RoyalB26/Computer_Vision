@@ -51,6 +51,7 @@ class VisDroneYOLO11DeformableSlot(VisDroneYOLO11Slot):
         class_focus_weights: Optional[List[float]] = None,
         spread_local_3x3: bool = True,
         patch_dropout: float = 0.1,
+        patch_loss_weight: float = 0.2,
         # Slot + FiLM hyperparameters (forwarded to VisDroneYOLO11Slot)
         slot_dim: int = 64,
         num_prototypes: Union[int, List[int], Tuple[int, ...]] = (2, 2, 2, 1, 2, 3, 3, 3, 2, 2),
@@ -129,6 +130,7 @@ class VisDroneYOLO11DeformableSlot(VisDroneYOLO11Slot):
         )
         self.backbone_size = int(backbone_size)
         self.use_deformable_patch = bool(use_deformable_patch)
+        self.patch_loss_weight = float(patch_loss_weight)
 
         if self.use_deformable_patch:
             self.patch_injector = DeformableHighResPatchInjector(
@@ -232,23 +234,36 @@ class VisDroneYOLO11DeformableSlot(VisDroneYOLO11Slot):
             img_size=lr_size,
         )
 
-        if self.slot_loss_weight > 0 and targets is not None:
+        if (self.slot_loss_weight > 0 or self.patch_loss_weight > 0) and targets is not None:
             gt_bboxes, gt_labels, mask_gt = self.criterion._prepare_targets(targets, lr_size, inputs.device)
-            slot_losses = self.slot_criterion(
-                slots=slot_info["slots"],
-                attn_ori=slot_info["attn_ori"],
-                obj_queries=self.slot_refiner.slot_attention.obj_queries,
-                resolutions=slot_info["resolutions"],
-                gt_bboxes=gt_bboxes,
-                gt_labels=gt_labels,
-                mask_gt=mask_gt,
-                img_size=lr_size,
-                dots=slot_info.get("dots"),
-                slots_sub=slot_info.get("slots_sub"),
-                presence_logits=slot_info.get("presence_logits"),
-            )
-            loss_dict["loss"] = loss_dict["loss"] + self.slot_loss_weight * slot_losses["loss_slot"]
-            loss_dict.update(slot_losses)
+
+            if self.slot_loss_weight > 0:
+                slot_losses = self.slot_criterion(
+                    slots=slot_info["slots"],
+                    attn_ori=slot_info["attn_ori"],
+                    obj_queries=self.slot_refiner.slot_attention.obj_queries,
+                    resolutions=slot_info["resolutions"],
+                    gt_bboxes=gt_bboxes,
+                    gt_labels=gt_labels,
+                    mask_gt=mask_gt,
+                    img_size=lr_size,
+                    dots=slot_info.get("dots"),
+                    slots_sub=slot_info.get("slots_sub"),
+                    presence_logits=slot_info.get("presence_logits"),
+                )
+                loss_dict["loss"] = loss_dict["loss"] + self.slot_loss_weight * slot_losses["loss_slot"]
+                loss_dict.update(slot_losses)
+
+            if self.patch_loss_weight > 0 and self.patch_injector is not None and "patch_info" in slot_info:
+                patch_losses = self.patch_injector.compute_patch_loss(
+                    patch_info=slot_info["patch_info"],
+                    gt_bboxes=gt_bboxes,
+                    gt_labels=gt_labels,
+                    mask_gt=mask_gt,
+                    img_size=lr_size,
+                )
+                loss_dict["loss"] = loss_dict["loss"] + self.patch_loss_weight * patch_losses["loss_patch"]
+                loss_dict.update(patch_losses)
 
         return loss_dict
 
