@@ -29,12 +29,13 @@ model:
   nms_threshold: 0.5
   max_det: 300
   # Slot + FiLM (Method B+C) hyperparameters
-  slot_dim: 32
+  slot_dim: 64                 # 64 dim gives 31 sub-slots plenty of orthogonal freedom
   num_prototypes: 3            # Multi-Prototype Sub-Slots (3 sub-slots per FG class for multi-modal classes)
+  use_cosine_attn: true        # Cosine Attention (locks ||q_bg||==||q_fg||==1, prevents logit explosion & BG dominance)
   fusion_mode: "film"          # "film" (Method C) or "residual"
   use_bg_slot_write: false     # false = FG slots only (natural bg gating), true = all slots
   use_logit_prior: false       # keep head.cv3 clean (no logit co-adaptation)
-  assigner_prior_weight: 0.0   # 0.0 = clean TAL assignment
+  assigner_prior_weight: 0.25   
   use_slot_checkpoint: false   # set true to further cut activation VRAM on small GPUs
   slot_loss_weight: 0.3        # auxiliary slot supervision multiplier
   bg_attn_weight: 0.3
@@ -45,6 +46,7 @@ model:
   slot_dropout: 0.1
   use_asa_gate: true           # ASA Presence Gate (GAP+GMP over P3+P4+P5)
   asa_gate_floor: 0.05         # soft floor so tiny small objects are never hard-killed
+  asa_logit_weight: 0.25       # gentle logit bias in dots_sub (full gating in slot_broadcast)
   presence_loss_weight: 0.5
   sparse_thresh: 0.05          # prune tiny background tails in attn_norm
 # 2. Dataset Configuration (Stratified Split synced with Visdrone/dataset.py)

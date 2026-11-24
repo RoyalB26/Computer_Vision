@@ -67,6 +67,8 @@ class LightweightSlotAttention(nn.Module):
         eps: float = 1e-8,
         slot_dropout: float = 0.1,
         sparse_thresh: float = 0.0,
+        use_cosine_attn: bool = False,
+        asa_logit_weight: float = 0.25,
     ):
         super().__init__()
         self.dim = dim
@@ -77,6 +79,8 @@ class LightweightSlotAttention(nn.Module):
         self.eps = eps
         self.scale = dim ** -0.5
         self.sparse_thresh = float(sparse_thresh)
+        self.use_cosine_attn = bool(use_cosine_attn)
+        self.asa_logit_weight = float(asa_logit_weight)
 
         self.obj_queries = nn.Parameter(torch.randn(1, self.num_slots, dim) * 0.05)
         self.norm_input = nn.LayerNorm(dim)
@@ -86,6 +90,12 @@ class LightweightSlotAttention(nn.Module):
         self.to_q = nn.Linear(dim, dim)
         self.to_k = nn.Linear(dim, dim)
         self.to_v = nn.Linear(dim, dim)
+
+        if self.use_cosine_attn:
+            # Learnable CLIP-style temperature starting at 10.0, clamped to [1.0, 20.0]
+            self.logit_scale = nn.Parameter(torch.tensor(math.log(10.0), dtype=torch.float32))
+        else:
+            self.register_parameter("logit_scale", None)
 
         self.fc1 = nn.Linear(dim, dim * 2)
         self.dropout = nn.Dropout(slot_dropout)
@@ -118,8 +128,15 @@ class LightweightSlotAttention(nn.Module):
             slots = self.obj_queries.expand(bs, -1, -1)
 
         q = self.to_q(self.norm_slots(slots))
-        # Compute attention logits in float32 and clamp to [-30, 30] so exp/logsumexp can NEVER overflow to NaN
-        dots_sub = (torch.einsum("bsd,bnd->bsn", q.float(), k.float()) * self.scale).clamp(-30.0, 30.0)
+        # Compute attention logits in float32; Cosine Attention locks ||q_bg|| == ||q_fg|| == 1.0
+        # so BG slot can never inflate its norm to dominate FG slots, and dots stay naturally bounded.
+        if self.use_cosine_attn and self.logit_scale is not None:
+            q_n = F.normalize(q.float(), p=2, dim=-1, eps=1e-6)
+            k_n = F.normalize(k.float(), p=2, dim=-1, eps=1e-6)
+            tau = self.logit_scale.float().clamp(min=0.0, max=math.log(20.0)).exp()
+            dots_sub = (torch.einsum("bsd,bnd->bsn", q_n, k_n) * tau).clamp(-30.0, 30.0)
+        else:
+            dots_sub = (torch.einsum("bsd,bnd->bsn", q.float(), k.float()) * self.scale).clamp(-30.0, 30.0)
 
         # Prior correction `-ln(M)` so M FG sub-slots don't get an artificial +ln(M) bias over the 1 BG slot
         if m_proto > 1:
@@ -127,9 +144,9 @@ class LightweightSlotAttention(nn.Module):
             bg_sub = dots_sub[:, self.num_fg_slots :, :]
             dots_sub = torch.cat([fg_sub, bg_sub], dim=1)
 
-        # [ASA Presence Gate] Detach gate so background pixels don't crush active class gates
-        if presence_gate is not None:
-            gate_bias = torch.log(presence_gate.detach().float().clamp(min=1e-4))  # (B, K)
+        # [ASA Presence Gate] Gentle detached log-bias on FG sub-slots (full gating happens at slot_broadcast)
+        if presence_gate is not None and self.asa_logit_weight > 0.0:
+            gate_bias = self.asa_logit_weight * torch.log(presence_gate.detach().float().clamp(min=1e-4))  # (B, K)
             if m_proto > 1:
                 gate_bias = gate_bias.repeat_interleave(m_proto, dim=1)  # (B, K*M)
             dots_sub = torch.cat(
@@ -190,7 +207,9 @@ class PostNeckSlotFiLMRefiner(nn.Module):
         slot_dropout: float = 0.1,
         use_asa_gate: bool = False,
         asa_gate_floor: float = 0.05,
+        asa_logit_weight: float = 0.25,
         sparse_thresh: float = 0.0,
+        use_cosine_attn: bool = False,
     ):
         super().__init__()
         assert slot_dim % 2 == 0, f"slot_dim must be even for 2D Sine PosEmb, got {slot_dim}"
@@ -241,6 +260,8 @@ class PostNeckSlotFiLMRefiner(nn.Module):
             num_prototypes=self.num_prototypes,
             slot_dropout=slot_dropout,
             sparse_thresh=sparse_thresh,
+            use_cosine_attn=use_cosine_attn,
+            asa_logit_weight=asa_logit_weight,
         )
         self.slot_drop = nn.Dropout2d(slot_dropout)
 

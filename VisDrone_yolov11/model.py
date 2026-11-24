@@ -404,8 +404,10 @@ class VisDroneYOLO11Slot(VisDroneYOLO11):
         slot_dropout: float = 0.1,
         use_asa_gate: bool = False,
         asa_gate_floor: float = 0.05,
+        asa_logit_weight: float = 0.25,
         presence_loss_weight: float = 0.5,
         sparse_thresh: float = 0.0,
+        use_cosine_attn: bool = False,
         slot_loss_weight: float = 0.3,
         bg_attn_weight: float = 0.5,
         fg_attn_weight: float = 0.5,
@@ -440,7 +442,9 @@ class VisDroneYOLO11Slot(VisDroneYOLO11):
             slot_dropout=slot_dropout,
             use_asa_gate=use_asa_gate,
             asa_gate_floor=asa_gate_floor,
+            asa_logit_weight=asa_logit_weight,
             sparse_thresh=sparse_thresh,
+            use_cosine_attn=use_cosine_attn,
         )
         self.slot_criterion = SlotAuxiliaryLoss(
             num_classes=num_classes,
