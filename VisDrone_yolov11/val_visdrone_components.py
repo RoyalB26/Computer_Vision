@@ -533,23 +533,33 @@ def _measure_slot_overfit_metrics(
     gt_xyxy: np.ndarray,
     imgsz: int,
     device: torch.device,
-) -> Tuple[Dict[str, float], np.ndarray, np.ndarray, np.ndarray]:
-    """Compute per-image Slot sharpness, entropy, calibration, BG leak, inactive FA, and confusion counts.
-
-    Returns:
-        metrics: dict of scalar diagnostics for this image.
-        conf_mat: (10, 11) pixel counts [gt_class, argmax_slot].
-        cls_inter: (10,) soft intersection sum(p_c * mask_c) for per-class Dice.
-        cls_card: (10,) soft cardinality sum(p_c) + sum(mask_c) for per-class Dice.
+    sa_cache: Optional[Dict[str, torch.Tensor]] = None,
+) -> Tuple[Dict[str, float], np.ndarray, np.ndarray, np.ndarray, Dict[str, Any]]:
+    """Compute per-image Slot sharpness, entropy, calibration, BG leak, inactive FA, confusion counts,
+    plus 4 cls_attn bottleneck diagnostics (per-scale recall/BG leak, T=1 vs T=2 alignment, logit gaps).
     """
     num_classes = 10
     attn_ori = slot_info["attn_ori"][0].float()   # (11, N)
     dots = slot_info["dots"][0].float()           # (11, N)
     resolutions = slot_info["resolutions"]
+    (h3, w3), (h4, w4), _ = resolutions
+    n3, n4 = h3 * w3, h4 * w4
 
     conf_mat = np.zeros((num_classes, num_classes + 1), dtype=np.float64)
     cls_inter = np.zeros(num_classes, dtype=np.float64)
     cls_card = np.zeros(num_classes, dtype=np.float64)
+    extra: Dict[str, Any] = {
+        "scale_correct": np.zeros((3, num_classes), dtype=np.float64),
+        "scale_bg_leak": np.zeros((3, num_classes), dtype=np.float64),
+        "scale_total": np.zeros((3, num_classes), dtype=np.float64),
+        "dot_gt_sum": np.zeros(num_classes, dtype=np.float64),
+        "dot_bg_sum": np.zeros(num_classes, dtype=np.float64),
+        "dot_other_sum": np.zeros(num_classes, dtype=np.float64),
+        "dot_cnt": np.zeros(num_classes, dtype=np.float64),
+        "cos_q_k": [[] for _ in range(num_classes)],
+        "cos_slot2_k": [[] for _ in range(num_classes)],
+        "k_means": [[] for _ in range(num_classes)],
+    }
 
     out: Dict[str, float] = {
         "dots_std": float(dots.std().item()),
@@ -557,7 +567,7 @@ def _measure_slot_overfit_metrics(
     }
 
     if len(gt_xyxy) == 0:
-        return out, conf_mat, cls_inter, cls_card
+        return out, conf_mat, cls_inter, cls_card, extra
 
     gt_boxes = torch.from_numpy(gt_xyxy[:, 1:5]).to(device=device, dtype=torch.float32).unsqueeze(0)
     gt_labels = torch.from_numpy(gt_xyxy[:, 0]).to(device=device, dtype=torch.long).view(1, -1, 1)
@@ -604,9 +614,19 @@ def _measure_slot_overfit_metrics(
         per_c_ce = (neg_log_p * pos_m).sum(dim=-1) / pos_cnt.clamp(min=1.0)
         out["slot_pos_ce_balanced"] = float(per_c_ce[valid_c].mean().item())
 
-    # Per-class Dice accumulators + Confusion matrix (GT class -> argmax slot)
+    # Prepare T=1 static q vs simulated T=2 adapted q2 from slots
+    k_tok = sa_cache.get("k")[0].float() if (sa_cache and "k" in sa_cache) else None  # (N, D)
+    q_static = sa_cache.get("q")[0].float() if (sa_cache and "q" in sa_cache) else None  # (11, D)
+    q_step2 = None
+    if k_tok is not None and q_static is not None and hasattr(model, "slot_refiner"):
+        sa = model.slot_refiner.slot_attention
+        q_step2 = sa.to_q(sa.norm_slots(slot_info["slots"][0].float()))  # (11, D)
+
+    # Per-class Dice, Confusion, Per-Scale Recall/BG Leak, Logit Gaps, and T=1 vs T=2 alignment
     pred_slot_all = attn_ori.argmax(dim=0)  # (N,)
     p_fg = attn_ori[:num_classes]           # (10, N)
+    scale_slices = [(0, n3), (n3, n3 + n4), (n3 + n4, dots.shape[1])]
+
     for c in range(num_classes):
         if not active[c]:
             continue
@@ -618,7 +638,40 @@ def _measure_slot_overfit_metrics(
         binc = torch.bincount(pred_slot_all[cm], minlength=num_classes + 1).cpu().numpy()
         conf_mat[c] += binc
 
-    return out, conf_mat, cls_inter, cls_card
+        # Group 2: Per-scale Recall & BG Leak
+        for s_idx, (st, ed) in enumerate(scale_slices):
+            cm_s = cm[st:ed]
+            tot_s = int(cm_s.sum().item())
+            if tot_s > 0:
+                ps_s = pred_slot_all[st:ed][cm_s]
+                extra["scale_total"][s_idx, c] = tot_s
+                extra["scale_correct"][s_idx, c] = float((ps_s == c).sum().item())
+                extra["scale_bg_leak"][s_idx, c] = float((ps_s == num_classes).sum().item())
+
+        # Group 4: Logit Gaps on GT pixels of class c
+        cnt_px = float(cm.sum().item())
+        d_gt = dots[c, cm]
+        d_bg = dots[num_classes, cm]
+        d_all_c = dots[:, cm].clone()
+        d_all_c[c] = -1e9
+        d_other = d_all_c.amax(dim=0)
+        extra["dot_gt_sum"][c] = float(d_gt.sum().item())
+        extra["dot_bg_sum"][c] = float(d_bg.sum().item())
+        extra["dot_other_sum"][c] = float(d_other.sum().item())
+        extra["dot_cnt"][c] = cnt_px
+
+        # Group 3: T=1 static query vs T=2 adapted slot alignment with mean GT key
+        if k_tok is not None and q_static is not None and q_step2 is not None:
+            m_proto = getattr(model.slot_refiner.slot_attention, "num_prototypes", 1)
+            k_mean = F.normalize(k_tok[cm].mean(dim=0), dim=0)
+            q1_sub = F.normalize(q_static[c * m_proto : (c + 1) * m_proto], dim=-1)  # (M, D)
+            cos_q1_best = float((q1_sub @ k_mean).max().item())
+            q2_n = F.normalize(q_step2[c], dim=0)
+            extra["cos_q_k"][c].append(cos_q1_best)
+            extra["cos_slot2_k"][c].append(float(torch.dot(q2_n, k_mean).item()))
+            extra["k_means"][c].append(k_mean.cpu().numpy())
+
+    return out, conf_mat, cls_inter, cls_card, extra
 
 
 def _predict_film_off_from_neck(
@@ -733,9 +786,11 @@ def run_visdrone_component_validation(
     model, has_slots = load_visdrone_model(weights_path, device, model_cfg=model_cfg)
     probe = YOLOv11ComponentProbe(model.net)
 
-    # Optional hooks on slot_refiner & its FiLM modulators to inspect modulated cls_feats, slot attention, and FiLM stats
+    # Optional hooks on slot_refiner, FiLM modulators, proj_in, to_k, and to_q
     slot_cache: Dict[str, Any] = {}
     film_mod_cache: Dict[int, torch.Tensor] = {}
+    proj_cache: Dict[int, torch.Tensor] = {}
+    sa_cache: Dict[str, torch.Tensor] = {}
     slot_handle = None
     mod_handles: List[Any] = []
     if has_slots and hasattr(model, "slot_refiner"):
@@ -750,6 +805,18 @@ def run_visdrone_component_validation(
                     film_mod_cache[idx_m] = out_t.detach()
                 return _mh
             mod_handles.append(mod.register_forward_hook(_make_mod_hook(mi)))
+        for pi, pr in enumerate(model.slot_refiner.proj_in):
+            def _make_proj_hook(idx_p: int):
+                def _ph(_m, _in, out_t):
+                    proj_cache[idx_p] = out_t.detach()
+                return _ph
+            mod_handles.append(pr.register_forward_hook(_make_proj_hook(pi)))
+        mod_handles.append(model.slot_refiner.slot_attention.to_k.register_forward_hook(
+            lambda _m, _in, out_t: sa_cache.__setitem__("k", out_t.detach())
+        ))
+        mod_handles.append(model.slot_refiner.slot_attention.to_q.register_forward_hook(
+            lambda _m, _in, out_t: sa_cache.__setitem__("q", out_t.detach())
+        ))
 
     component_order = list(BASE_COMPONENT_ORDER)
     if has_slots:
@@ -816,6 +883,21 @@ def run_visdrone_component_validation(
     slot_conf_mat = np.zeros((10, 11), dtype=np.float64)
     slot_cls_inter = np.zeros(10, dtype=np.float64)
     slot_cls_card = np.zeros(10, dtype=np.float64)
+    slot_scale_correct = np.zeros((3, 10), dtype=np.float64)
+    slot_scale_bg_leak = np.zeros((3, 10), dtype=np.float64)
+    slot_scale_total = np.zeros((3, 10), dtype=np.float64)
+    slot_dot_gt_sum = np.zeros(10, dtype=np.float64)
+    slot_dot_bg_sum = np.zeros(10, dtype=np.float64)
+    slot_dot_other_sum = np.zeros(10, dtype=np.float64)
+    slot_dot_cnt = np.zeros(10, dtype=np.float64)
+    slot_cos_q_k: List[List[float]] = [[] for _ in range(10)]
+    slot_cos_slot2_k: List[List[float]] = [[] for _ in range(10)]
+    slot_k_means: List[List[np.ndarray]] = [[] for _ in range(10)]
+    stage_sep_acc: Dict[str, Dict[str, List[float]]] = {
+        f"{st}_{sc}": {"full_fisher": [], "class_cos_sep": [], "all_ratio": []}
+        for st in ("proj", "key")
+        for sc in ("p3", "p4", "p5")
+    }
     slot_vecs_list: List[np.ndarray] = []
     all_preds_film_off: List[np.ndarray] = []
     box_diag_acc: Dict[str, List[float]] = {
@@ -863,6 +945,8 @@ def run_visdrone_component_validation(
         probe.clear()
         slot_cache.clear()
         film_mod_cache.clear()
+        proj_cache.clear()
+        sa_cache.clear()
         if device.type == "cuda":
             torch.cuda.synchronize()
         t_start = time.perf_counter()
@@ -896,13 +980,51 @@ def run_visdrone_component_validation(
             off_diag = sim[~torch.eye(10, dtype=torch.bool, device=sim.device)]
             slot_stats["slot_cos_sep"].append(float((1.0 - off_diag).mean().item()))
 
-            # Slot overfit diagnostics: sharpness, entropy, calibration, BG leak, inactive FA, confusion
-            so_m, c_mat, c_int, c_card = _measure_slot_overfit_metrics(model, s_info, gt_xyxy, imgsz, device)
+            # Slot overfit + cls_attn bottleneck diagnostics
+            so_m, c_mat, c_int, c_card, so_extra = _measure_slot_overfit_metrics(
+                model, s_info, gt_xyxy, imgsz, device, sa_cache=sa_cache
+            )
             for k, v in so_m.items():
                 slot_stats[k].append(v)
             slot_conf_mat += c_mat
             slot_cls_inter += c_int
             slot_cls_card += c_card
+            slot_scale_correct += so_extra["scale_correct"]
+            slot_scale_bg_leak += so_extra["scale_bg_leak"]
+            slot_scale_total += so_extra["scale_total"]
+            slot_dot_gt_sum += so_extra["dot_gt_sum"]
+            slot_dot_bg_sum += so_extra["dot_bg_sum"]
+            slot_dot_other_sum += so_extra["dot_other_sum"]
+            slot_dot_cnt += so_extra["dot_cnt"]
+            for c_i in range(10):
+                slot_cos_q_k[c_i].extend(so_extra["cos_q_k"][c_i])
+                slot_cos_slot2_k[c_i].extend(so_extra["cos_slot2_k"][c_i])
+                slot_k_means[c_i].extend(so_extra["k_means"][c_i])
+
+            # Group 1 bottleneck: measure separability at proj_in (32d) and Key (32d) per scale
+            if len(gt_lb_norm) > 0:
+                (h3, w3), (h4, w4), (h5, w5) = s_info["resolutions"]
+                n3_s, n4_s = h3 * w3, h4 * w4
+                for pi, sc_name in enumerate(["p3", "p4", "p5"]):
+                    pf = proj_cache.get(pi)
+                    if pf is not None:
+                        pm = measure_feature_metrics(pf, gt_lb_norm, imgsz, is_cls_logits=False)
+                        for mk in ("full_fisher", "class_cos_sep", "all_ratio"):
+                            if mk in pm:
+                                stage_sep_acc[f"proj_{sc_name}"][mk].append(pm[mk])
+                if "k" in sa_cache:
+                    kt = sa_cache["k"][0].float().transpose(0, 1)  # (D, N)
+                    d_k = kt.shape[0]
+                    k_maps = [
+                        ("p3", kt[:, :n3_s].view(1, d_k, h3, w3)),
+                        ("p4", kt[:, n3_s : n3_s + n4_s].view(1, d_k, h4, w4)),
+                        ("p5", kt[:, n3_s + n4_s :].view(1, d_k, h5, w5)),
+                    ]
+                    for sc_name, km in k_maps:
+                        k_met = measure_feature_metrics(km, gt_lb_norm, imgsz, is_cls_logits=False)
+                        for mk in ("full_fisher", "class_cos_sep", "all_ratio"):
+                            if mk in k_met:
+                                stage_sep_acc[f"key_{sc_name}"][mk].append(k_met[mk])
 
             # FiLM modulation magnitude & tanh saturation per scale
             if model.slot_refiner.fusion_mode == "film":
@@ -1149,9 +1271,51 @@ def run_visdrone_component_validation(
         slot_summary["wnorm_slot_attn"] = _wnorm(model.slot_refiner.slot_attention)
         slot_summary["wnorm_modulators"] = _wnorm(model.slot_refiner.modulators)
 
-        # Group 3: Per-class Slot Dice, Recall, BG leak & top confused slot
+        # Group 4 (static): ||q_c||_2 for all 10 FG classes (mean over M prototypes) + BG
+        sa = model.slot_refiner.slot_attention
+        m_proto = getattr(sa, "num_prototypes", 1)
+        q_all_static = sa.to_q(sa.norm_slots(sa.obj_queries.detach().float()))[0]  # (K*M + 1, D)
+        q_norms_raw = torch.linalg.vector_norm(q_all_static, dim=-1).cpu().numpy()
+        q_norms_fg = q_norms_raw[: 10 * m_proto].reshape(10, m_proto).mean(axis=1)
+        q_norms_11 = np.concatenate([q_norms_fg, q_norms_raw[-1:]])  # (11,)
+        slot_summary["q_norm_fg_mean"] = round(float(q_norms_11[:10].mean()), 4)
+        slot_summary["q_norm_fg_min"] = round(float(q_norms_11[:10].min()), 4)
+        slot_summary["q_norm_fg_max"] = round(float(q_norms_11[:10].max()), 4)
+        slot_summary["q_norm_bg"] = round(float(q_norms_11[10]), 4)
+
+        # Group 1: Neck -> proj_in (32d) -> Key (32d) separability table
+        neck_comp_map = {
+            "p3": "neck.c3k2_16 (P3 //8)",
+            "p4": "neck.c3k2_19 (P4 //16)",
+            "p5": "neck.c3k2_22 (P5 //32)",
+        }
+        stage_rows: List[Dict[str, object]] = []
+        for sc in ("p3", "p4", "p5"):
+            nc_acc = comp_acc[neck_comp_map[sc]]
+            n_fish = float(np.mean(nc_acc["full_fisher"])) if nc_acc["full_fisher"] else np.nan
+            n_cos = float(np.mean(nc_acc["class_cos_sep"])) if nc_acc["class_cos_sep"] else np.nan
+            p_fish = float(np.mean(stage_sep_acc[f"proj_{sc}"]["full_fisher"])) if stage_sep_acc[f"proj_{sc}"]["full_fisher"] else np.nan
+            p_cos = float(np.mean(stage_sep_acc[f"proj_{sc}"]["class_cos_sep"])) if stage_sep_acc[f"proj_{sc}"]["class_cos_sep"] else np.nan
+            k_fish = float(np.mean(stage_sep_acc[f"key_{sc}"]["full_fisher"])) if stage_sep_acc[f"key_{sc}"]["full_fisher"] else np.nan
+            k_cos = float(np.mean(stage_sep_acc[f"key_{sc}"]["class_cos_sep"])) if stage_sep_acc[f"key_{sc}"]["class_cos_sep"] else np.nan
+            slot_summary[f"fisher_neck_{sc}"] = round(n_fish, 4) if np.isfinite(n_fish) else np.nan
+            slot_summary[f"fisher_proj_{sc}"] = round(p_fish, 4) if np.isfinite(p_fish) else np.nan
+            slot_summary[f"fisher_key_{sc}"] = round(k_fish, 4) if np.isfinite(k_fish) else np.nan
+            stage_rows.append({
+                "scale": sc.upper(),
+                "neck_fisher": round(n_fish, 4), "proj_fisher": round(p_fish, 4), "key_fisher": round(k_fish, 4),
+                "neck_cos_sep": round(n_cos, 4), "proj_cos_sep": round(p_cos, 4), "key_cos_sep": round(k_cos, 4),
+            })
+        with open(os.path.join(out_dir, "slot_bottleneck_stages.csv"), "w", newline="", encoding="utf-8") as f:
+            w = csv.DictWriter(f, fieldnames=list(stage_rows[0].keys()))
+            w.writeheader()
+            w.writerows(stage_rows)
+
+        # Group 2, 3, 4: Per-class Slot Dice, Recall (overall + P3/P4/P5), BG leak (overall + P3/P4/P5),
+        # T=1 vs T=2 alignment, key variance, ||q_c||, and logit gaps
         col_names_11 = list(VISDRONE_CLASSES) + ["BG"]
         dices_valid = []
+        cos_q1_all, cos_q2_all = [], []
         for c in range(10):
             tot_px = float(slot_conf_mat[c].sum())
             dice_c = (2.0 * slot_cls_inter[c] / max(slot_cls_card[c], 1e-8)) if slot_cls_card[c] > 0 else np.nan
@@ -1161,19 +1325,57 @@ def run_visdrone_component_validation(
             wrong[c] = -1.0
             top_w_idx = int(np.argmax(wrong)) if tot_px > 0 else -1
             top_w_str = f"{col_names_11[top_w_idx]} ({wrong[top_w_idx] / tot_px * 100.0:.1f}%)" if (tot_px > 0 and wrong[top_w_idx] > 0) else "-"
+
+            rec_sc = [
+                (slot_scale_correct[s, c] / slot_scale_total[s, c] * 100.0) if slot_scale_total[s, c] > 0 else np.nan
+                for s in range(3)
+            ]
+            bgl_sc = [
+                (slot_scale_bg_leak[s, c] / slot_scale_total[s, c] * 100.0) if slot_scale_total[s, c] > 0 else np.nan
+                for s in range(3)
+            ]
+            d_cnt = max(slot_dot_cnt[c], 1.0)
+            dot_gt_m = slot_dot_gt_sum[c] / d_cnt if slot_dot_cnt[c] > 0 else np.nan
+            dot_bg_m = slot_dot_bg_sum[c] / d_cnt if slot_dot_cnt[c] > 0 else np.nan
+            dot_ot_m = slot_dot_other_sum[c] / d_cnt if slot_dot_cnt[c] > 0 else np.nan
+            cos_q1_m = float(np.mean(slot_cos_q_k[c])) if slot_cos_q_k[c] else np.nan
+            cos_q2_m = float(np.mean(slot_cos_slot2_k[c])) if slot_cos_slot2_k[c] else np.nan
+            k_std_m = float(np.stack(slot_k_means[c], axis=0).std(axis=0).mean()) if len(slot_k_means[c]) >= 2 else np.nan
+
             if np.isfinite(dice_c):
                 dices_valid.append(dice_c)
+            if np.isfinite(cos_q1_m):
+                cos_q1_all.append(cos_q1_m)
+            if np.isfinite(cos_q2_m):
+                cos_q2_all.append(cos_q2_m)
+
             slot_per_class_rows.append({
                 "class_id": c,
                 "class_name": VISDRONE_CLASSES[c],
                 "gt_pixels": int(tot_px),
                 "slot_dice": round(float(dice_c), 4) if np.isfinite(dice_c) else np.nan,
                 "slot_recall_pct": round(float(rec_c), 2) if np.isfinite(rec_c) else np.nan,
+                "rec_p3_pct": round(float(rec_sc[0]), 1) if np.isfinite(rec_sc[0]) else np.nan,
+                "rec_p4_pct": round(float(rec_sc[1]), 1) if np.isfinite(rec_sc[1]) else np.nan,
+                "rec_p5_pct": round(float(rec_sc[2]), 1) if np.isfinite(rec_sc[2]) else np.nan,
                 "bg_leak_pct": round(float(bg_leak_c), 2) if np.isfinite(bg_leak_c) else np.nan,
+                "bg_leak_p3_pct": round(float(bgl_sc[0]), 1) if np.isfinite(bgl_sc[0]) else np.nan,
+                "bg_leak_p4_pct": round(float(bgl_sc[1]), 1) if np.isfinite(bgl_sc[1]) else np.nan,
+                "bg_leak_p5_pct": round(float(bgl_sc[2]), 1) if np.isfinite(bgl_sc[2]) else np.nan,
+                "q_norm": round(float(q_norms_11[c]), 3),
+                "dot_gt": round(float(dot_gt_m), 3) if np.isfinite(dot_gt_m) else np.nan,
+                "gap_vs_bg": round(float(dot_gt_m - dot_bg_m), 3) if np.isfinite(dot_gt_m) else np.nan,
+                "gap_vs_other": round(float(dot_gt_m - dot_ot_m), 3) if np.isfinite(dot_gt_m) else np.nan,
+                "cos_q1_k": round(cos_q1_m, 3) if np.isfinite(cos_q1_m) else np.nan,
+                "cos_q2_k": round(cos_q2_m, 3) if np.isfinite(cos_q2_m) else np.nan,
+                "k_intra_std": round(k_std_m, 3) if np.isfinite(k_std_m) else np.nan,
                 "top_confused_slot": top_w_str,
             })
         if dices_valid:
             slot_summary["slot_mean_dice"] = round(float(np.mean(dices_valid)), 4)
+        if cos_q1_all and cos_q2_all:
+            slot_summary["cos_q1_vs_k_mean"] = round(float(np.mean(cos_q1_all)), 4)
+            slot_summary["cos_q2_vs_k_mean"] = round(float(np.mean(cos_q2_all)), 4)
 
         with open(os.path.join(out_dir, "slot_overfit_diagnostics.csv"), "w", newline="", encoding="utf-8") as f:
             w = csv.DictWriter(f, fieldnames=list(slot_summary.keys()))
@@ -1247,6 +1449,11 @@ def run_visdrone_component_validation(
         print(f"  FiLM |d_beta|  P3/P4/P5        : {slot_summary.get('film_beta_abs_p3', 0):.3f} / {slot_summary.get('film_beta_abs_p4', 0):.3f} / {slot_summary.get('film_beta_abs_p5', 0):.3f}")
         print(f"  FiLM Sat(>0.9) P3/P4/P5        : {slot_summary.get('film_sat_pct_p3', 0):.2f}% / {slot_summary.get('film_sat_pct_p4', 0):.2f}% / {slot_summary.get('film_sat_pct_p5', 0):.2f}%")
         print(f"  Weight Norms (proj/attn/mod)   : {slot_summary.get('wnorm_proj_in', 0):.2f} / {slot_summary.get('wnorm_slot_attn', 0):.2f} / {slot_summary.get('wnorm_modulators', 0):.2f}")
+        print(f"  ||q|| Norm (FG min/mean/max|BG): {slot_summary.get('q_norm_fg_min', 0):.2f} / {slot_summary.get('q_norm_fg_mean', 0):.2f} / {slot_summary.get('q_norm_fg_max', 0):.2f} | BG={slot_summary.get('q_norm_bg', 0):.2f}")
+        print(f"  Bottleneck Fisher P3 (N/P/K)   : {slot_summary.get('fisher_neck_p3', 0):.3f} / {slot_summary.get('fisher_proj_p3', 0):.3f} / {slot_summary.get('fisher_key_p3', 0):.3f}")
+        print(f"  Bottleneck Fisher P4 (N/P/K)   : {slot_summary.get('fisher_neck_p4', 0):.3f} / {slot_summary.get('fisher_proj_p4', 0):.3f} / {slot_summary.get('fisher_key_p4', 0):.3f}")
+        print(f"  Bottleneck Fisher P5 (N/P/K)   : {slot_summary.get('fisher_neck_p5', 0):.3f} / {slot_summary.get('fisher_proj_p5', 0):.3f} / {slot_summary.get('fisher_key_p5', 0):.3f}")
+        print(f"  T=1 vs T=2 Cos(q, k_gt) Mean   : {slot_summary.get('cos_q1_vs_k_mean', 0):+.3f} -> {slot_summary.get('cos_q2_vs_k_mean', 0):+.3f}")
     if box_diag:
         print("  --- Box Learning Mechanism Diagnostics ---")
         print(f"  Boundary Contrast (P3/P4/P5)   : {box_diag.get('boundary_contrast_p3', 0):.3f} / {box_diag.get('boundary_contrast_p4', 0):.3f} / {box_diag.get('boundary_contrast_p5', 0):.3f}")

@@ -395,12 +395,17 @@ class VisDroneYOLO11Slot(VisDroneYOLO11):
         max_det: int = 300,
         # Slot + FiLM (B+C) hyperparameters
         slot_dim: int = 32,
+        num_prototypes: int = 1,
         fusion_mode: str = "film",
         use_bg_slot_write: bool = False,
         use_logit_prior: bool = False,
         assigner_prior_weight: float = 0.0,
         use_slot_checkpoint: bool = False,
         slot_dropout: float = 0.1,
+        use_asa_gate: bool = False,
+        asa_gate_floor: float = 0.05,
+        presence_loss_weight: float = 0.5,
+        sparse_thresh: float = 0.0,
         slot_loss_weight: float = 0.3,
         bg_attn_weight: float = 0.5,
         fg_attn_weight: float = 0.5,
@@ -427,11 +432,15 @@ class VisDroneYOLO11Slot(VisDroneYOLO11):
             in_channels=(64, 128, 256),
             num_classes=num_classes,
             slot_dim=slot_dim,
+            num_prototypes=num_prototypes,
             fusion_mode=fusion_mode,
             use_bg_slot_write=use_bg_slot_write,
             use_logit_prior=use_logit_prior,
             use_checkpoint=use_slot_checkpoint,
             slot_dropout=slot_dropout,
+            use_asa_gate=use_asa_gate,
+            asa_gate_floor=asa_gate_floor,
+            sparse_thresh=sparse_thresh,
         )
         self.slot_criterion = SlotAuxiliaryLoss(
             num_classes=num_classes,
@@ -440,6 +449,7 @@ class VisDroneYOLO11Slot(VisDroneYOLO11):
             suppress_weight=suppress_weight,
             cls_attn_weight=cls_attn_weight,
             ortho_weight=ortho_weight,
+            presence_loss_weight=presence_loss_weight,
         )
 
     def _forward_head_with_slots(
@@ -522,6 +532,8 @@ class VisDroneYOLO11Slot(VisDroneYOLO11):
                 mask_gt=mask_gt,
                 img_size=img_size,
                 dots=slot_info.get("dots"),
+                slots_sub=slot_info.get("slots_sub"),
+                presence_logits=slot_info.get("presence_logits"),
             )
             loss_dict["loss"] = loss_dict["loss"] + self.slot_loss_weight * slot_losses["loss_slot"]
             loss_dict.update(slot_losses)

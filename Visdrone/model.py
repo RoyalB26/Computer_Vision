@@ -182,13 +182,26 @@ class PANetNeck(nn.Module):
 class SlotAttention(nn.Module):
     """Slot Attention module nhận chuỗi tokens đa quy mô N = N_p3 + N_p4 + N_p5.
     num_slots: num_class + 1 (10 class slots + 1 background slot).
+
+    Tích hợp:
+      - ASA Presence Gate: cộng log(presence_gate.detach()) vào FG logits để lớp vắng mặt không tranh xác suất.
+      - Sparse attn_norm: cắt đuôi xác suất nền nhỏ (< sparse_thresh) khi gom prototype FG.
+      - Slot Dropout: chống overfit trong FFN của slot.
     """
-    def __init__(self, dim: int = 32, num_class: int = 10, eps: float = 1e-8):
+    def __init__(
+        self,
+        dim: int = 32,
+        num_class: int = 10,
+        eps: float = 1e-8,
+        sparse_thresh: float = 0.05,
+        slot_dropout: float = 0.1,
+    ):
         super().__init__()
         self.dim = dim
         self.num_class = num_class
         num_slots: int = num_class + 1
         self.num_slots = num_slots
+        self.sparse_thresh = float(sparse_thresh)
         self.to_q = nn.Linear(dim, dim)
         self.to_k = nn.Linear(dim, dim)
         self.to_v = nn.Linear(dim, dim)
@@ -197,6 +210,7 @@ class SlotAttention(nn.Module):
         self.FC2 = nn.Linear(dim, dim)
         self.LN = nn.LayerNorm(dim)
         self.fc1 = nn.Linear(dim, dim)
+        self.dropout = nn.Dropout(slot_dropout)
         self.fc2 = nn.Linear(dim, dim)
         self.norm_input = nn.LayerNorm(dim)
         self.norm_slots = nn.LayerNorm(dim)
@@ -204,20 +218,43 @@ class SlotAttention(nn.Module):
         self.pool = nn.AdaptiveAvgPool1d(1)
         self.eps = eps
         self.scale = dim**-0.5
-    def forward(self, inputs: Tensor, slots: Optional[Tensor] = None) -> Tuple[Tensor, Tensor, Tensor]:
+
+    def forward(
+        self,
+        inputs: Tensor,
+        slots: Optional[Tensor] = None,
+        presence_gate: Optional[Tensor] = None,
+    ) -> Tuple[Tensor, Tensor, Tensor]:
         """inputs shape: (B, N, dim). N = 14400 (P3) + 3600 (P4) + 900 (P5) = 18900 tokens."""
         inputs = inputs + self.FC2(F.relu(self.FC1(self.LN(inputs))))
         inputs = self.norm_input(inputs)
         k, v = self.to_k(inputs), self.to_v(inputs)
         if slots is None:
             slots = self.obj_queries.expand(inputs.shape[0], -1, -1)
-        slots = self.norm_slots(slots)
-        q = self.to_q(slots)
-        dots = torch.einsum("bid,bjd->bij", q, k) * self.scale
-        attn_ori = dots.softmax(dim=1) + self.eps
-        attn_norm = attn_ori / attn_ori.sum(dim=-1, keepdim=True).clamp(min=self.eps)
-        slots = torch.einsum("bjd,bij->bid", v, attn_norm)
-        slots = slots + self.fc2(F.relu(self.fc1(self.norm_pre_ff(slots))))
+        slots_n = self.norm_slots(slots)
+        q = self.to_q(slots_n)
+
+        dots = torch.einsum("bid,bjd->bij", q.float(), k.float()) * self.scale
+
+        # [ASA Presence Gate] Detach gate khi cộng vào dots để pixel nền không kéo gate lớp active về 0
+        if presence_gate is not None:
+            gate_bias = torch.log(presence_gate.detach().float().clamp(min=1e-4)).unsqueeze(-1)  # (B, K, 1)
+            dots = torch.cat([dots[:, : self.num_class, :] + gate_bias, dots[:, self.num_class :, :]], dim=1)
+
+        attn_ori = dots.softmax(dim=1)
+
+        # [Sparse attn_norm] Cắt bỏ đuôi xác suất nền nhỏ trên các FG slot để không làm loãng prototype lớp hiếm
+        if self.sparse_thresh > 0.0:
+            fg_attn = attn_ori[:, : self.num_class, :]
+            bg_attn = attn_ori[:, self.num_class :, :]
+            fg_sparse = fg_attn * (fg_attn >= self.sparse_thresh).float()
+            attn_for_agg = torch.cat([fg_sparse, bg_attn], dim=1) + self.eps
+        else:
+            attn_for_agg = attn_ori + self.eps
+
+        attn_norm = attn_for_agg / attn_for_agg.sum(dim=-1, keepdim=True).clamp(min=self.eps)
+        slots = torch.einsum("bjd,bij->bid", v.float(), attn_norm).to(dtype=v.dtype)
+        slots = slots + self.fc2(self.dropout(F.relu(self.fc1(self.norm_pre_ff(slots)))))
         return slots, attn_ori, attn_norm
 @MODELS.register_module(name="VisDroneDetector", force=True)
 @MODELS.register_module(name="VisDroneSlotCounter", force=True)
@@ -236,11 +273,18 @@ class VisDroneDetector(BaseModel):
         pretrained: bool = True,
         exp_factor: float = 5.0,
         count_loss_weight: float = 1.0,
-        bg_attn_weight: float = 0.5,
-        fg_attn_weight: float = 0.5,
+        bg_attn_weight: float = 0.3,
+        fg_attn_weight: float = 0.7,
         suppress_weight: float = 0.05,
-        cls_attn_weight: float = 0.5,
+        cls_attn_weight: float = 0.8,
         ortho_weight: float = 0.1,
+        # Top-3 Slot Attention upgrades (ASA + MUFASA T=2 Implicit Diff + Sparse SA)
+        use_asa_gate: bool = True,
+        asa_gate_floor: float = 0.05,
+        presence_loss_weight: float = 0.5,
+        use_coarse_to_fine: bool = True,
+        sparse_thresh: float = 0.05,
+        slot_dropout: float = 0.1,
         **kwargs,
     ):
         super().__init__()
@@ -253,6 +297,12 @@ class VisDroneDetector(BaseModel):
         self.suppress_weight = float(suppress_weight)
         self.cls_attn_weight = float(cls_attn_weight)
         self.ortho_weight = float(ortho_weight)
+        self.use_asa_gate = bool(use_asa_gate)
+        self.asa_gate_floor = float(asa_gate_floor)
+        self.presence_loss_weight = float(presence_loss_weight)
+        self.use_coarse_to_fine = bool(use_coarse_to_fine)
+        self._last_presence_logits: Optional[torch.Tensor] = None
+        self._last_presence_gate: Optional[torch.Tensor] = None
         # 1. Backbone MobileNetV3 Small (Nano)
         try:
             weights = MobileNet_V3_Small_Weights.DEFAULT if pretrained else None
@@ -272,8 +322,23 @@ class VisDroneDetector(BaseModel):
         self.pos_emb = PositionEmbeddingSine(num_pos_feats=dim // 2)
         # Level Embeddings: giúp các slot nhận biết token đến từ tầng //8, //16 hay //32
         self.level_embed = nn.Parameter(torch.randn(3, dim) * 0.02)
-        # 4. Slot Attention Module
-        self.slot_attention = SlotAttention(dim=dim, num_class=num_classes)
+        # 3b. [ASA Presence Gate] GAP + GMP trên cả P3, P4, P5 (6 * dim) để không mất tín hiệu vật thể nhỏ
+        if self.use_asa_gate:
+            self.presence_head = nn.Sequential(
+                nn.Linear(6 * dim, dim * 2),
+                nn.SiLU(inplace=True),
+                nn.Dropout(slot_dropout),
+                nn.Linear(dim * 2, num_classes),
+            )
+        else:
+            self.presence_head = None
+        # 4. Slot Attention Module (hỗ trợ ASA gate + Sparse attn_norm + Slot Dropout)
+        self.slot_attention = SlotAttention(
+            dim=dim,
+            num_class=num_classes,
+            sparse_thresh=sparse_thresh,
+            slot_dropout=slot_dropout,
+        )
         # 5. fc_actor: nhận [slot_vector (dim), mass_p3, mass_p4, mass_p5] -> dự đoán số lượng (không âm)
         self.fc_actor = nn.ModuleList([
             nn.Sequential(
@@ -285,9 +350,26 @@ class VisDroneDetector(BaseModel):
             for _ in range(num_classes)
         ])
     def extract_features(self, x: torch.Tensor) -> Tuple[torch.Tensor, Tuple[Tuple[int, int], Tuple[int, int], Tuple[int, int]]]:
-        """Trích xuất P3, P4, P5 qua PANet Neck, cộng 2D Positional Encoding và Level Embeddings."""
+        """Trích xuất P3, P4, P5 qua PANet Neck, tính ASA Presence Gate (GAP+GMP), cộng PosEmb & LevelEmbed."""
         feats = self.backbone(x)
         feat_p3, feat_p4, feat_p5 = self.neck(feats["p3"], feats["p4"], feats["p5"])
+
+        # [ASA Presence Gate] GAP + GMP trên cả P3, P4, P5 để giữ nguyên đỉnh kích hoạt của vật thể nhỏ
+        if self.presence_head is not None:
+            pooled = torch.cat([
+                feat_p3.mean(dim=(2, 3)), feat_p3.amax(dim=(2, 3)),
+                feat_p4.mean(dim=(2, 3)), feat_p4.amax(dim=(2, 3)),
+                feat_p5.mean(dim=(2, 3)), feat_p5.amax(dim=(2, 3)),
+            ], dim=-1)  # (B, 6 * dim)
+            pres_logits = self.presence_head(pooled)
+            floor = self.asa_gate_floor
+            pres_gate = floor + (1.0 - floor) * torch.sigmoid(pres_logits)
+            self._last_presence_logits = pres_logits
+            self._last_presence_gate = pres_gate
+        else:
+            self._last_presence_logits = None
+            self._last_presence_gate = None
+
         # Cộng 2D Positional Encoding (x, y) để mạng biết vị trí địa lý của từng token
         feat_p3 = feat_p3 + self.pos_emb(feat_p3)
         feat_p4 = feat_p4 + self.pos_emb(feat_p4)
@@ -302,10 +384,22 @@ class VisDroneDetector(BaseModel):
         # Ghép nối thành chuỗi 18,900 tokens
         inputs = torch.cat([p3, p4, p5], dim=1)  # (B, 18900, dim)
         return inputs, (res_p3, res_p4, res_p5)
+
     def extract_slots(self, inputs_img: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, Tuple[Tuple[int, int], Tuple[int, int], Tuple[int, int]]]:
-        """Chạy qua Backbone, Positional Encoding và Slot Attention để lấy slots và attention matrix."""
+        """Chạy Backbone + PANet + ASA Presence Gate + MUFASA Coarse-to-Fine (T=2, 1-step Implicit Diff)."""
         tokens, resolutions = self.extract_features(inputs_img)
-        slots, attn_ori, _ = self.slot_attention(tokens)
+        pres_gate = self._last_presence_gate
+
+        if self.use_coarse_to_fine:
+            # [MUFASA T=2 + 1-Step Implicit Diff]
+            # Bước 1 (Coarse): gom prototype lớp từ P4 + P5 (4,500 tokens giàu ngữ nghĩa)
+            n3 = resolutions[0][0] * resolutions[0][1]
+            tokens_coarse = tokens[:, n3:, :]
+            slots_coarse, _, _ = self.slot_attention(tokens_coarse, slots=None, presence_gate=pres_gate)
+            # Detach bước 1 để chỉ backprop qua bước 2 (tiết kiệm VRAM & ổn định gradient)
+            slots, attn_ori, _ = self.slot_attention(tokens, slots=slots_coarse.detach(), presence_gate=pres_gate)
+        else:
+            slots, attn_ori, _ = self.slot_attention(tokens, slots=None, presence_gate=pres_gate)
         return slots, attn_ori, resolutions
     def get_spatial_attention_maps(
         self,
@@ -618,12 +712,14 @@ class VisDroneDetector(BaseModel):
         n4 = H4 * W4
 
         def _balanced_multiscale_bce(pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
-            """Tính BCE riêng cho P3, P4, P5 rồi lấy trung bình 3 tầng"""
-            p = pred.clamp(1e-6, 1.0 - 1e-6)
-            l_p3 = F.binary_cross_entropy(p[..., :n3], target[..., :n3])
-            l_p4 = F.binary_cross_entropy(p[..., n3:n3 + n4], target[..., n3:n3 + n4])
-            l_p5 = F.binary_cross_entropy(p[..., n3 + n4:], target[..., n3 + n4:])
-            return (l_p3 + l_p4 + l_p5) / 3.0
+            """Tính BCE riêng cho P3, P4, P5 rồi lấy trung bình 3 tầng (chạy float32 an toàn với AMP)."""
+            with torch.amp.autocast(device_type=pred.device.type, enabled=False):
+                p = pred.float().clamp(1e-6, 1.0 - 1e-6)
+                t = target.float()
+                l_p3 = F.binary_cross_entropy(p[..., :n3], t[..., :n3])
+                l_p4 = F.binary_cross_entropy(p[..., n3:n3 + n4], t[..., n3:n3 + n4])
+                l_p5 = F.binary_cross_entropy(p[..., n3 + n4:], t[..., n3 + n4:])
+                return (l_p3 + l_p4 + l_p5) / 3.0
 
         # 1. Count regression loss (Smooth L1)
         loss_count = F.smooth_l1_loss(pred_counts, gt_counts, beta=1.0)
@@ -682,9 +778,13 @@ class VisDroneDetector(BaseModel):
                 dice = 1.0 - (2.0 * inter + 1.0) / (card + 1.0)
                 loss_dice = dice[active_mask].mean()
 
-                pos_pixels = (cls_mask > 0.5) & active_mask.unsqueeze(-1)
-                if pos_pixels.any():
-                    loss_pos = -torch.log(p_cls[pos_pixels]).mean()
+                # Class-balanced Positive CE: trung bình theo từng lớp active để lớp hiếm không bị car áp đảo
+                pos_m = (cls_mask > 0.5).float()
+                pos_cnt = pos_m.sum(dim=-1)
+                valid_pos_cls = active_mask & (pos_cnt > 0)
+                if valid_pos_cls.any():
+                    per_cls_pos_ce = (-torch.log(p_cls) * pos_m).sum(dim=-1) / pos_cnt.clamp(min=1.0)
+                    loss_pos = per_cls_pos_ce[valid_pos_cls].mean()
                 else:
                     loss_pos = torch.tensor(0.0, device=inputs.device)
 
@@ -715,6 +815,13 @@ class VisDroneDetector(BaseModel):
         else:
             loss_ortho = torch.tensor(0.0, device=inputs.device)
 
+        # 8. ASA Presence Gate BCE Loss (giám sát trực tiếp lớp có mặt/vắng mặt trong ảnh)
+        if self.presence_loss_weight > 0 and self._last_presence_logits is not None:
+            active_gt_f = (gt_counts > 0).float()
+            loss_presence = F.binary_cross_entropy_with_logits(self._last_presence_logits.float(), active_gt_f)
+        else:
+            loss_presence = torch.tensor(0.0, device=inputs.device)
+
         # Tổng hợp loss
         total_loss = (
             self.count_loss_weight * loss_count
@@ -723,6 +830,7 @@ class VisDroneDetector(BaseModel):
             + self.suppress_weight * loss_suppress
             + self.cls_attn_weight * loss_cls_attn
             + self.ortho_weight * loss_ortho
+            + self.presence_loss_weight * loss_presence
         )
         return {
             "loss": total_loss,
@@ -732,6 +840,7 @@ class VisDroneDetector(BaseModel):
             "loss_suppress": loss_suppress,
             "loss_cls_attn": loss_cls_attn,
             "loss_ortho": loss_ortho,
+            "loss_presence": loss_presence,
         }
     def forward_train(
         self,
