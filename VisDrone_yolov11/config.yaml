@@ -74,6 +74,8 @@ data:
       num_classes: 10
       include_boxes: true
       augment: true
+      mosaic_prob: 0.65            # 4-image Mosaic augmentation (disabled in final 15 epochs via CloseMosaicHook)
+      mosaic_rare_prob: 0.85       # 85% of Mosaic samples inject 1-2 object-centered rare-class crops (< 45% freq)
       pipeline:
         - type: "Resize"
           size: [960, 960]
@@ -126,6 +128,8 @@ train_cfg:
   log_interval: 50000
 # 7. Lifecycle Hooks
 hooks:
+  - type: "CloseMosaicHook"
+    close_epochs: 15
   - type: "CheckpointHook"
     interval: 5
     save_best: "mAP_50"

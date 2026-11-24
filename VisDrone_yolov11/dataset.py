@@ -79,6 +79,8 @@ class VisDroneLMDBDataset(BaseDataset):
         self.mosaic_rare_prob = float(mosaic_rare_prob) if self.mosaic_prob > 0.0 else 0.0
         self.mosaic_rare_classes = list(mosaic_rare_classes) if mosaic_rare_classes is not None else None
         self._rare_class_pools: Dict[int, List[int]] = {}
+        self._rare_class_weights: List[float] = []
+        self._rare_class_ids: List[int] = []
         self.env = None
         self.txn = None
         self.bg_env = None
@@ -557,14 +559,17 @@ class VisDroneLMDBDataset(BaseDataset):
         if self.mosaic_rare_classes is not None:
             rare_ids = [c for c in self.mosaic_rare_classes if 0 <= c < self.num_classes and len(cls_pools[c]) > 0]
         else:
-            # Auto-detect rare classes appearing in < 35% of images (fallback to 3 rarest non-empty classes)
+            # Auto-detect rare classes appearing in < 45% of images (captures bicycle, tricycle, awning-tricycle, bus)
             non_empty = [(c, len(cls_pools[c])) for c in range(self.num_classes) if len(cls_pools[c]) > 0]
-            rare_ids = [c for c, cnt in non_empty if (cnt / max(n, 1)) < 0.35]
+            rare_ids = [c for c, cnt in non_empty if (cnt / max(n, 1)) < 0.45]
             if not rare_ids and non_empty:
                 non_empty.sort(key=lambda x: x[1])
                 rare_ids = [c for c, _ in non_empty[:3]]
 
         self._rare_class_pools = {c: cls_pools[c] for c in rare_ids}
+        self._rare_class_ids = list(rare_ids)
+        # Inverse-frequency sampling weights so the rarest class (awning-tricycle) is picked more often than bus/bicycle
+        self._rare_class_weights = [1.0 / max(len(cls_pools[c]), 1) for c in rare_ids]
         if self._rare_class_pools:
             summary = ", ".join(
                 f"{VISDRONE_CLASSES[c] if c < len(VISDRONE_CLASSES) else c}({len(idxs)})"
@@ -577,15 +582,25 @@ class VisDroneLMDBDataset(BaseDataset):
 
         Aligns 4 images at a random split point (xc, yc) in [0.25, 0.75] of (W, H) without shrinking
         objects, clamps each quadrant's boxes strictly inside its quadrant, and filters sliver boxes.
-        When `mosaic_rare_prob > 0`, 1 of the 3 extra images is preferentially sampled from a rare class.
+        When `mosaic_rare_prob > 0`, 1-2 extra quadrants are sampled from rare classes using
+        inverse-frequency weighting AND object-centered cropping so the rare object is guaranteed
+        to land inside the mosaic canvas (~100% retention vs ~25% with blind corner crops).
         """
         n_total = len(self.data_infos)
-        if self.mosaic_rare_prob > 0.0 and self._rare_class_pools and random.random() < self.mosaic_rare_prob:
-            rare_cls = random.choice(list(self._rare_class_pools.keys()))
-            rare_idx = random.choice(self._rare_class_pools[rare_cls])
-            extra = [rare_idx, random.randint(0, n_total - 1), random.randint(0, n_total - 1)]
-            random.shuffle(extra)
-            indices = [idx] + extra
+        # Track target rare class per quadrant (None = standard corner crop, int = center crop on that class)
+        quad_rare_cls: List[Optional[int]] = [None, None, None, None]
+        if self.mosaic_rare_prob > 0.0 and self._rare_class_ids and random.random() < self.mosaic_rare_prob:
+            # Inject 1 rare quadrant (or 2 with prob 0.5) for strong rare-class boost
+            num_rare_inject = 2 if (random.random() < 0.5) else 1
+            chosen_rare_classes = random.choices(self._rare_class_ids, weights=self._rare_class_weights, k=num_rare_inject)
+            extra_pairs: List[Tuple[int, Optional[int]]] = [
+                (random.choice(self._rare_class_pools[rc]), rc) for rc in chosen_rare_classes
+            ]
+            while len(extra_pairs) < 3:
+                extra_pairs.append((random.randint(0, n_total - 1), None))
+            random.shuffle(extra_pairs)
+            indices = [idx] + [p[0] for p in extra_pairs]
+            quad_rare_cls = [None] + [p[1] for p in extra_pairs]
         else:
             indices = [idx] + [random.randint(0, n_total - 1) for _ in range(3)]
         samples = [self._load_raw_tensor_sample(i) for i in indices]
@@ -599,27 +614,47 @@ class VisDroneLMDBDataset(BaseDataset):
         all_boxes: List[torch.Tensor] = []
         all_labels: List[torch.Tensor] = []
 
-        # (src_y1, src_y2, src_x1, src_x2, dst_y1, dst_y2, dst_x1, dst_x2, dx, dy)
+        # Default corner crops: (src_y1, src_y2, src_x1, src_x2, dst_y1, dst_y2, dst_x1, dst_x2)
         quads = [
-            (h - yc, h, w - xc, w, 0, yc, 0, xc, xc - w, yc - h),       # Top-Left
-            (h - yc, h, 0, w - xc, 0, yc, xc, w, xc, yc - h),           # Top-Right
-            (0, h - yc, w - xc, w, yc, h, 0, xc, xc - w, yc),           # Bottom-Left
-            (0, h - yc, 0, w - xc, yc, h, xc, w, xc, yc),               # Bottom-Right
+            (h - yc, h, w - xc, w, 0, yc, 0, xc),       # Top-Left
+            (h - yc, h, 0, w - xc, 0, yc, xc, w),       # Top-Right
+            (0, h - yc, w - xc, w, yc, h, 0, xc),       # Bottom-Left
+            (0, h - yc, 0, w - xc, yc, h, xc, w),       # Bottom-Right
         ]
 
-        for (img_q, t_q), (sy1, sy2, sx1, sx2, dy1, dy2, dx1, dx2, dx, dy) in zip(samples, quads):
+        for (img_q, t_q), (sy1, sy2, sx1, sx2, dy1, dy2, dx1, dx2), target_rc in zip(samples, quads, quad_rare_cls):
             if img_q is None:
                 continue
             # Ensure matching spatial size if loaded from non-RAM path
             if img_q.shape[1] != h or img_q.shape[2] != w:
                 img_q = F.interpolate(img_q.unsqueeze(0), size=(h, w), mode="bilinear", align_corners=False).squeeze(0)
-            canvas[:, dy1:dy2, dx1:dx2] = img_q[:, sy1:sy2, sx1:sx2]
 
             boxes_q = t_q.get("boxes", torch.empty((0, 4), dtype=torch.float32))
             labels_q = t_q.get("labels", torch.empty((0,), dtype=torch.int64))
+
+            # [Object-Centered Rare Crop] Shift source window (qh, qw) around a target rare box with jitter
+            if target_rc is not None and len(boxes_q) > 0:
+                rc_mask = labels_q == target_rc
+                if rc_mask.any():
+                    rc_indices = torch.nonzero(rc_mask, as_tuple=False).squeeze(-1)
+                    pick = int(rc_indices[random.randint(0, len(rc_indices) - 1)].item())
+                    rc_cx = float(boxes_q[pick, 0].item()) * w
+                    rc_cy = float(boxes_q[pick, 1].item()) * h
+                    qh, qw = dy2 - dy1, dx2 - dx1
+                    jx = random.uniform(-0.25, 0.25) * qw
+                    jy = random.uniform(-0.25, 0.25) * qh
+                    sx1 = max(0, min(w - qw, int(round(rc_cx - 0.5 * qw + jx))))
+                    sy1 = max(0, min(h - qh, int(round(rc_cy - 0.5 * qh + jy))))
+                    sx2 = sx1 + qw
+                    sy2 = sy1 + qh
+
+            canvas[:, dy1:dy2, dx1:dx2] = img_q[:, sy1:sy2, sx1:sx2]
+
             if len(boxes_q) == 0:
                 continue
 
+            dx = dx1 - sx1
+            dy = dy1 - sy1
             cx = boxes_q[:, 0] * w
             cy = boxes_q[:, 1] * h
             bw = boxes_q[:, 2] * w
