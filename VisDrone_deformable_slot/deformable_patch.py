@@ -51,13 +51,20 @@ class MicroPatchEncoder(nn.Module):
             nn.SiLU(inplace=True),
         )
 
-    def forward(self, patches: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        patches: torch.Tensor,
+        return_spatial: bool = False,
+    ):
         x = self.stem(patches)
         x = self.block1(x)
         x = self.block2(x)
         gap = x.mean(dim=(2, 3))
         gmp = x.amax(dim=(2, 3))
-        return self.head(torch.cat([gap, gmp], dim=-1))
+        emb = self.head(torch.cat([gap, gmp], dim=-1))
+        if return_spatial:
+            return emb, x
+        return emb
 
 
 class DeformableHighResPatchInjector(nn.Module):
@@ -74,6 +81,10 @@ class DeformableHighResPatchInjector(nn.Module):
         class_focus_weights: Optional[List[float]] = None,
         spread_local_3x3: bool = True,
         patch_dropout: float = 0.1,
+        use_uncertainty_routing: bool = False,
+        uncertainty_floor: float = 0.2,
+        use_sparse_subhead: bool = False,
+        reg_max: int = 16,
     ):
         super().__init__()
         self.p3_channels = int(p3_channels)
@@ -83,6 +94,11 @@ class DeformableHighResPatchInjector(nn.Module):
         self.base_patch_radius = float(base_patch_radius)
         self.max_offset_cells = float(max_offset_cells)
         self.spread_local_3x3 = bool(spread_local_3x3)
+        self.use_uncertainty_routing = bool(use_uncertainty_routing)
+        self.uncertainty_floor = float(uncertainty_floor)
+        self.use_sparse_subhead = bool(use_sparse_subhead)
+        self.reg_max = int(reg_max)
+        self.sub_grid_size = max(1, self.patch_size // 8)
 
         if class_focus_weights is None:
             # Default: emphasize tiny & rare VisDrone classes (ped, people, bicycle, tricycle, awning-tri, moto)
@@ -132,6 +148,38 @@ class DeformableHighResPatchInjector(nn.Module):
         base_grid = torch.stack([gx, gy], dim=-1).view(1, 1, self.patch_size, self.patch_size, 2)  # (1, 1, P, P, 2)
         self.register_buffer("base_grid", base_grid, persistent=False)
 
+        # Optional 4x4 Sparse High-Res Sub-Head directly on MicroPatchEncoder's spatial map
+        if self.use_sparse_subhead:
+            g = self.sub_grid_size
+            gn_groups = min(8, p3_channels)
+            # Cell centers in patch-local [-1, 1] coordinates (row-major gy, gx matching flatten(2))
+            u = ((torch.arange(g, dtype=torch.float32) + 0.5) / float(g)) * 2.0 - 1.0
+            sgy, sgx = torch.meshgrid(u, u, indexing="ij")
+            sub_grid_uv = torch.stack([sgx, sgy], dim=-1).view(1, 1, g * g, 2)  # (1, 1, G*G, 2)
+            self.register_buffer("sub_grid_uv", sub_grid_uv, persistent=False)
+
+            # Global P3 + Slot-FiLM context injection into each patch's 4x4 map
+            self.sub_box_ctx = nn.Linear(p3_channels, p3_channels)
+            self.sub_cls_ctx = nn.Linear(p3_channels, p3_channels)
+
+            self.sub_box_refine = nn.Sequential(
+                nn.Conv2d(p3_channels, p3_channels, kernel_size=3, padding=1, groups=p3_channels, bias=False),
+                nn.Conv2d(p3_channels, p3_channels, kernel_size=1, bias=False),
+                nn.GroupNorm(gn_groups, p3_channels),
+                nn.SiLU(inplace=True),
+            )
+            self.sub_cls_refine = nn.Sequential(
+                nn.Conv2d(p3_channels, p3_channels, kernel_size=3, padding=1, groups=p3_channels, bias=False),
+                nn.Conv2d(p3_channels, p3_channels, kernel_size=1, bias=False),
+                nn.GroupNorm(gn_groups, p3_channels),
+                nn.SiLU(inplace=True),
+            )
+            self.sub_cv2 = nn.Conv2d(p3_channels, 4 * self.reg_max, kernel_size=1)
+            self.sub_cv3 = nn.Conv2d(p3_channels, num_classes, kernel_size=1)
+            # YOLOv11-aligned bias init: DFL ~ 1.0, cls prior ~ 0.01 (prevents Epoch-1 focal spike)
+            nn.init.constant_(self.sub_cv2.bias, 1.0)
+            nn.init.constant_(self.sub_cv3.bias, -4.5)
+
     def _select_topk_locations(
         self,
         attn_ori: torch.Tensor,
@@ -150,9 +198,20 @@ class DeformableHighResPatchInjector(nn.Module):
         k_eff = min(self.num_patches, n3)
 
         attn_p3 = attn_ori[:, :, :n3].view(bs, self.num_classes + 1, h3, w3).float()
+        cls_p3 = attn_p3[:, : self.num_classes, :, :]  # (B, C, H3, W3)
         fg_sal = (1.0 - attn_p3[:, -1, :, :]).clamp(0.0, 1.0)  # (B, H3, W3)
-        weighted_cls = (attn_p3[:, : self.num_classes, :, :] * self.class_weights).sum(dim=1)  # (B, H3, W3)
+        weighted_cls = (cls_p3 * self.class_weights).sum(dim=1)  # (B, H3, W3)
         priority = fg_sal * (0.25 + weighted_cls)  # (B, H3, W3)
+
+        if self.use_uncertainty_routing:
+            # Uncertainty-Guided Routing: de-prioritize already crystal-clear P3 objects
+            # and focus high-res patches on FG/BG boundary ambiguity & inter-class confusion.
+            u_fg = (4.0 * fg_sal * (1.0 - fg_sal)).clamp(0.0, 1.0)
+            q_cls = cls_p3 / (fg_sal.unsqueeze(1) + 1e-6)
+            u_cls = (1.0 - q_cls.amax(dim=1)).clamp(0.0, 1.0)
+            uncertainty = torch.maximum(u_fg, fg_sal * u_cls)
+            fl = self.uncertainty_floor
+            priority = priority * (fl + (1.0 - fl) * uncertainty)
 
         # CenterNet-style 3x3 Local-Peak NMS: prevents Top-K from dumping 6-10 redundant patches
         # onto the same bright object; spreads the K budget cleanly across distinct small/rare objects.
@@ -245,8 +304,13 @@ class DeformableHighResPatchInjector(nn.Module):
                 .view(bs * k_eff, 3, self.patch_size, self.patch_size)
             )  # (B*K, 3, P, P)
 
-            # 4. Encode micro-patches -> (B, K, C3)
-            patch_emb = self.drop(self.patch_encoder(patches).view(bs, k_eff, c3))
+            # 4. Encode micro-patches -> (B, K, C3) (+ optional 4x4 spatial feature map)
+            if self.use_sparse_subhead:
+                raw_emb, spatial_feat = self.patch_encoder(patches, return_spatial=True)
+            else:
+                raw_emb = self.patch_encoder(patches, return_spatial=False)
+                spatial_feat = None
+            patch_emb = self.drop(raw_emb.view(bs, k_eff, c3))
             gate = top_scores.unsqueeze(-1)  # (B, K, 1)
 
             delta_box = (self.box_proj(patch_emb) * gate).transpose(1, 2)  # (B, C3, K)
@@ -267,13 +331,58 @@ class DeformableHighResPatchInjector(nn.Module):
             p3_box_out = (p3_box_f + map_box).to(dtype=orig_dtype)
             p3_cls_out = (p3_cls_f + map_cls).to(dtype=orig_dtype)
 
+            # 6. Optional 4x4 Sparse High-Res Sub-Head directly on each patch's spatial map
+            sub_out: Dict[str, Any] = {}
+            if self.use_sparse_subhead and spatial_feat is not None:
+                g = int(spatial_feat.shape[-1])
+                gg = g * g
+                p3_cls_flat = p3_cls_f.flatten(2)  # (B, C3, N3)
+                p3_cls_sel = torch.gather(p3_cls_flat, dim=2, index=gather_idx).transpose(1, 2)  # (B, K, C3)
+
+                ctx_box = self.sub_box_ctx(p3_sel).reshape(bs * k_eff, c3, 1, 1)
+                ctx_cls = self.sub_cls_ctx(p3_cls_sel).reshape(bs * k_eff, c3, 1, 1)
+
+                sub_box_feat = self.sub_box_refine(spatial_feat + ctx_box)
+                sub_cls_feat = self.sub_cls_refine(spatial_feat + ctx_cls)
+
+                sub_boxes_raw = (
+                    self.sub_cv2(sub_box_feat)
+                    .view(bs, k_eff, 4 * self.reg_max, gg)
+                    .permute(0, 2, 1, 3)
+                    .reshape(bs, 4 * self.reg_max, k_eff * gg)
+                )  # (B, 4*reg_max, K*G*G)
+                sub_scores_raw = (
+                    self.sub_cv3(sub_cls_feat)
+                    .view(bs, k_eff, self.num_classes, gg)
+                    .permute(0, 2, 1, 3)
+                    .reshape(bs, self.num_classes, k_eff * gg)
+                )  # (B, num_classes, K*G*G)
+
+                # Sub-anchor centers in [-1, 1] and patch radii in [-1, 1] (aligned with K*G*G order)
+                sub_anchors_norm = (
+                    centers_xy[:, :, None, :] + self.sub_grid_uv * radii_xy[:, :, None, :]
+                ).clamp(-1.0, 1.0).reshape(bs, k_eff * gg, 2)  # (B, K*G*G, 2)
+                sub_radii_norm = (
+                    radii_xy[:, :, None, :].expand(-1, -1, gg, -1).reshape(bs, k_eff * gg, 2)
+                )  # (B, K*G*G, 2)
+
+                sub_out = {
+                    "sub_boxes_raw": sub_boxes_raw.to(dtype=orig_dtype),
+                    "sub_scores_raw": sub_scores_raw.to(dtype=orig_dtype),
+                    "sub_anchors_norm": sub_anchors_norm,
+                    "sub_radii_norm": sub_radii_norm,
+                    "sub_grid_size": g,
+                }
+
         patch_info = {
             "ref_xy": ref_xy,
             "centers_xy": centers_xy,
             "radii_xy": radii_xy,
             "top_scores": top_scores,
+            "top_idx": top_idx,
             "num_patches": k_eff,
             "grid_hw": (h3, w3),
+            **sub_out,
         }
         return p3_box_out, p3_cls_out, patch_info
 

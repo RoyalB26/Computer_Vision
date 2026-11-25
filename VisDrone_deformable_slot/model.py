@@ -52,6 +52,9 @@ class VisDroneYOLO11DeformableSlot(VisDroneYOLO11Slot):
         spread_local_3x3: bool = True,
         patch_dropout: float = 0.1,
         patch_loss_weight: float = 0.2,
+        use_uncertainty_routing: bool = False,
+        uncertainty_floor: float = 0.2,
+        use_sparse_subhead: bool = False,
         # Slot + FiLM hyperparameters (forwarded to VisDroneYOLO11Slot)
         slot_dim: int = 64,
         num_prototypes: Union[int, List[int], Tuple[int, ...]] = (2, 2, 2, 1, 2, 3, 3, 3, 2, 2),
@@ -131,6 +134,7 @@ class VisDroneYOLO11DeformableSlot(VisDroneYOLO11Slot):
         self.backbone_size = int(backbone_size)
         self.use_deformable_patch = bool(use_deformable_patch)
         self.patch_loss_weight = float(patch_loss_weight)
+        self.use_sparse_subhead = bool(use_sparse_subhead)
 
         if self.use_deformable_patch:
             self.patch_injector = DeformableHighResPatchInjector(
@@ -143,6 +147,10 @@ class VisDroneYOLO11DeformableSlot(VisDroneYOLO11Slot):
                 class_focus_weights=class_focus_weights,
                 spread_local_3x3=spread_local_3x3,
                 patch_dropout=patch_dropout,
+                use_uncertainty_routing=use_uncertainty_routing,
+                uncertainty_floor=uncertainty_floor,
+                use_sparse_subhead=use_sparse_subhead,
+                reg_max=int(self.net.head.reg_max),
             )
         else:
             self.patch_injector = None
@@ -198,7 +206,61 @@ class VisDroneYOLO11DeformableSlot(VisDroneYOLO11Slot):
         if slot_info["logit_prior"] is not None:
             scores_raw = scores_raw + slot_info["logit_prior"]
 
+        # Append 4x4 Sparse High-Res Sub-Head predictions (K*16 sub-anchors) when enabled
+        p_info = slot_info.get("patch_info")
+        if p_info is not None and "sub_boxes_raw" in p_info:
+            boxes_raw = torch.cat([boxes_raw, p_info["sub_boxes_raw"]], dim=-1)
+            scores_raw = torch.cat([scores_raw, p_info["sub_scores_raw"]], dim=-1)
+
         return box_feats, boxes_raw, scores_raw, slot_info, lr_size
+
+    def _build_anchors_and_decode(
+        self,
+        feats: List[torch.Tensor],
+        boxes_raw: torch.Tensor,
+        slot_info: Dict[str, Any],
+        lr_size: Tuple[int, int],
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Build anchor points & strides (P3/P4/P5 + optional 4x4 sparse sub-anchors) and decode xyxy boxes."""
+        device = boxes_raw.device
+        bs = boxes_raw.shape[0]
+        a_raw, s_raw = make_anchors(feats, self.net.head.stride, 0.5)
+        anchors_p = (a_raw * s_raw).to(device)  # [N_p345, 2] in lr_size pixel coords
+        strides_p = s_raw.to(device)            # [N_p345, 1]
+
+        p_info = slot_info.get("patch_info")
+        if p_info is not None and "sub_anchors_norm" in p_info:
+            lr_h, lr_w = float(lr_size[0]), float(lr_size[1])
+            g = float(p_info["sub_grid_size"])
+            sub_norm = p_info["sub_anchors_norm"].to(device)  # [B, N_sub, 2] in [-1, 1]
+            sub_anchors_px = torch.stack(
+                [
+                    (sub_norm[..., 0] + 1.0) * 0.5 * lr_w,
+                    (sub_norm[..., 1] + 1.0) * 0.5 * lr_h,
+                ],
+                dim=-1,
+            )  # [B, N_sub, 2]
+            sub_radii = p_info["sub_radii_norm"].to(device)   # [B, N_sub, 2]
+            stride_x = sub_radii[..., 0] * lr_w / g
+            stride_y = sub_radii[..., 1] * lr_h / g
+            sub_strides = (0.5 * (stride_x + stride_y)).clamp(min=1.0).unsqueeze(-1)  # [B, N_sub, 1]
+
+            anchor_points_pixel = torch.cat(
+                [anchors_p.unsqueeze(0).expand(bs, -1, -1), sub_anchors_px], dim=1
+            )  # [B, N_total, 2]
+            stride_tensor = torch.cat(
+                [strides_p.unsqueeze(0).expand(bs, -1, -1), sub_strides], dim=1
+            )  # [B, N_total, 1]
+        else:
+            anchor_points_pixel = anchors_p  # [N_p345, 2]
+            stride_tensor = strides_p        # [N_p345, 1]
+
+        pred_dist = self.net.head.dfl(boxes_raw).transpose(1, 2)  # [B, N_total, 4] (l, t, r, b in stride units)
+        ap = anchor_points_pixel if anchor_points_pixel.dim() == 3 else anchor_points_pixel.unsqueeze(0)
+        st = stride_tensor if stride_tensor.dim() == 3 else stride_tensor.unsqueeze(0)
+        lt, rb = pred_dist.chunk(2, dim=-1)
+        decoded_xyxy = torch.cat([ap - lt * st, ap + rb * st], dim=-1)  # [B, N_total, 4]
+        return decoded_xyxy, anchor_points_pixel, stride_tensor
 
     def forward_train(
         self,
@@ -210,19 +272,22 @@ class VisDroneYOLO11DeformableSlot(VisDroneYOLO11Slot):
         feats, boxes_raw, scores_raw, slot_info, lr_size = self._forward_head_with_slots(inputs)
         preds = {"boxes": boxes_raw, "scores": scores_raw, "feats": feats}
         if self.assigner_prior_weight > 0 and "dots" in slot_info:
-            preds["assign_scores"] = (
-                scores_raw + self.assigner_prior_weight * slot_info["dots"][:, : self.num_classes, :].detach()
-            )
+            dots_cls = slot_info["dots"][:, : self.num_classes, :].detach()
+            p_info = slot_info.get("patch_info")
+            if p_info is not None and "sub_scores_raw" in p_info and scores_raw.shape[-1] > dots_cls.shape[-1]:
+                h3, w3 = p_info["grid_hw"]
+                n3 = h3 * w3
+                g = int(p_info["sub_grid_size"])
+                top_idx = p_info["top_idx"]  # (B, K)
+                dots_p3 = dots_cls[:, :, :n3]  # (B, C, N3)
+                idx_exp = top_idx.unsqueeze(1).expand(-1, self.num_classes, -1)  # (B, C, K)
+                dots_sub = torch.gather(dots_p3, dim=2, index=idx_exp).repeat_interleave(g * g, dim=-1)
+                dots_cls = torch.cat([dots_cls, dots_sub], dim=-1)
+            preds["assign_scores"] = scores_raw + self.assigner_prior_weight * dots_cls
 
-        a_raw, s_raw = make_anchors(feats, self.net.head.stride, 0.5)
-        anchors, strides = (a.transpose(0, 1).to(inputs.device) for a in (a_raw, s_raw))
-
-        pred_dist = self.net.head.dfl(boxes_raw)
-        decoded_xyxy = dist2bbox(pred_dist, anchors.unsqueeze(0), xywh=False, dim=1) * strides
-        decoded_xyxy = decoded_xyxy.transpose(1, 2)
-
-        anchor_points_pixel = (anchors * strides).transpose(0, 1)
-        stride_tensor = strides.transpose(0, 1)
+        decoded_xyxy, anchor_points_pixel, stride_tensor = self._build_anchors_and_decode(
+            feats, boxes_raw, slot_info, lr_size
+        )
 
         # Targets are normalized [0, 1] cxcywh -> scaled cleanly to `lr_size` matching `feats` & `strides`
         loss_dict = self.criterion(
@@ -286,14 +351,11 @@ class VisDroneYOLO11DeformableSlot(VisDroneYOLO11Slot):
 
         with torch.no_grad():
             bs, _, in_h, in_w = inputs.shape
-            feats, boxes_raw, scores_raw, _, (lr_h, lr_w) = self._forward_head_with_slots(inputs)
+            feats, boxes_raw, scores_raw, slot_info, (lr_h, lr_w) = self._forward_head_with_slots(inputs)
 
-            a_raw, s_raw = make_anchors(feats, self.net.head.stride, 0.5)
-            anchors, strides = (a.transpose(0, 1).to(inputs.device) for a in (a_raw, s_raw))
-
-            pred_dist = self.net.head.dfl(boxes_raw)
-            decoded_boxes = dist2bbox(pred_dist, anchors.unsqueeze(0), xywh=False, dim=1) * strides
-            decoded_boxes = decoded_boxes.transpose(1, 2)  # [B, N, 4] in lr_size coordinates
+            decoded_boxes, _, _ = self._build_anchors_and_decode(
+                feats, boxes_raw, slot_info, (lr_h, lr_w)
+            )  # [B, N_total, 4] in lr_size coordinates
             probs = scores_raw.sigmoid().transpose(1, 2)
 
         if was_training:

@@ -345,9 +345,10 @@ class TaskAlignedAssigner(nn.Module):
             b_pred_scores = pred_scores[b]           # [N, C]
 
             # 1. Candidate selection: Anchor centers inside GT boxes
-            # b_gt_boxes: [M, 4], anchor_points: [N, 2]
-            lt = anchor_points.unsqueeze(0) - b_gt_boxes[:, :2].unsqueeze(1)  # [M, N, 2]
-            rb = b_gt_boxes[:, 2:].unsqueeze(1) - anchor_points.unsqueeze(0)  # [M, N, 2]
+            # b_gt_boxes: [M, 4], b_anchors: [N, 2] (supports shared [N, 2] or per-image [B, N, 2])
+            b_anchors = anchor_points[b] if anchor_points.dim() == 3 else anchor_points
+            lt = b_anchors.unsqueeze(0) - b_gt_boxes[:, :2].unsqueeze(1)  # [M, N, 2]
+            rb = b_gt_boxes[:, 2:].unsqueeze(1) - b_anchors.unsqueeze(0)  # [M, N, 2]
             is_in_box = torch.cat([lt, rb], dim=-1).min(dim=-1).values > 0.0  # [M, N]
 
             # 2. Compute IoU between predicted boxes and all GT boxes: [M, N]
@@ -533,8 +534,10 @@ class YOLOv11DetectionLoss(nn.Module):
                 loss_diou = ((diou_per_anchor * weight).sum() / target_scores_sum) * self.box_weight
 
                 # Weighted DFL loss (mean over 4 edges, weighted by TAL quality)
-                pos_anchor_points = anchor_points.unsqueeze(0).expand(bs, -1, -1)[fg_mask]
-                pos_stride = stride_tensor.unsqueeze(0).expand(bs, -1, -1)[fg_mask]
+                ap_batched = anchor_points if anchor_points.dim() == 3 else anchor_points.unsqueeze(0).expand(bs, -1, -1)
+                st_batched = stride_tensor if stride_tensor.dim() == 3 else stride_tensor.unsqueeze(0).expand(bs, -1, -1)
+                pos_anchor_points = ap_batched[fg_mask]
+                pos_stride = st_batched[fg_mask]
 
                 target_ltrb = self._bbox2dist(pos_anchor_points, pos_target_bboxes) / pos_stride
                 pos_pred_dist = pred_dist[fg_mask].view(-1, 4, self.reg_max)
