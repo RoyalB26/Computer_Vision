@@ -29,7 +29,87 @@ from VisDrone_yolov11.dataset import (
 
 @DATASETS.register_module(name="VisDroneDualResLMDBDataset", force=True)
 class VisDroneDualResLMDBDataset(VisDroneLMDBDataset):
-    """Fast OpenCV-accelerated Dual-Resolution LMDB Dataset."""
+    """Fast OpenCV-accelerated Dual-Resolution LMDB Dataset with Drone Photometric & Blur Augment."""
+
+    def __init__(
+        self,
+        *args,
+        drone_aug: bool = True,
+        hsv_prob: float = 0.7,
+        blur_prob: float = 0.15,
+        haze_gamma_prob: float = 0.25,
+        noise_prob: float = 0.10,
+        **kwargs,
+    ):
+        super().__init__(*args, **kwargs)
+        self.drone_aug = bool(drone_aug)
+        self.hsv_prob = float(hsv_prob)
+        self.blur_prob = float(blur_prob)
+        self.haze_gamma_prob = float(haze_gamma_prob)
+        self.noise_prob = float(noise_prob)
+        self._lut_x = np.arange(256, dtype=np.float32)
+
+    def _apply_drone_photometric_blur(self, rgb: np.ndarray) -> np.ndarray:
+        """Fast uint8 OpenCV-SIMD Drone Photometric & Blur Augmentation (~2-3ms at 1280x1280).
+
+        Simulates aerial drone conditions without harming tiny objects:
+          1. HSV color/white-balance/exposure jitter via 256-entry cv2.LUT.
+          2. Mild directional drone motion blur (3x3 / 5x5) or optical defocus blur (3x3).
+          3. Dusk/glare gamma curve (cv2.LUT) or mild high-altitude atmospheric haze.
+          4. Mild high-ISO night sensor noise.
+        """
+        # 1. HSV Jitter (LUT-accelerated, zero float32 full-image allocation)
+        if self.hsv_prob > 0.0 and random.random() < self.hsv_prob:
+            r = np.random.uniform(-1.0, 1.0, 3) * np.array([0.015, 0.50, 0.35], dtype=np.float32) + 1.0
+            hsv = cv2.cvtColor(rgb, cv2.COLOR_RGB2HSV)
+            x = self._lut_x
+            lut_h = ((x * r[0]) % 180.0).astype(np.uint8)
+            lut_s = np.clip(x * r[1], 0, 255).astype(np.uint8)
+            lut_v = np.clip(x * r[2], 0, 255).astype(np.uint8)
+            hsv[..., 0] = cv2.LUT(hsv[..., 0], lut_h)
+            hsv[..., 1] = cv2.LUT(hsv[..., 1], lut_s)
+            hsv[..., 2] = cv2.LUT(hsv[..., 2], lut_v)
+            rgb = cv2.cvtColor(hsv, cv2.COLOR_HSV2RGB)
+
+        # 2. Dusk/Glare Gamma OR Mild High-Altitude Haze (0.3ms via LUT / addWeighted)
+        if self.haze_gamma_prob > 0.0 and random.random() < self.haze_gamma_prob:
+            if random.random() < 0.6:
+                gamma = random.uniform(0.75, 1.35)
+                lut_g = np.clip(((self._lut_x / 255.0) ** gamma) * 255.0, 0, 255).astype(np.uint8)
+                rgb = cv2.LUT(rgb, lut_g)
+            else:
+                alpha = random.uniform(0.05, 0.18)
+                fog_val = random.randint(205, 238)
+                # Blend toward bright atmospheric haze: (1 - alpha) * rgb + alpha * fog_val
+                rgb = cv2.convertScaleAbs(rgb, alpha=1.0 - alpha, beta=alpha * fog_val)
+
+        # 3. Mild Drone Motion Blur (gimbal pan/vibration) OR Optical Defocus Blur
+        if self.blur_prob > 0.0 and random.random() < self.blur_prob:
+            if random.random() < 0.6:
+                k = random.choice((3, 5))
+                kernel = np.zeros((k, k), dtype=np.float32)
+                mode = random.randint(0, 3)
+                if mode == 0:  # horizontal motion
+                    kernel[k // 2, :] = 1.0 / k
+                elif mode == 1:  # vertical motion
+                    kernel[:, k // 2] = 1.0 / k
+                elif mode == 2:  # main diagonal
+                    np.fill_diagonal(kernel, 1.0 / k)
+                else:  # anti-diagonal
+                    np.fill_diagonal(np.fliplr(kernel), 1.0 / k)
+                rgb = cv2.filter2D(rgb, -1, kernel)
+            else:
+                sigma = random.uniform(0.4, 1.0)
+                rgb = cv2.GaussianBlur(rgb, (3, 3), sigmaX=sigma)
+
+        # 4. Mild High-ISO Sensor Noise
+        if self.noise_prob > 0.0 and random.random() < self.noise_prob:
+            sigma = random.uniform(2.0, 6.0)
+            noise = np.empty_like(rgb, dtype=np.int8)
+            cv2.randn(noise, 0, sigma)
+            rgb = np.clip(rgb.astype(np.int16) + noise.astype(np.int16), 0, 255).astype(np.uint8)
+
+        return rgb
 
     def _read_uint8_rgb_and_target(self, idx: int) -> Tuple[Optional[np.ndarray], Dict[str, Any]]:
         """Read resized (H, W, 3) uint8 RGB numpy array + target dict using fast OpenCV SIMD."""
@@ -228,11 +308,14 @@ class VisDroneDualResLMDBDataset(VisDroneLMDBDataset):
                     bh = boxes[:, 3] * (nh / float(h))
                     boxes = torch.stack([cx, cy, bw, bh], dim=-1)
 
-        # 3. Single uint8 -> float32 conversion + fast in-place brightness/contrast jitter
+        # 3. Drone Photometric & Blur Augmentation in uint8 (OpenCV SIMD) + single float32 conversion
+        if self.drone_aug:
+            rgb = self._apply_drone_photometric_blur(rgb)
+
         img = torch.from_numpy(rgb).permute(2, 0, 1).contiguous().to(dtype=torch.float32).div_(255.0)
-        if random.random() < 0.8:
-            alpha = random.uniform(0.8, 1.2)  # contrast/brightness scale
-            beta = random.uniform(-0.08, 0.08)  # brightness shift
+        if not self.drone_aug and random.random() < 0.8:
+            alpha = random.uniform(0.8, 1.2)  # fallback contrast/brightness scale
+            beta = random.uniform(-0.08, 0.08)
             img.mul_(alpha).add_(beta).clamp_(0.0, 1.0)
 
         counts = torch.zeros(self.num_classes, dtype=torch.float32)

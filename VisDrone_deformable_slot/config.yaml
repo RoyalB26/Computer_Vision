@@ -23,7 +23,7 @@ model:
   focal_alpha: -1.0
   focal_gamma: 0.0
   conf_threshold: 0.05
-  nms_threshold: 0.5
+  nms_threshold: 0.001
   max_det: 300
   # Dual-Resolution & Deformable High-Res Micro-Patch Injector (Approach 2)
   backbone_size: 960
