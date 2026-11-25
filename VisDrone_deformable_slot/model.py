@@ -55,6 +55,11 @@ class VisDroneYOLO11DeformableSlot(VisDroneYOLO11Slot):
         use_uncertainty_routing: bool = False,
         uncertainty_floor: float = 0.2,
         use_sparse_subhead: bool = False,
+        subhead_grid: int = 4,
+        use_res_fpn: bool = False,
+        use_patch_cls_loss: bool = False,
+        patch_cls_loss_weight: float = 0.3,
+        cls_pos_weights: Optional[List[float]] = None,
         # Slot + FiLM hyperparameters (forwarded to VisDroneYOLO11Slot)
         slot_dim: int = 64,
         num_prototypes: Union[int, List[int], Tuple[int, ...]] = (2, 2, 2, 1, 2, 3, 3, 3, 2, 2),
@@ -134,7 +139,14 @@ class VisDroneYOLO11DeformableSlot(VisDroneYOLO11Slot):
         self.backbone_size = int(backbone_size)
         self.use_deformable_patch = bool(use_deformable_patch)
         self.patch_loss_weight = float(patch_loss_weight)
+        self.patch_cls_loss_weight = float(patch_cls_loss_weight)
         self.use_sparse_subhead = bool(use_sparse_subhead)
+
+        if cls_pos_weights is not None:
+            assert len(cls_pos_weights) == num_classes, (
+                f"cls_pos_weights len ({len(cls_pos_weights)}) != num_classes ({num_classes})"
+            )
+            self.criterion.cls_pos_weights = torch.tensor(cls_pos_weights, dtype=torch.float32)
 
         if self.use_deformable_patch:
             self.patch_injector = DeformableHighResPatchInjector(
@@ -150,6 +162,9 @@ class VisDroneYOLO11DeformableSlot(VisDroneYOLO11Slot):
                 use_uncertainty_routing=use_uncertainty_routing,
                 uncertainty_floor=uncertainty_floor,
                 use_sparse_subhead=use_sparse_subhead,
+                subhead_grid=subhead_grid,
+                use_res_fpn=use_res_fpn,
+                use_patch_cls_loss=use_patch_cls_loss,
                 reg_max=int(self.net.head.reg_max),
             )
         else:
@@ -322,7 +337,7 @@ class VisDroneYOLO11DeformableSlot(VisDroneYOLO11Slot):
                 loss_dict["loss"] = loss_dict["loss"] + self.slot_loss_weight * slot_losses["loss_slot"]
                 loss_dict.update(slot_losses)
 
-            if self.patch_loss_weight > 0 and self.patch_injector is not None and "patch_info" in slot_info:
+            if (self.patch_loss_weight > 0 or self.patch_cls_loss_weight > 0) and self.patch_injector is not None and "patch_info" in slot_info:
                 patch_losses = self.patch_injector.compute_patch_loss(
                     patch_info=slot_info["patch_info"],
                     gt_bboxes=gt_bboxes,
@@ -330,7 +345,10 @@ class VisDroneYOLO11DeformableSlot(VisDroneYOLO11Slot):
                     mask_gt=mask_gt,
                     img_size=lr_size,
                 )
-                loss_dict["loss"] = loss_dict["loss"] + self.patch_loss_weight * patch_losses["loss_patch"]
+                if self.patch_loss_weight > 0:
+                    loss_dict["loss"] = loss_dict["loss"] + self.patch_loss_weight * patch_losses["loss_patch"]
+                if self.patch_cls_loss_weight > 0 and "loss_patch_cls" in patch_losses:
+                    loss_dict["loss"] = loss_dict["loss"] + self.patch_cls_loss_weight * patch_losses["loss_patch_cls"]
                 loss_dict.update(patch_losses)
 
         return loss_dict

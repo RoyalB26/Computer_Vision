@@ -1,0 +1,5 @@
+layer,num_samples,probe_acc_all,probe_acc_small,probe_acc_tiny
+backbone.feat4 (//8),24691,62.05,57.38,48.9
+neck.P3 (//8),24691,69.53,66.07,58.44
+slot.cls_P3 (FiLM),24691,69.22,64.98,57.78
+patch.cls_P3 (Deform+HR),24691,69.15,65.14,58.11

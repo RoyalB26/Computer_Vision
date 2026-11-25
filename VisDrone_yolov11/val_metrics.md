@@ -121,3 +121,40 @@ Tài liệu này tổng hợp đầy đủ **tất cả các chỉ số** đư�
 | **`cos_q2_k`** | $\text{mean}_{\text{img}}\cos\big(\widehat{W_q\text{LN}(s_c)},\, \widehat{\text{mean}}(k_{\text{GT}_c})\big)$ | Độ khớp khi đưa slot đầu ra `s_c` qua lại `to_q` (chỉ có ý nghĩa trực tiếp khi train `T ≥ 2`). | **`[-1, +1]`**. |
 | **`k_intra_std`** | $\text{mean}_d\big(\text{std}_{\text{img}}(\widehat{\text{mean}}(k_{\text{GT}_c})_d)\big)$ | Độ phân tán hình dạng/ngữ cảnh nội lớp của Key giữa các ảnh Val. | **`[0, ~0.2]`**. Thấp (`< 0.06`) = đồng nhất; **cao (`> 0.10`)** = đa hình dạng (multi-modal, nên dùng multi-prototype). |
 | **`top_confused_slot`** | $\arg\max_{j \neq c}\text{ConfMat}[c, j]$ kèm `%` | Slot sai bị lớp $c$ gán nhầm nhiều nhất (`0..9` hoặc `BG`). | Chuỗi mô tả, vd `car (30.5%)` hoặc `BG (41.1%)`. |
+
+---
+
+## 7. Chẩn đoán Nút thắt Phân loại, TAL & Linear Probe (`VisDrone_deformable_slot/val_deformable_components.py`)
+
+Các chỉ số bổ sung xuất ra tại `bottleneck_summary.csv`, `bottleneck_per_class.csv`, và `linear_probe.csv` để tách bạch lỗi **vị trí (localization/TAL)** vs **phân loại (classification)**:
+
+### 7.1. Tổng hợp Nút thắt (`bottleneck_summary.csv`)
+
+| Chỉ số | Công thức | Ý nghĩa | Khoảng giá trị & Mốc tốt |
+|---|---|---|---|
+| **`class_agnostic_mAP50` / `_95`** | COCO $\text{mAP}$ sau khi gộp toàn bộ nhãn dự đoán và GT về 1 lớp duy nhất (`0`) | Đo khả năng **tìm đúng vị trí vật thể** (objectness + box) không tính lỗi đoán nhầm lớp. | **`[0, 1]`**. Nếu cao gấp ~`1.8–2×` `mAP50` thường → nút thắt nằm ở **phân loại**, không phải vị trí. |
+| **`class_agnostic_mAP50_tiny` / `_small`** | `class_agnostic_mAP50` lọc riêng vật `Tiny (<16²)` và `Small (<32²)` | Trần hiệu năng phát hiện vật siêu nhỏ/nhỏ nếu phân loại đúng 100%. | **`[0, 1]`**. |
+| **`rec_ca_c25_iou10 / 30 / 50`** | Recall phân biệt đúng lớp tại $\text{conf} \ge 0.25$ theo 3 ngưỡng $\text{IoU} \in \{0.10, 0.30, 0.50\}$ (kèm bản `_tiny`, `_small`) | Kiểm tra xem vật thể bị bỏ sót hoàn toàn hay có tìm thấy nhưng box hơi lệch. | **`[0, 1]`**. Nếu tăng rất ít khi hạ IoU `0.50 → 0.10` → lỗi không phải do lệch box. |
+| **`rec_agn_c25_iou10 / 30 / 50`** | Recall *không phân biệt lớp* tại $\text{conf} \ge 0.25$ theo 3 ngưỡng IoU (kèm bản `_tiny`, `_small`) | So sánh trực tiếp với `rec_ca` để lượng hóa số box đã bắt trúng vị trí nhưng sai lớp hoặc tụt conf. | **`[0, 1]`**. |
+| **`tal_all / tiny / small_in_box_pct`** | $\% \text{ GT}$ có ít nhất 1 tâm anchor (P3/P4/P5 + Sub-Head) nằm lọt bên trong GT box | Tỷ lệ phủ hình học của lưới anchor. | **`[0%, 100%]`**. Tốt **`> 90%`** ở Tiny và **`> 95%`** ở Small. |
+| **`tal_all / tiny / small_pos_pct`** | $\% \text{ GT}$ được `TaskAlignedAssigner` gán ít nhất 1 positive anchor | Kiểm tra xem vật nhỏ có bị "đói nhãn" (0 positive anchor) khi train hay không. | **`[0%, 100%]`**. Tốt **`> 90%`**. |
+
+### 7.2. Chi tiết Từng Lớp (`bottleneck_per_class.csv`)
+
+| Chỉ số | Công thức | Ý nghĩa | Khoảng giá trị & Mốc tốt |
+|---|---|---|---|
+| **`gt_count`** | Tổng số GT box của lớp $c$ trong tập đánh giá | Quy mô mẫu thực tế của từng lớp. | Số nguyên $\ge 0$. |
+| **`agn_match_iou50_pct`** | $\% \text{ GT}_c$ có ít nhất 1 box dự đoán ($\text{conf} \ge 0.001$) khớp $\text{IoU} \ge 0.50$ *bất kể lớp* | Tỷ lệ vật thể của lớp $c$ đã được khoanh đúng vị trí. | **`[0%, 100%]`**. |
+| **`cls_match_iou50_pct`** | $\% \text{ GT}_c$ có box dự đoán khớp $\text{IoU} \ge 0.50$ và **đúng lớp $c$** | Tỷ lệ vật thể vừa đúng vị trí vừa đúng lớp (ở ngưỡng `conf >= 0.001`). | **`[0%, 100%]`**. |
+| **`wrong_cls_among_matched_pct`** | $\frac{\text{agn\_match} - \text{cls\_match}}{\text{agn\_match}} \times 100\%$ | Trong số các vật đã tìm đúng chỗ, có bao nhiêu `%` bị đoán **sai lớp**. | **`[0%, 100%]`**. Càng **thấp** càng tốt (`> 40%` là báo động đỏ về nhầm lớp). |
+| **`cls_match_c25_pct`** | $\% \text{ GT}_c$ khớp đúng lớp tại $\text{IoU} \ge 0.50,\ \text{conf} \ge 0.25$ | Recall thực tế của lớp $c$ ở ngưỡng hiển thị `0.25`. | **`[0%, 100%]`**. |
+| **`matched_conf_mean / median / p75`** | Trung bình / trung vị / phân vị 75% điểm `conf` của các box khớp đúng GT ($\text{IoU} \ge 0.50$) | Đo độ tự tin của head phân loại trên các vật đã tìm đúng. | **`[0, 1]`**. Nếu `median < 0.25` → lớp hiếm đang bị dìm confidence bởi lớp đa số (`car`). |
+| **`tal_pos_pct` / `tal_mean_anchors`** | $\% \text{ GT}_c$ có $\ge 1$ positive anchor và số positive anchor trung bình/GT trong TAL | Xác nhận từng lớp có nhận đủ tín hiệu gán nhãn khi train hay không. | `[0%, 100%]` / `[0, topk]`. |
+
+### 7.3. Linear Probe Theo Tầng (`linear_probe.csv`)
+
+| Chỉ số | Công thức | Ý nghĩa | Khoảng giá trị & Mốc tốt |
+|---|---|---|---|
+| **`layer`** | `backbone.feat4 (//8)`, `neck.P3 (//8)`, `slot.cls_P3 (FiLM)`, `patch.cls_P3 (Deform+HR)` | Tầng đặc trưng được trích xuất (mean-pool vector trong từng GT box). | Danh mục. |
+| **`num_samples`** | Tổng số GT box lấy mẫu (tối đa 40 box/ảnh, chia 70% train / 30% val) | Kích thước tập dữ liệu huấn luyện Linear Probe. | Số nguyên $> 0$. |
+| **`probe_acc_all / small / tiny`** | Accuracy (%) của bộ phân loại tuyến tính $L_2$-normalized trên toàn bộ / Small / Tiny GT | Đo **trần khả năng phân biệt 10 lớp** có sẵn trong đặc trưng ở từng tầng. | **`[0%, 100%]`**. Nếu `patch.cls_P3` không cao hơn `neck.P3` → nhánh MicroPatch chưa bổ sung thông tin phân loại. |

@@ -41,7 +41,12 @@ model:
   patch_loss_weight: 0.2         # Class-weighted auxiliary loss for offset_head & scale_head
   use_uncertainty_routing: true  # Focus patches on FG/BG & inter-class uncertainty instead of crystal-clear cars
   uncertainty_floor: 0.2
-  use_sparse_subhead: true       # 4x4 Sparse High-Res Sub-Head (K*16 sub-anchors directly on MicroPatchEncoder)
+  use_sparse_subhead: true       # Sparse High-Res Sub-Head directly on MicroPatchEncoder
+  subhead_grid: 8                # 8x8 Patch-FPN sub-anchors (~4.2px step at 960, finer than P3)
+  use_res_fpn: true              # ResSE blocks + 4x4->8x8 Mini-FPN inside MicroPatchEncoder
+  use_patch_cls_loss: true       # Direct 10-class CE supervision on high-res patch embeddings
+  patch_cls_loss_weight: 0.3
+  cls_pos_weights: [1.1, 1.2, 2.0, 0.9, 1.5, 1.7, 2.0, 2.2, 1.4, 1.1]
   # Slot + FiLM hyperparameters
   slot_dim: 64
   num_prototypes: [2, 2, 2, 1, 2, 3, 3, 3, 2, 2]

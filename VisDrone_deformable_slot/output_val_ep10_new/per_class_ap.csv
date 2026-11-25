@@ -1,0 +1,11 @@
+class_id,class_name,AP50,small_gt,small_rec_c25
+0,pedestrian,0.13482,6542,0.0402
+1,people,0.15791,3873,0.00671
+2,bicycle,0.01746,821,0.0
+3,car,0.65805,5018,0.30032
+4,van,0.11008,635,0.0
+5,truck,0.00851,189,0.0
+6,tricycle,0.05275,341,0.0
+7,awning-tricycle,0.0153,187,0.0
+8,bus,0.10058,74,0.0
+9,motorcycle,0.26159,3175,0.00976

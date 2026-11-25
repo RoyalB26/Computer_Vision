@@ -21,11 +21,59 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
-class MicroPatchEncoder(nn.Module):
-    """Lightweight GroupNorm Depthwise-Separable CNN encoding (B*K, 3, P, P) -> (B*K, out_dim)."""
+class _SEBlock(nn.Module):
+    """Lightweight Squeeze-and-Excitation channel attention."""
 
-    def __init__(self, out_dim: int = 64, hidden_dim: int = 32):
+    def __init__(self, channels: int, reduction: int = 4):
         super().__init__()
+        mid = max(8, channels // reduction)
+        self.fc = nn.Sequential(
+            nn.Linear(channels, mid),
+            nn.SiLU(inplace=True),
+            nn.Linear(mid, channels),
+            nn.Sigmoid(),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        w = self.fc(x.mean(dim=(2, 3))).unsqueeze(-1).unsqueeze(-1)
+        return x * w
+
+
+class _ResSEBlock(nn.Module):
+    """Depthwise-Separable Residual + SE block with GroupNorm for stable micro-patch encoding."""
+
+    def __init__(self, channels: int, use_se: bool = True):
+        super().__init__()
+        groups = min(8, channels)
+        self.conv = nn.Sequential(
+            nn.Conv2d(channels, channels, kernel_size=3, padding=1, groups=channels, bias=False),
+            nn.Conv2d(channels, channels, kernel_size=1, bias=False),
+            nn.GroupNorm(groups, channels),
+            nn.SiLU(inplace=True),
+            nn.Conv2d(channels, channels, kernel_size=3, padding=1, groups=channels, bias=False),
+            nn.Conv2d(channels, channels, kernel_size=1, bias=False),
+            nn.GroupNorm(groups, channels),
+        )
+        self.se = _SEBlock(channels) if use_se else nn.Identity()
+        self.act = nn.SiLU(inplace=True)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.act(x + self.se(self.conv(x)))
+
+
+class MicroPatchEncoder(nn.Module):
+    """Lightweight GroupNorm CNN encoding (B*K, 3, P, P) -> (B*K, out_dim) (+ optional 4x4/8x8 FPN map)."""
+
+    def __init__(
+        self,
+        out_dim: int = 64,
+        hidden_dim: int = 32,
+        use_res_fpn: bool = False,
+        fpn_out_size: int = 4,
+    ):
+        super().__init__()
+        self.use_res_fpn = bool(use_res_fpn)
+        self.fpn_out_size = int(fpn_out_size)
         g1 = min(8, hidden_dim)
         g2 = min(8, out_dim)
         self.stem = nn.Sequential(
@@ -45,6 +93,23 @@ class MicroPatchEncoder(nn.Module):
             nn.GroupNorm(g2, out_dim),
             nn.SiLU(inplace=True),
         )
+        if self.use_res_fpn:
+            self.res16 = _ResSEBlock(hidden_dim)
+            self.res8 = _ResSEBlock(out_dim)
+            self.res4 = _ResSEBlock(out_dim)
+            if self.fpn_out_size == 8:
+                self.fpn_lat = nn.Conv2d(out_dim, out_dim, kernel_size=1, bias=False)
+                self.fpn_fuse = _ResSEBlock(out_dim)
+            else:
+                self.fpn_lat = None
+                self.fpn_fuse = None
+        else:
+            self.res16 = None
+            self.res8 = None
+            self.res4 = None
+            self.fpn_lat = None
+            self.fpn_fuse = None
+
         self.head = nn.Sequential(
             nn.Linear(out_dim * 2, out_dim),
             nn.LayerNorm(out_dim),
@@ -56,14 +121,29 @@ class MicroPatchEncoder(nn.Module):
         patches: torch.Tensor,
         return_spatial: bool = False,
     ):
-        x = self.stem(patches)
-        x = self.block1(x)
-        x = self.block2(x)
-        gap = x.mean(dim=(2, 3))
-        gmp = x.amax(dim=(2, 3))
+        x16 = self.stem(patches)
+        if self.res16 is not None:
+            x16 = self.res16(x16)
+        x8 = self.block1(x16)
+        if self.res8 is not None:
+            x8 = self.res8(x8)
+        x4 = self.block2(x8)
+        if self.res4 is not None:
+            x4 = self.res4(x4)
+
+        gap = x4.mean(dim=(2, 3))
+        gmp = x4.amax(dim=(2, 3))
         emb = self.head(torch.cat([gap, gmp], dim=-1))
         if return_spatial:
-            return emb, x
+            if self.fpn_out_size == 8:
+                if self.fpn_lat is not None and self.fpn_fuse is not None:
+                    up4 = F.interpolate(self.fpn_lat(x4), size=x8.shape[-2:], mode="bilinear", align_corners=False)
+                    spatial = self.fpn_fuse(x8 + up4)
+                else:
+                    spatial = x8
+            else:
+                spatial = x4
+            return emb, spatial
         return emb
 
 
@@ -84,6 +164,9 @@ class DeformableHighResPatchInjector(nn.Module):
         use_uncertainty_routing: bool = False,
         uncertainty_floor: float = 0.2,
         use_sparse_subhead: bool = False,
+        subhead_grid: int = 4,
+        use_res_fpn: bool = False,
+        use_patch_cls_loss: bool = False,
         reg_max: int = 16,
     ):
         super().__init__()
@@ -97,8 +180,10 @@ class DeformableHighResPatchInjector(nn.Module):
         self.use_uncertainty_routing = bool(use_uncertainty_routing)
         self.uncertainty_floor = float(uncertainty_floor)
         self.use_sparse_subhead = bool(use_sparse_subhead)
+        self.use_res_fpn = bool(use_res_fpn)
+        self.use_patch_cls_loss = bool(use_patch_cls_loss)
         self.reg_max = int(reg_max)
-        self.sub_grid_size = max(1, self.patch_size // 8)
+        self.sub_grid_size = int(subhead_grid) if int(subhead_grid) in (4, 8) else max(1, self.patch_size // 8)
 
         if class_focus_weights is None:
             # Default: emphasize tiny & rare VisDrone classes (ped, people, bicycle, tricycle, awning-tri, moto)
@@ -121,8 +206,17 @@ class DeformableHighResPatchInjector(nn.Module):
         nn.init.zeros_(self.scale_head.bias)
 
         # Lightweight high-res RGB micro-patch encoder
-        self.patch_encoder = MicroPatchEncoder(out_dim=p3_channels, hidden_dim=max(24, p3_channels // 2))
+        self.patch_encoder = MicroPatchEncoder(
+            out_dim=p3_channels,
+            hidden_dim=max(32 if self.use_res_fpn else 24, p3_channels // 2),
+            use_res_fpn=self.use_res_fpn,
+            fpn_out_size=self.sub_grid_size,
+        )
         self.drop = nn.Dropout(patch_dropout)
+        if self.use_patch_cls_loss:
+            self.patch_cls_head = nn.Linear(p3_channels, num_classes)
+        else:
+            self.patch_cls_head = None
 
         # Zero-init projection back to P3 box/cls feature space (preserves pretrained yolo11n.pt at Epoch 0)
         self.box_proj = nn.Linear(p3_channels, p3_channels)
@@ -384,6 +478,8 @@ class DeformableHighResPatchInjector(nn.Module):
             "grid_hw": (h3, w3),
             **sub_out,
         }
+        if self.patch_cls_head is not None:
+            patch_info["patch_cls_logits"] = self.patch_cls_head(patch_emb)
         return p3_box_out, p3_cls_out, patch_info
 
     def compute_patch_loss(
@@ -412,7 +508,10 @@ class DeformableHighResPatchInjector(nn.Module):
 
         bs, max_m, _ = gt_bboxes.shape
         if max_m == 0:
-            return {"loss_patch": zero, "loss_patch_offset": zero, "loss_patch_scale": zero}
+            out_zero = {"loss_patch": zero, "loss_patch_offset": zero, "loss_patch_scale": zero}
+            if "patch_cls_logits" in patch_info:
+                out_zero["loss_patch_cls"] = zero
+            return out_zero
 
         with torch.amp.autocast(device_type=device.type, enabled=False):
             img_h, img_w = float(img_size[0]), float(img_size[1])
@@ -450,7 +549,10 @@ class DeformableHighResPatchInjector(nn.Module):
             matched = best_d < 1e8                     # (B, K)
 
             if not matched.any():
-                return {"loss_patch": zero, "loss_patch_offset": zero, "loss_patch_scale": zero}
+                out_zero = {"loss_patch": zero, "loss_patch_offset": zero, "loss_patch_scale": zero}
+                if "patch_cls_logits" in patch_info:
+                    out_zero["loss_patch_cls"] = zero
+                return out_zero
 
             # Gather matched GT center, size, and class weight
             m_idx2 = best_m.unsqueeze(-1).expand(-1, -1, 2)
@@ -482,8 +584,19 @@ class DeformableHighResPatchInjector(nn.Module):
             loss_sc = (per_pt_sc[matched] * w_m).sum() / w_sum
             loss_patch = loss_off + 0.5 * loss_sc
 
-        return {
-            "loss_patch": loss_patch,
-            "loss_patch_offset": loss_off,
-            "loss_patch_scale": loss_sc,
-        }
+            out_losses = {
+                "loss_patch": loss_patch,
+                "loss_patch_offset": loss_off,
+                "loss_patch_scale": loss_sc,
+            }
+            if "patch_cls_logits" in patch_info:
+                p_logits = patch_info["patch_cls_logits"].float()  # (B, K, C)
+                tgt_cls = torch.gather(lbls, dim=1, index=best_m)   # (B, K)
+                ce_per_pt = F.cross_entropy(
+                    p_logits.reshape(-1, self.num_classes),
+                    tgt_cls.reshape(-1),
+                    reduction="none",
+                ).view(bs, -1)
+                out_losses["loss_patch_cls"] = (ce_per_pt[matched] * w_m).sum() / w_sum
+
+        return out_losses

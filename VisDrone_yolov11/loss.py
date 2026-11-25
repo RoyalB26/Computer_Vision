@@ -166,6 +166,7 @@ class SigmoidFocalLoss(BaseLoss):
         preds: torch.Tensor,
         targets: torch.Tensor,
         normalizer: Optional[float] = None,
+        pos_cls_weights: Optional[torch.Tensor] = None,
         **kwargs,
     ) -> torch.Tensor:
         """Compute Sigmoid Focal Loss.
@@ -174,6 +175,7 @@ class SigmoidFocalLoss(BaseLoss):
             preds: Logits tensor of arbitrary shape [B, N, C] or [N, C].
             targets: Target binary scores tensor matching preds shape with values in [0, 1].
             normalizer: Optional scalar denominator to normalize sum loss (e.g., num_positives).
+            pos_cls_weights: Optional [C] tensor boosting positive loss per class (negatives stay 1.0).
         """
         p = torch.sigmoid(preds)
         ce_loss = F.binary_cross_entropy_with_logits(preds, targets, reduction="none")
@@ -184,6 +186,11 @@ class SigmoidFocalLoss(BaseLoss):
         if self.alpha >= 0:
             alpha_t = self.alpha * targets + (1.0 - self.alpha) * (1.0 - targets)
             loss = alpha_t * loss
+
+        if pos_cls_weights is not None:
+            cw = pos_cls_weights.to(device=loss.device, dtype=loss.dtype).view(1, 1, -1)
+            pos_mask = (targets > 0).to(dtype=loss.dtype)
+            loss = loss * (1.0 + (cw - 1.0) * pos_mask)
 
         if normalizer is not None and normalizer > 0:
             return (loss.sum() / normalizer) * self.loss_weight
@@ -447,6 +454,7 @@ class YOLOv11DetectionLoss(nn.Module):
         dfl_weight: float = 1.5,
         focal_alpha: float = 0.25,
         focal_gamma: float = 2.0,
+        cls_pos_weights: Optional[List[float]] = None,
     ):
         super().__init__()
         self.num_classes = num_classes
@@ -454,6 +462,15 @@ class YOLOv11DetectionLoss(nn.Module):
         self.box_weight = box_weight
         self.cls_weight = cls_weight
         self.dfl_weight = dfl_weight
+
+        if cls_pos_weights is not None:
+            self.register_buffer(
+                "cls_pos_weights",
+                torch.tensor(cls_pos_weights, dtype=torch.float32),
+                persistent=False,
+            )
+        else:
+            self.register_buffer("cls_pos_weights", None, persistent=False)
 
         self.diou_loss = DIoULoss(loss_weight=1.0, reduction="none")
         self.focal_loss = SigmoidFocalLoss(loss_weight=1.0, alpha=focal_alpha, gamma=focal_gamma, reduction="sum")
@@ -517,6 +534,7 @@ class YOLOv11DetectionLoss(nn.Module):
                 pred_scores,
                 target_scores,
                 normalizer=focal_normalizer,
+                pos_cls_weights=self.cls_pos_weights,
             ) * self.cls_weight
 
             # 2. Localization: TAL-weighted DIoU Loss and DFL on FOREGROUND anchors

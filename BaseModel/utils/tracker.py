@@ -5,6 +5,7 @@ directly to a multi-sheet Microsoft Excel (.xlsx) file after each epoch.
 Runs completely silent on the console/terminal.
 """
 from collections import defaultdict
+import math
 import os
 import time
 from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Sequence, Union
@@ -367,12 +368,18 @@ class ExcelTracker(BaseHook):
                 self._epoch_losses[k] += val
         self._epoch_loss_count += 1
 
-        # 2. Track Gradients if enabled
-        if self.track_gradients and ((batch_idx + 1) % self.grad_interval == 0):
+        # 2. Track Gradients if enabled (only on optimizer-step batches so AMP GradScaler has
+        #    already unscaled `p.grad` when `accumulate > 1`, and ignore NaN/Inf overflow skips).
+        accumulate = max(1, int(getattr(trainer, "accumulate", 1)))
+        train_loader = getattr(trainer, "train_loader", None)
+        num_batches = len(train_loader) if train_loader is not None else 0
+        is_step_iter = ((batch_idx + 1) % accumulate == 0) or (num_batches > 0 and (batch_idx + 1) == num_batches)
+        if self.track_gradients and is_step_iter and ((batch_idx + 1) % self.grad_interval == 0):
             norms = compute_gradient_norms(trainer.model, submodules=self.submodules)
-            for k, v in norms.items():
-                self._epoch_grad_norms[k] += v
-            self._epoch_grad_count += 1
+            if all(math.isfinite(v) for v in norms.values()):
+                for k, v in norms.items():
+                    self._epoch_grad_norms[k] += v
+                self._epoch_grad_count += 1
 
     def after_val(self, trainer: "BaseTrainer", val_metrics: Dict[str, float]) -> None:
         """Record validation metrics for the current epoch."""

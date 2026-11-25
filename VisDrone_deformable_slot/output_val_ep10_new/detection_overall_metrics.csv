@@ -1,0 +1,2 @@
+mAP50,mAP50_95,mAP50_tiny,mAP50_95_tiny,mAP50_small,mAP50_95_small,mAP50_95_medium,mAP50_95_large,precision_c25,recall_c25,f1_c25,rec_tiny_c25,rec_small_c25,rec_border_c25,rec_interior_c25,latency_ms
+0.1517,0.06366,0.03119,0.01018,0.07653,0.02785,0.09008,0.0603,0.63472,0.2281,0.3356,0.03161,0.0876,0.21422,0.23197,73.37143

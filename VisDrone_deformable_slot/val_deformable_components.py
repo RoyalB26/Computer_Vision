@@ -176,6 +176,204 @@ def _compute_patch_coverage_stats(
     return stats
 
 
+def _box_iou_matrix_np(boxes1: np.ndarray, boxes2: np.ndarray) -> np.ndarray:
+    """Compute pairwise IoU matrix (M, N) for xyxy numpy arrays."""
+    x1 = np.maximum(boxes1[:, None, 0], boxes2[None, :, 0])
+    y1 = np.maximum(boxes1[:, None, 1], boxes2[None, :, 1])
+    x2 = np.minimum(boxes1[:, None, 2], boxes2[None, :, 2])
+    y2 = np.minimum(boxes1[:, None, 3], boxes2[None, :, 3])
+    inter = np.maximum(0.0, x2 - x1) * np.maximum(0.0, y2 - y1)
+    a1 = np.maximum(0.0, boxes1[:, 2] - boxes1[:, 0]) * np.maximum(0.0, boxes1[:, 3] - boxes1[:, 1])
+    a2 = np.maximum(0.0, boxes2[:, 2] - boxes2[:, 0]) * np.maximum(0.0, boxes2[:, 3] - boxes2[:, 1])
+    return inter / np.maximum(a1[:, None] + a2[None, :] - inter, 1e-7)
+
+
+def _compute_bottleneck_diagnostics(
+    preds_full: List[np.ndarray],
+    gts_all: List[np.ndarray],
+    iou_thresholds: Tuple[float, ...] = (0.10, 0.30, 0.50),
+) -> Tuple[Dict[str, float], List[Dict[str, Any]]]:
+    """Compute IoU-sweep recalls, class-agnostic recalls, and matched GT confidence/confusion stats."""
+
+    # Overall & size-split recall at IoU 0.1, 0.3, 0.5 (conf >= 0.25, class-aware & class-agnostic)
+    tot_all = 0
+    tot_tiny = 0
+    tot_small = 0
+    hits_ca: Dict[float, List[int]] = {t: [0, 0, 0] for t in iou_thresholds}   # [all, tiny, small]
+    hits_agn: Dict[float, List[int]] = {t: [0, 0, 0] for t in iou_thresholds}
+
+    # Per-class matched GT stats at IoU >= 0.5 (any conf >= 0.001)
+    cls_tot = [0] * 10
+    cls_best_confs: List[List[float]] = [[] for _ in range(10)]
+    cls_agn_hits_05 = [0] * 10
+    cls_right_hits_05 = [0] * 10
+    cls_right_c25 = [0] * 10
+
+    for pred, gt in zip(preds_full, gts_all):
+        if len(gt) == 0:
+            continue
+        g_boxes = gt[:, 1:5]
+        g_cls = gt[:, 0].astype(np.int64)
+        g_area = np.maximum(0.0, g_boxes[:, 2] - g_boxes[:, 0]) * np.maximum(0.0, g_boxes[:, 3] - g_boxes[:, 1])
+        m_tiny = g_area < (16.0 ** 2)
+        m_small = g_area < (32.0 ** 2)
+
+        m_gt = len(gt)
+        tot_all += m_gt
+        tot_tiny += int(m_tiny.sum())
+        tot_small += int(m_small.sum())
+        for c in g_cls:
+            if 0 <= c < 10:
+                cls_tot[c] += 1
+
+        if len(pred) == 0:
+            continue
+
+        # 1. All predictions (conf >= 0.001) for matched confidence & class confusion at IoU >= 0.5
+        iou_all = _box_iou_matrix_np(g_boxes, pred[:, :4])  # (M, N)
+        p_cls_all = pred[:, 5].astype(np.int64)
+        p_conf_all = pred[:, 4]
+        same_cls = g_cls[:, None] == p_cls_all[None, :]
+
+        # Best IoU regardless of class
+        best_iou_agn = iou_all.max(axis=1)
+        # Best confidence among predictions with same class & IoU >= 0.5
+        valid_same = same_cls & (iou_all >= 0.50)
+        best_conf_same = np.where(valid_same, p_conf_all[None, :], -1.0).max(axis=1)
+
+        for gi, c in enumerate(g_cls):
+            if not (0 <= c < 10):
+                continue
+            if best_iou_agn[gi] >= 0.50:
+                cls_agn_hits_05[c] += 1
+            if best_conf_same[gi] >= 0.0:
+                cls_right_hits_05[c] += 1
+                cls_best_confs[c].append(float(best_conf_same[gi]))
+                if best_conf_same[gi] >= 0.25:
+                    cls_right_c25[c] += 1
+
+        # 2. IoU sweep at conf >= 0.25
+        p25 = pred[pred[:, 4] >= 0.25]
+        if len(p25) == 0:
+            continue
+        iou_25 = _box_iou_matrix_np(g_boxes, p25[:, :4])
+        p_cls_25 = p25[:, 5].astype(np.int64)
+        same_25 = g_cls[:, None] == p_cls_25[None, :]
+        max_agn = iou_25.max(axis=1)
+        max_ca = np.where(same_25, iou_25, 0.0).max(axis=1)
+
+        for t in iou_thresholds:
+            ha = max_ca >= t
+            hits_ca[t][0] += int(ha.sum())
+            hits_ca[t][1] += int((ha & m_tiny).sum())
+            hits_ca[t][2] += int((ha & m_small).sum())
+
+            hg = max_agn >= t
+            hits_agn[t][0] += int(hg.sum())
+            hits_agn[t][1] += int((hg & m_tiny).sum())
+            hits_agn[t][2] += int((hg & m_small).sum())
+
+    summary: Dict[str, float] = {}
+    for t in iou_thresholds:
+        tag = f"{int(round(t * 100)):02d}"
+        summary[f"rec_ca_c25_iou{tag}"] = hits_ca[t][0] / max(tot_all, 1)
+        summary[f"rec_ca_tiny_c25_iou{tag}"] = hits_ca[t][1] / max(tot_tiny, 1)
+        summary[f"rec_ca_small_c25_iou{tag}"] = hits_ca[t][2] / max(tot_small, 1)
+        summary[f"rec_agn_c25_iou{tag}"] = hits_agn[t][0] / max(tot_all, 1)
+        summary[f"rec_agn_tiny_c25_iou{tag}"] = hits_agn[t][1] / max(tot_tiny, 1)
+        summary[f"rec_agn_small_c25_iou{tag}"] = hits_agn[t][2] / max(tot_small, 1)
+
+    per_cls_rows: List[Dict[str, Any]] = []
+    for c in range(10):
+        confs = np.array(cls_best_confs[c], dtype=np.float32)
+        tot = max(cls_tot[c], 1)
+        agn_h = cls_agn_hits_05[c]
+        r_h = cls_right_hits_05[c]
+        wrong_cls_pct = 100.0 * max(0, agn_h - r_h) / max(agn_h, 1) if agn_h > 0 else 0.0
+        per_cls_rows.append({
+            "class_id": c,
+            "class_name": VISDRONE_CLASSES[c],
+            "gt_count": cls_tot[c],
+            "agn_match_iou50_pct": round(100.0 * agn_h / tot, 2),
+            "cls_match_iou50_pct": round(100.0 * r_h / tot, 2),
+            "wrong_cls_among_matched_pct": round(wrong_cls_pct, 2),
+            "cls_match_c25_pct": round(100.0 * cls_right_c25[c] / tot, 2),
+            "matched_conf_mean": round(float(confs.mean()), 4) if len(confs) else 0.0,
+            "matched_conf_median": round(float(np.median(confs)), 4) if len(confs) else 0.0,
+            "matched_conf_p75": round(float(np.percentile(confs, 75)), 4) if len(confs) else 0.0,
+        })
+    return summary, per_cls_rows
+
+
+def _pool_gt_features(
+    fmap: torch.Tensor,
+    gt_arr: np.ndarray,
+    hr_w: int,
+    hr_h: int,
+) -> Optional[torch.Tensor]:
+    """Pool (M, C) feature vectors for each GT box in `gt_arr` from (1, C, Hf, Wf)."""
+    if len(gt_arr) == 0:
+        return None
+    _, c, hf, wf = fmap.shape
+    feats_out = []
+    for g in gt_arr:
+        x1 = max(0, min(wf - 1, int(np.floor(g[1] * wf / float(hr_w)))))
+        y1 = max(0, min(hf - 1, int(np.floor(g[2] * hf / float(hr_h)))))
+        x2 = max(x1 + 1, min(wf, int(np.ceil(g[3] * wf / float(hr_w)))))
+        y2 = max(y1 + 1, min(hf, int(np.ceil(g[4] * hf / float(hr_h)))))
+        vec = fmap[0, :, y1:y2, x1:x2].float().mean(dim=(1, 2))
+        feats_out.append(vec)
+    return torch.stack(feats_out, dim=0)
+
+
+def _run_linear_probe(
+    feats_x: torch.Tensor,
+    labels_y: torch.Tensor,
+    is_small: torch.Tensor,
+    is_tiny: torch.Tensor,
+    device: torch.device,
+    epochs: int = 80,
+) -> Dict[str, float]:
+    """Train a fast L2-normalized linear classifier (70/30 split) to measure class separability."""
+    n = len(labels_y)
+    if n < 50:
+        return {"probe_acc_all": 0.0, "probe_acc_small": 0.0, "probe_acc_tiny": 0.0}
+
+    g = torch.Generator().manual_seed(42)
+    perm = torch.randperm(n, generator=g)
+    split = int(0.7 * n)
+    tr_idx, va_idx = perm[:split], perm[split:]
+
+    x_tr = F.normalize(feats_x[tr_idx].to(device), dim=-1)
+    y_tr = labels_y[tr_idx].to(device)
+    x_va = F.normalize(feats_x[va_idx].to(device), dim=-1)
+    y_va = labels_y[va_idx].to(device)
+    sm_va = is_small[va_idx].to(device)
+    tn_va = is_tiny[va_idx].to(device)
+
+    clf = torch.nn.Linear(x_tr.shape[1], 10).to(device)
+    opt = torch.optim.AdamW(clf.parameters(), lr=0.05, weight_decay=1e-4)
+    with torch.enable_grad():
+        for _ in range(epochs):
+            opt.zero_grad()
+            loss = F.cross_entropy(clf(x_tr), y_tr)
+            loss.backward()
+            opt.step()
+
+    with torch.no_grad():
+        pred = clf(x_va).argmax(dim=-1)
+        correct = pred == y_va
+        acc_all = float(correct.float().mean().item())
+        acc_sm = float(correct[sm_va].float().mean().item()) if sm_va.any() else 0.0
+        acc_tn = float(correct[tn_va].float().mean().item()) if tn_va.any() else 0.0
+
+    return {
+        "probe_acc_all": round(acc_all * 100.0, 2),
+        "probe_acc_small": round(acc_sm * 100.0, 2),
+        "probe_acc_tiny": round(acc_tn * 100.0, 2),
+    }
+
+
 def _plot_deformable_patches(vis_sample: Dict[str, Any], save_path: str) -> None:
     """Save 2x2 visual inspection of Deformable High-Res Micro-Patch sampling & P3 injection."""
     rgb = vis_sample["rgb"]
@@ -402,6 +600,19 @@ def main() -> None:
         "p3_box_delta_ratio": [], "p3_cls_delta_ratio": [],
     }
     patch_totals = {k: 0.0 for k in ("patch_fg_hits", "patch_total", "gt_tiny_cov", "gt_tiny_tot", "gt_small_cov", "gt_small_tot", "gt_border_cov", "gt_border_tot")}
+    tal_stats = {
+        "all_tot": 0, "all_in_box": 0, "all_pos": 0,
+        "tiny_tot": 0, "tiny_in_box": 0, "tiny_pos": 0,
+        "small_tot": 0, "small_in_box": 0, "small_pos": 0,
+        "cls_tot": np.zeros(10, dtype=np.int64),
+        "cls_pos": np.zeros(10, dtype=np.int64),
+        "cls_anchors": np.zeros(10, dtype=np.int64),
+    }
+    probe_layers = ("backbone.feat4 (//8)", "neck.P3 (//8)", "slot.cls_P3 (FiLM)", "patch.cls_P3 (Deform+HR)")
+    probe_feats: Dict[str, List[torch.Tensor]] = {k: [] for k in probe_layers}
+    probe_labels: List[torch.Tensor] = []
+    probe_small: List[torch.Tensor] = []
+    probe_tiny: List[torch.Tensor] = []
     latencies: List[float] = []
     vis_sample: Optional[Dict[str, Any]] = None
     best_vis_gt = -1
@@ -529,6 +740,68 @@ def main() -> None:
                         "p3_delta_l2": torch.linalg.vector_norm((p3_box_ref[0] - p3[0]).float(), dim=0).cpu().numpy(),
                     }
 
+            # 7. TAL GT anchor starvation & Linear Probe feature extraction
+            if len(gt_arr) > 0:
+                _, boxes_raw, scores_raw, slot_info_f, lr_sz_f = model._forward_head_with_slots(x_hr)
+                decoded_xyxy, ap_px, _ = model._build_anchors_and_decode(
+                    [p3, p4, p5], boxes_raw, slot_info_f, lr_sz_f
+                )
+                b_ap = ap_px[0] if ap_px.dim() == 3 else ap_px  # (N_total, 2)
+                gt_lr_t = torch.from_numpy(gt_lr[:, 1:5]).to(device=device, dtype=torch.float32)
+                gt_lbl_t = torch.from_numpy(gt_lr[:, 0]).to(device=device, dtype=torch.long)
+
+                # In-box check per GT
+                lt = b_ap.unsqueeze(0) - gt_lr_t[:, :2].unsqueeze(1)
+                rb = gt_lr_t[:, 2:].unsqueeze(1) - b_ap.unsqueeze(0)
+                in_box_m = (torch.cat([lt, rb], dim=-1).min(dim=-1).values > 0.0).any(dim=1)  # (M,)
+
+                # Actual TAL assignment check per GT
+                b_pred_scores = scores_raw.sigmoid().transpose(1, 2)[0]
+                b_pred_boxes = decoded_xyxy[0]
+                ious_m = model.criterion.assigner._batch_iou(gt_lr_t, b_pred_boxes)
+                cls_sc_m = b_pred_scores[:, gt_lbl_t].transpose(0, 1)
+                is_in = torch.cat([lt, rb], dim=-1).min(dim=-1).values > 0.0
+                align_m = (cls_sc_m.clamp(min=0.0) ** model.criterion.assigner.alpha) * (ious_m.clamp(min=0.0) ** model.criterion.assigner.beta) * is_in.float()
+                k_tal = min(model.criterion.assigner.topk, align_m.shape[1])
+                _, topk_idx_m = torch.topk(align_m, k=k_tal, dim=-1, largest=True)
+                topk_mask_m = torch.zeros_like(align_m, dtype=torch.bool).scatter_(1, topk_idx_m, True)
+                pos_cnt_per_gt = (topk_mask_m & is_in & (align_m > 0)).sum(dim=1)  # (M,)
+                has_pos_m = pos_cnt_per_gt > 0
+
+                g_area_hr = (gt_arr[:, 3] - gt_arr[:, 1]) * (gt_arr[:, 4] - gt_arr[:, 2])
+                m_tn_t = torch.from_numpy(g_area_hr < (16.0 ** 2)).to(device)
+                m_sm_t = torch.from_numpy(g_area_hr < (32.0 ** 2)).to(device)
+
+                tal_stats["all_tot"] += len(gt_arr)
+                tal_stats["all_in_box"] += int(in_box_m.sum().item())
+                tal_stats["all_pos"] += int(has_pos_m.sum().item())
+                tal_stats["tiny_tot"] += int(m_tn_t.sum().item())
+                tal_stats["tiny_in_box"] += int((in_box_m & m_tn_t).sum().item())
+                tal_stats["tiny_pos"] += int((has_pos_m & m_tn_t).sum().item())
+                tal_stats["small_tot"] += int(m_sm_t.sum().item())
+                tal_stats["small_in_box"] += int((in_box_m & m_sm_t).sum().item())
+                tal_stats["small_pos"] += int((has_pos_m & m_sm_t).sum().item())
+
+                for gi in range(len(gt_arr)):
+                    cid = int(gt_arr[gi, 0])
+                    if 0 <= cid < 10:
+                        tal_stats["cls_tot"][cid] += 1
+                        if has_pos_m[gi].item():
+                            tal_stats["cls_pos"][cid] += 1
+                        tal_stats["cls_anchors"][cid] += int(pos_cnt_per_gt[gi].item())
+
+                # Pool GT features for linear probe (sub-sample up to 40 boxes/img for speed)
+                step_p = max(1, len(gt_arr) // 40)
+                gt_sub = gt_arr[::step_p]
+                g_area_sub = (gt_sub[:, 3] - gt_sub[:, 1]) * (gt_sub[:, 4] - gt_sub[:, 2])
+                for lname in probe_layers:
+                    pv = _pool_gt_features(feat_map_dict[lname], gt_sub, hr_w, hr_h)
+                    if pv is not None:
+                        probe_feats[lname].append(pv.cpu())
+                probe_labels.append(torch.from_numpy(gt_sub[:, 0].astype(np.int64)))
+                probe_small.append(torch.from_numpy(g_area_sub < (32.0 ** 2)))
+                probe_tiny.append(torch.from_numpy(g_area_sub < (16.0 ** 2)))
+
             if (idx + 1) % 50 == 0 or (idx + 1) == total_imgs:
                 print(f"  [{idx + 1:3d}/{total_imgs}] avg_latency={np.mean(latencies):.1f}ms")
 
@@ -601,6 +874,48 @@ def main() -> None:
         "mufasa_iter_gate": ig_val,
     }
 
+    # 8. Class-Agnostic mAP, IoU-sweep Recalls, Matched Confidence, TAL Starvation, & Linear Probe
+    preds_agn = [
+        (np.column_stack([p[:, :5], np.zeros((len(p), 1), dtype=np.float32)]) if len(p) else p)
+        for p in preds_full
+    ]
+    gts_agn = [
+        (np.column_stack([np.zeros((len(g), 1), dtype=np.float32), g[:, 1:5]]) if len(g) else g)
+        for g in gts_all
+    ]
+    agn_ov, _ = compute_coco_map(preds_agn, gts_agn)
+    agn_tn, _ = compute_coco_map(preds_agn, gts_agn, area_range=(0.0, 16.0 ** 2))
+    agn_sm, _ = compute_coco_map(preds_agn, gts_agn, area_range=(0.0, 32.0 ** 2))
+
+    bn_summary, bn_cls_rows = _compute_bottleneck_diagnostics(preds_full, gts_all)
+    bn_summary["class_agnostic_mAP50"] = float(agn_ov.get("mAP50", 0.0))
+    bn_summary["class_agnostic_mAP50_95"] = float(agn_ov.get("mAP50_95", 0.0))
+    bn_summary["class_agnostic_mAP50_tiny"] = float(agn_tn.get("mAP50", 0.0))
+    bn_summary["class_agnostic_mAP50_small"] = float(agn_sm.get("mAP50", 0.0))
+    bn_summary["tal_all_in_box_pct"] = 100.0 * tal_stats["all_in_box"] / max(tal_stats["all_tot"], 1)
+    bn_summary["tal_all_pos_pct"] = 100.0 * tal_stats["all_pos"] / max(tal_stats["all_tot"], 1)
+    bn_summary["tal_tiny_in_box_pct"] = 100.0 * tal_stats["tiny_in_box"] / max(tal_stats["tiny_tot"], 1)
+    bn_summary["tal_tiny_pos_pct"] = 100.0 * tal_stats["tiny_pos"] / max(tal_stats["tiny_tot"], 1)
+    bn_summary["tal_small_in_box_pct"] = 100.0 * tal_stats["small_in_box"] / max(tal_stats["small_tot"], 1)
+    bn_summary["tal_small_pos_pct"] = 100.0 * tal_stats["small_pos"] / max(tal_stats["small_tot"], 1)
+
+    for c_row in bn_cls_rows:
+        cid = int(c_row["class_id"])
+        ct = max(int(tal_stats["cls_tot"][cid]), 1)
+        c_row["tal_pos_pct"] = round(100.0 * float(tal_stats["cls_pos"][cid]) / ct, 2)
+        c_row["tal_mean_anchors"] = round(float(tal_stats["cls_anchors"][cid]) / ct, 2)
+
+    probe_rows: List[Dict[str, Any]] = []
+    if probe_labels:
+        y_all = torch.cat(probe_labels, dim=0)
+        sm_all = torch.cat(probe_small, dim=0)
+        tn_all = torch.cat(probe_tiny, dim=0)
+        for lname in probe_layers:
+            if probe_feats[lname]:
+                x_all = torch.cat(probe_feats[lname], dim=0)
+                pr = _run_linear_probe(x_all, y_all, sm_all, tn_all, device=device)
+                probe_rows.append({"layer": lname, "num_samples": int(len(y_all)), **pr})
+
     # Save CSVs
     def _save_dict_csv(path: str, d: Dict[str, float]) -> None:
         with open(path, "w", newline="", encoding="utf-8") as f:
@@ -611,6 +926,16 @@ def main() -> None:
     _save_dict_csv(os.path.join(args.out_dir, "detection_overall_metrics.csv"), det_full_m)
     _save_dict_csv(os.path.join(args.out_dir, "dual_ablation_metrics.csv"), ablation_summary)
     _save_dict_csv(os.path.join(args.out_dir, "deformable_patch_diagnostics.csv"), patch_summary)
+    _save_dict_csv(os.path.join(args.out_dir, "bottleneck_summary.csv"), bn_summary)
+    with open(os.path.join(args.out_dir, "bottleneck_per_class.csv"), "w", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=list(bn_cls_rows[0].keys()))
+        w.writeheader()
+        w.writerows(bn_cls_rows)
+    if probe_rows:
+        with open(os.path.join(args.out_dir, "linear_probe.csv"), "w", newline="", encoding="utf-8") as f:
+            w = csv.DictWriter(f, fieldnames=list(probe_rows[0].keys()))
+            w.writeheader()
+            w.writerows(probe_rows)
     with open(os.path.join(args.out_dir, "component_breakdown.csv"), "w", newline="", encoding="utf-8") as f:
         w = csv.DictWriter(f, fieldnames=list(comp_rows[0].keys()))
         w.writeheader()
@@ -642,6 +967,8 @@ def main() -> None:
     print(f"DEFORMABLE-SLOT VALIDATION COMPLETE ({total_imgs} imgs, {elapsed:.1f}s)")
     print("=" * 78)
     print(f"  mAP50={det_full_m['mAP50']:.4f} | mAP50:95={det_full_m['mAP50_95']:.4f} | Tiny={det_full_m['mAP50_tiny']:.4f} | Small={det_full_m['mAP50_small']:.4f}")
+    print(f"  Class-Agnostic mAP50={bn_summary['class_agnostic_mAP50']:.4f} | Tiny={bn_summary['class_agnostic_mAP50_tiny']:.4f} | Small={bn_summary['class_agnostic_mAP50_small']:.4f}")
+    print(f"  TAL GT Pos%: All={bn_summary['tal_all_pos_pct']:.1f}% (in_box={bn_summary['tal_all_in_box_pct']:.1f}%) | Tiny={bn_summary['tal_tiny_pos_pct']:.1f}% (in_box={bn_summary['tal_tiny_in_box_pct']:.1f}%) | Small={bn_summary['tal_small_pos_pct']:.1f}% (in_box={bn_summary['tal_small_in_box_pct']:.1f}%)")
     print(f"  Ablation: patch_delta={ablation_summary['patch_delta_mAP50']:+.4f} | film_delta={ablation_summary['film_delta_mAP50']:+.4f} | total_delta={ablation_summary['total_delta_mAP50']:+.4f}")
     print(
         f"  Patch Coverage: FG_hit={patch_summary['patch_fg_hit_rate_pct']:.1f}% | "
