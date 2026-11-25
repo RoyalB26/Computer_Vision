@@ -30,9 +30,9 @@ model:
   nms_threshold: 0.5
   max_det: 300
   # Dual-Resolution & Deformable High-Res Micro-Patch Injector (Approach 2)
-  backbone_size: 640             # Backbone runs fast at 640x640 (~6.9 GFLOPs) or set 960 (~15.7 GFLOPs)
+  backbone_size: 960             # Backbone runs fast at 640x640 (~6.9 GFLOPs) or set 960 (~15.7 GFLOPs)
   use_deformable_patch: true
-  num_patches: 192               # Top-192 foreground P3 locations sampled from 1280x1280
+  num_patches: 256               # Top-192 foreground P3 locations sampled from 1280x1280
   patch_size: 32                 # 32x32 RGB micro-patch (preserves ~100% sharpness; divides cleanly 32->16->8->4)
   base_patch_radius: 0.035       # 45x45px span on 1280x1280 (scales dynamically 27x27..63x63px covering Tiny->Small p90)
   max_offset_cells: 1.5          # Learned deformable shift up to +-1.5 P3 cells
