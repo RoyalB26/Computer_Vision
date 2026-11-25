@@ -232,7 +232,10 @@ class VisDroneYOLO11DeformableSlot(VisDroneYOLO11Slot):
         if p_info is not None and "sub_anchors_norm" in p_info:
             lr_h, lr_w = float(lr_size[0]), float(lr_size[1])
             g = float(p_info["sub_grid_size"])
-            sub_norm = p_info["sub_anchors_norm"].to(device)  # [B, N_sub, 2] in [-1, 1]
+            # Detach anchor grid & stride so DFL's `target_ltrb / pos_stride` cannot cheat by
+            # inflating `scale_head` to 1.4x (offset_head & scale_head still learn cleanly via
+            # bilinear `F.grid_sample` gradients and `loss_patch`).
+            sub_norm = p_info["sub_anchors_norm"].detach().to(device)  # [B, N_sub, 2] in [-1, 1]
             sub_anchors_px = torch.stack(
                 [
                     (sub_norm[..., 0] + 1.0) * 0.5 * lr_w,
@@ -240,7 +243,7 @@ class VisDroneYOLO11DeformableSlot(VisDroneYOLO11Slot):
                 ],
                 dim=-1,
             )  # [B, N_sub, 2]
-            sub_radii = p_info["sub_radii_norm"].to(device)   # [B, N_sub, 2]
+            sub_radii = p_info["sub_radii_norm"].detach().to(device)   # [B, N_sub, 2]
             stride_x = sub_radii[..., 0] * lr_w / g
             stride_y = sub_radii[..., 1] * lr_h / g
             sub_strides = (0.5 * (stride_x + stride_y)).clamp(min=1.0).unsqueeze(-1)  # [B, N_sub, 1]

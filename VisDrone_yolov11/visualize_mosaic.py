@@ -91,7 +91,8 @@ def main() -> None:
     ds_cfg = cfg["data"]["train"]["dataset"]
 
     rare_prob = float(args.rare_prob) if args.rare_prob is not None else float(ds_cfg.get("mosaic_rare_prob", 0.85))
-    ds = VisDroneLMDBDataset(
+    ds_type = str(ds_cfg.get("type", "VisDroneLMDBDataset"))
+    ds_kwargs = dict(
         data_root=ds_cfg["data_root"],
         pipeline=ds_cfg.get("pipeline"),
         num_classes=int(ds_cfg.get("num_classes", 10)),
@@ -101,6 +102,15 @@ def main() -> None:
         mosaic_prob=1.0,    # Force 100% Mosaic for preview
         mosaic_rare_prob=rare_prob,
     )
+    if ds_type == "VisDroneDualResLMDBDataset":
+        from VisDrone_deformable_slot.dataset import VisDroneDualResLMDBDataset
+
+        for k in ("drone_aug", "hsv_prob", "blur_prob", "haze_gamma_prob", "noise_prob"):
+            if k in ds_cfg:
+                ds_kwargs[k] = ds_cfg[k]
+        ds = VisDroneDualResLMDBDataset(**ds_kwargs)
+    else:
+        ds = VisDroneLMDBDataset(**ds_kwargs)
 
     os.makedirs(args.out_dir, exist_ok=True)
     n_total = len(ds)
@@ -111,7 +121,11 @@ def main() -> None:
 
     for i, idx in enumerate(chosen_indices):
         if args.raw_mosaic:
-            img_t, target = ds._apply_mosaic4(idx)
+            if hasattr(ds, "_apply_mosaic4_uint8"):
+                rgb, target = ds._apply_mosaic4_uint8(idx)
+                img_t = torch.from_numpy(rgb).permute(2, 0, 1).float().div_(255.0)
+            else:
+                img_t, target = ds._apply_mosaic4(idx)
         else:
             sample = ds.prepare_data(idx)
             img_t, target = sample["image"], sample["target"]
