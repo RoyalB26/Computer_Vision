@@ -71,7 +71,7 @@ model:
   presence_label_smoothing: 0.05
   sparse_thresh: 0.05
   use_overlap_soft_target: true
-  use_ellipse_mask: true
+  use_ellipse_mask: false
   ellipse_min_side: 3.0
   use_class_freq_weight: true
   class_freq_max_weight: 2.0
@@ -82,7 +82,7 @@ data:
     dataset:
       type: "VisDroneDualResLMDBDataset"
       data_root: "/content/train_data.lmdb"
-      cache_images: null         # LMDB mmap shares OS page cache across all DDP ranks & workers (0 RAM duplication!)
+      cache_images: "jpeg"         # LMDB mmap shares OS page cache across all DDP ranks & workers (0 RAM duplication!)
       seed: 42
       num_classes: 10
       include_boxes: true
@@ -101,7 +101,7 @@ data:
     dataset:
       type: "VisDroneDualResLMDBDataset"
       data_root: "/content/val_data.lmdb"
-      cache_images: null
+      cache_images: "jpeg"
       seed: 42
       num_classes: 10
       include_boxes: true

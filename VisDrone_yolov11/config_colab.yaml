@@ -1,21 +1,23 @@
 # ==============================================================================
-# VisDrone YOLOv11 + Post-Neck Decoupled Slot Attention & FiLM (Method B+C, 960x960)
+# VisDrone YOLOv11 + Slot FiLM + Deformable High-Res Micro-Patch (Colab L4)
+# High-Res Input: 1280x1280 | Backbone: 640x640 (6.9 GFLOPs) | Deformable Patches: +1.5 GFLOPs
+# Total ~8.5 GFLOPs (nearly 2x LIGHTER than 960x960!) while reading 1280x1280 pixel detail!
 # ==============================================================================
 
-work_dir: "./work_dirs/visdrone_yolov11_slot_960"
+work_dir: "./work_dirs/visdrone_deformable_slot_1280_bb640"
 device: "cuda"
 seed: 42
 tqdm: true
 
 custom_imports:
-  - "VisDrone_yolov11.model"
-  - "VisDrone_yolov11.dataset"
+  - "VisDrone_deformable_slot.model"
+  - "VisDrone_deformable_slot.dataset"
   - "VisDrone_yolov11.loss"
   - "VisDrone_yolov11.metrics"
 
-# 1. Model Configuration: YOLOv11 + Post-Neck Decoupled Slot + FiLM (B+C)
+# 1. Model Configuration
 model:
-  type: "VisDroneYOLO11Slot"
+  type: "VisDroneYOLO11DeformableSlot"
   num_classes: 10
   pretrained: "/content/yolo11n.pt"
   # Core YOLOv11 detection loss weights
@@ -24,128 +26,139 @@ model:
   dfl_weight: 1.5
   focal_alpha: -1.0
   focal_gamma: 0.0
-  # Inference thresholds
   conf_threshold: 0.05
   nms_threshold: 0.5
   max_det: 300
-  # Slot + FiLM (Method B+C) hyperparameters
-  slot_dim: 64                 # 64 dim gives sub-slots plenty of orthogonal freedom
-  # Per-class prototypes: [ped, people, bicycle, car, van, truck, tricycle, awning-tri, bus, moto] -> 22 FG + 1 BG = 23 slots
+  # Dual-Resolution & Deformable High-Res Micro-Patch Injector (Approach 2)
+  backbone_size: 960             # Backbone runs fast at 640x640 (~6.9 GFLOPs) or set 960 (~15.7 GFLOPs)
+  use_deformable_patch: true
+  num_patches: 256               # Top-192 foreground P3 locations sampled from 1280x1280
+  patch_size: 32                 # 32x32 RGB micro-patch (preserves ~100% sharpness; divides cleanly 32->16->8->4)
+  base_patch_radius: 0.035       # 45x45px span on 1280x1280 (scales dynamically 27x27..63x63px covering Tiny->Small p90)
+  max_offset_cells: 1.5          # Learned deformable shift up to +-1.5 P3 cells
+  class_focus_weights: [2.0, 2.0, 3.0, 0.3, 1.2, 1.5, 3.0, 3.0, 0.8, 2.0]
+  spread_local_3x3: true         # Spread high-res residual to immediate 3x3 P3 neighbors
+  patch_dropout: 0.1
+  patch_loss_weight: 0.2         # Class-weighted auxiliary loss for offset_head & scale_head
+  use_uncertainty_routing: true  # Focus patches on FG/BG & inter-class uncertainty instead of crystal-clear cars
+  uncertainty_floor: 0.2
+  use_sparse_subhead: true       # 4x4 Sparse High-Res Sub-Head (K*16 sub-anchors directly on MicroPatchEncoder)
+  # Slot + FiLM hyperparameters
+  slot_dim: 64
   num_prototypes: [2, 2, 2, 1, 2, 3, 3, 3, 2, 2]
-  num_iters: 2                 # MUFASA Coarse-to-Fine T=2 (Iter 1: P4+P5 -> detach -> Iter 2: P3+P4+P5)
-  use_implicit_diff: true      # 1-Step Implicit Diff (detach coarse slots to save VRAM & stabilize grad)
-  use_cosine_attn: true        # Cosine Attention (locks ||q_bg||==||q_fg||==1, prevents logit explosion & BG dominance)
-  fusion_mode: "film"          # "film" (Method C) or "residual"
-  use_bg_slot_write: false     # false = FG slots only (natural bg gating), true = all slots
-  use_logit_prior: false       # keep head.cv3 clean (no logit co-adaptation)
-  assigner_prior_weight: 0.25   
-  use_slot_checkpoint: false   # set true to further cut activation VRAM on small GPUs
-  slot_loss_weight: 0.3        # auxiliary slot supervision multiplier
+  num_iters: 1
+  use_implicit_diff: true
+  use_cosine_attn: true
+  fusion_mode: "film"
+  use_bg_slot_write: false
+  use_logit_prior: false
+  assigner_prior_weight: 0.25
+  use_slot_checkpoint: false
+  slot_loss_weight: 0.3
   bg_attn_weight: 0.3
   fg_attn_weight: 0.7
   suppress_weight: 0.05
   cls_attn_weight: 0.8
   ortho_weight: 0.1
   slot_dropout: 0.1
-  # Compact Anti-Overfit ASA Presence Gate (proj_in GAP + Top-K Mean, ~13K params)
   use_asa_gate: true
-  asa_gate_floor: 0.05         # soft floor so tiny small objects are never hard-killed
-  asa_logit_weight: 0.25       # gentle logit bias in dots_sub (full gating in slot_broadcast)
-  asa_topk: 16                 # Top-K Mean Pooling (resists single-pixel outlier spikes vs GMP)
-  presence_hidden_dim: 32      # compact bottleneck (~13.4K params vs 116K)
+  asa_gate_floor: 0.05
+  asa_logit_weight: 0.25
+  asa_topk: 16
+  presence_hidden_dim: 32
   presence_dropout: 0.3
   presence_loss_weight: 0.25
   presence_label_smoothing: 0.05
-  sparse_thresh: 0.05          # prune tiny background tails in attn_norm
-  # cls_attn target & imbalance refinements
-  use_overlap_soft_target: true   # soft target normalization on overlapping pixels (motorcycle <-> people)
-  use_ellipse_mask: true          # inscribed ellipse mask for large boxes (>= 3x3 cells) to cut truck BG leak
+  sparse_thresh: 0.05
+  use_overlap_soft_target: true
+  use_ellipse_mask: false
   ellipse_min_side: 3.0
-  use_class_freq_weight: true     # gentle EMA inverse-sqrt class-frequency weighting in [1.0, 2.0]
+  use_class_freq_weight: true
   class_freq_max_weight: 2.0
-# 2. Dataset Configuration (Stratified Split synced with Visdrone/dataset.py)
+
+# 2. Dual-Resolution Dataset Configuration (loads 1280x1280; model downsamples to backbone_size on GPU)
 data:
   train:
     dataset:
-      type: "VisDroneLMDBDataset"
+      type: "VisDroneDualResLMDBDataset"
       data_root: "/content/train_data.lmdb"
-      cache_images: "ram"
+      cache_images: "jpeg"         # LMDB mmap shares OS page cache across all DDP ranks & workers (0 RAM duplication!)
       seed: 42
       num_classes: 10
       include_boxes: true
       augment: true
-      mosaic_prob: 0.65            # 4-image Mosaic augmentation (disabled in final 15 epochs via CloseMosaicHook)
-      mosaic_rare_prob: 0.85       # 85% of Mosaic samples inject 1-2 object-centered rare-class crops (< 45% freq)
+      mosaic_prob: 0.5
+      mosaic_rare_prob: 0.75
       pipeline:
         - type: "Resize"
-          size: [960, 960]
+          size: [1280, 1280]
         - type: "ToTensor"
-    batch_size: 32
+    batch_size: 18
     shuffle: true
-    num_workers: 4
+    num_workers: 2
     pin_memory: true
   val:
     dataset:
-      type: "VisDroneLMDBDataset"
+      type: "VisDroneDualResLMDBDataset"
       data_root: "/content/val_data.lmdb"
-      cache_images: "ram"
+      cache_images: "jpeg"
       seed: 42
       num_classes: 10
       include_boxes: true
       augment: false
       pipeline:
         - type: "Resize"
-          size: [960, 960]
+          size: [1280, 1280]
         - type: "ToTensor"
-    batch_size: 32
+    batch_size: 18
     shuffle: false
     num_workers: 2
     pin_memory: true
 
-# 3. Optimizer Configuration
+# 3. Optimizer & Scheduler
 optimizer:
   type: "AdamW"
   lr: 0.0012
   weight_decay: 0.001
 
-# 4. Learning Rate Scheduler
 lr_scheduler:
   type: "CosineAnnealingLR"
   T_max: 100
   eta_min: 0.00001
 
-# 5. Metrics Configuration: mAP Evaluation
+# 4. Metrics
 metrics:
   mAP:
     type: "VisDroneMAP"
     num_classes: 10
 
-# 6. Training Hyperparameters
+# 5. Training Hyperparameters
 train_cfg:
   max_epochs: 100
   val_interval: 10
   grad_clip: 10.0
   use_amp: true
-  accumulate: 1                # effective batch size = 8 * 2 = 16
+  accumulate: 2                  # effective batch size = 16 * 2 = 32
   log_interval: 50000
-# 7. Lifecycle Hooks
+
+# 6. Lifecycle Hooks
 hooks:
   - type: "WarmupLRHook"
-    warmup_epochs: 3                        # Tăng LR tuyến tính 0.05x -> 1.0x và tạm tắt Mosaic 3 epoch đầu
+    warmup_epochs: 3
     start_factor: 0.05
     disable_mosaic_warmup: true
   - type: "CloseMosaicHook"
-    close_epochs: 15                        # Tắt Mosaic 15 epoch cuối để hội tụ về phân phối ảnh thật
+    close_epochs: 15
   - type: "CheckpointHook"
     interval: 1
     save_best: "mAP_50"
     mode: "max"
   - type: "ExcelTracker"
-    filename: "training_metrics.xlsx"       # Lưu trực tiếp vào thư mục work_dir
-    track_gradients: true                   # Bật tracking gradient chi tiết
-    grad_interval: 1                        # Chu kỳ lấy mẫu gradient (mỗi 1 batch)
-    track_detection: true                   # Bật tracking tab Detection phân tích động lực học mô hình
-    detection_interval: 5                   # Chu kỳ lấy mẫu phân tích detection (mỗi 5 batch)
-    auto_save: true                         # Tự động ghi ra file Excel sau mỗi epoch
-    resume: true                            # Tự động tiếp tục ghi tiếp vào sheet nếu file đã tồn tại
+    filename: "training_metrics.xlsx"
+    track_gradients: true
+    grad_interval: 1
+    track_detection: true
+    detection_interval: 5
+    auto_save: true
+    resume: true
     submodules: null
