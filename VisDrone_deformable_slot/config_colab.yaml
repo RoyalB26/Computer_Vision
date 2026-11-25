@@ -93,7 +93,7 @@ data:
         - type: "Resize"
           size: [1280, 1280]
         - type: "ToTensor"
-    batch_size: 16
+    batch_size: 12
     shuffle: true
     num_workers: 2
     pin_memory: true
@@ -110,7 +110,7 @@ data:
         - type: "Resize"
           size: [1280, 1280]
         - type: "ToTensor"
-    batch_size: 16
+    batch_size: 12
     shuffle: false
     num_workers: 2
     pin_memory: true
